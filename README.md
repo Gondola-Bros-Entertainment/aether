@@ -58,16 +58,64 @@ ctest --test-dir build
 Needs a C++20 compiler (clang or gcc). Sockets are POSIX; a Windows port touches only
 `src/socket.cpp`.
 
-## Use
+## Getting started
+
+A `Host` is a socket plus its peers -- the same type is client or server. Bind it, then pump one
+step per frame: `hostTick` drains incoming datagrams, sends what you queued, and returns the
+events that happened.
 
 ```cpp
 #include <aether/net.hpp>
 
 aether::NetworkConfig cfg;
-auto host = aether::openHost(aether::addrAny(9000), cfg, now);   // bind a server on :9000
-for (const auto& ev : aether::hostTick(*host, outgoing, now)) {
-    // ev.kind: Connected / Disconnected / Message / Migrated
+
+// server: bind a port, tick each frame
+auto server = aether::openHost(aether::addrAny(9000), cfg, now);
+std::vector<std::pair<aether::ChannelId, aether::Bytes>> broadcast;
+for (const aether::PeerEvent& ev : aether::hostTick(*server, broadcast, now)) {
+    switch (ev.kind) {
+        case aether::PeerEvent::Connected:    break;   // ev.peer joined
+        case aether::PeerEvent::Message:      break;   // ev.data arrived on ev.channel
+        case aether::PeerEvent::Disconnected: break;
+        case aether::PeerEvent::Migrated:     break;   // ev.peer rebound to ev.other (NAT)
+    }
 }
+
+// client: connect, then send to a peer on a channel
+auto client = aether::openHost(aether::addrLocalhost(0), cfg, now);
+aether::hostConnect(*client, serverAddr, now);
+aether::hostSend(*client, serverAddr, aether::ChannelId{ 0 }, payload, now);
+```
+
+Each channel picks its own guarantee -- reliable-ordered, reliable-unordered, reliable-sequenced,
+unreliable, or unreliable-sequenced -- so one packet stream carries mixed delivery semantics.
+
+## Squeezing the wire
+
+The automatic delta is already compact. When you know a field's range, wrap it and it costs
+exactly the bits it needs -- still nothing to annotate, just a typed field:
+
+```cpp
+struct Input {
+    aether::Ranged<int, 0, 1023>       move;     // 10 bits, not 32
+    aether::Quantized<-1.0f, 1.0f, 12> aimYaw;   // 12 bits, not a 32-bit float
+    bool                               firing;   // 1 bit
+};
+
+aether::BitWriter bw{ buf, sizeof buf };
+aether::packBits(bw, input);                      // 23 bits -> 3 bytes on the wire
+```
+
+## Wire size
+
+The delta is the point. On a 12-field snapshot with two fields changed, aether writes 8 bytes; a
+full-struct serializer like zpp::bits writes 40 -- 5x less, automatically, with zero annotations.
+Computing the diff costs a few nanoseconds of CPU, which on a bandwidth-bound network is the trade
+you want. Reproduce:
+
+```sh
+cmake -B build -DAETHER_BENCH_COMPARE=ON
+cmake --build build --target aether_bench_compare && ./build/aether_bench_compare
 ```
 
 ## Status
