@@ -72,11 +72,12 @@ for (const auto& ev : aether::hostTick(*host, outgoing, now)) {
 
 ## Status
 
-The netcode stack is complete and tested -- reliable delivery is exercised under heavy simulated
-packet loss (a message that must arrive does, by retransmit), encryption is checked against the
-RFC 8439 vectors, and the suite also runs two UDP hosts through a handshake over a real socket.
-Planned next: an X25519 key-exchange handshake, NAT punch-through, and serializer benchmarks
-against other libraries.
+The netcode stack is complete and hardened. Reliable delivery is exercised under heavy simulated
+packet loss -- a message that must arrive does, by retransmit -- and the encryption is verified
+against the RFC 8439 vectors. CI is a staged pipeline: static analysis, then ASan/UBSan, then a
+build matrix across gcc and clang on Linux and macOS, all warning-clean under -Werror. Planned
+next: serializer benchmarks against other libraries, a Windows (Winsock) build, and NAT
+punch-through.
 
 ## License
 
