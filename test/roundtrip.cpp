@@ -128,6 +128,23 @@ int main() {
         std::printf("aether generic serialize OK: nested Entity, %zu bytes, zero boilerplate\n", gw.pos);
     }
 
+    // memcpy fast-path: for a trivially-copyable, no-padding struct on a little-endian target,
+    // serialize() is one memcpy -- its wire must be byte-identical to the portable per-field path
+    // so a big-endian peer on that path still interoperates.
+    {
+        struct Packed { std::uint32_t a; std::uint16_t b; std::uint8_t c, d; float e; };   // 12 bytes, no padding
+        static_assert(sizeof(Packed) == aether::serializedSize<Packed>(), "Packed must have no padding");
+        const Packed p{ 0x11223344u, 0x5566, 0x77, 0x88, 1.5f };
+        std::uint8_t fast[32], slow[32];
+        aether::Writer wf{ fast, sizeof fast, 0, true }; aether::serialize(wf, p);   // memcpy path on LE
+        aether::Writer ws{ slow, sizeof slow, 0, true }; aether::writeAny(ws, p);    // portable byte-wise
+        assert(wf.ok && wf.pos == ws.pos && std::memcmp(fast, slow, wf.pos) == 0);
+        aether::Reader rp{ fast, wf.pos, 0 };
+        const auto back = aether::deserialize<Packed>(rp);
+        assert(back && back->a == p.a && back->b == p.b && back->c == p.c && back->d == p.d && back->e == p.e);
+        std::printf("aether memcpy-fastpath OK: %zu-byte struct, memcpy wire == byte-wise wire, round-trips\n", wf.pos);
+    }
+
     // socket: bind a UDP socket on localhost, send a datagram to itself, receive it
     {
         auto sock = aether::openUdp(aether::addrLocalhost(0));   // ephemeral port

@@ -7,12 +7,15 @@
 
 #include "aether/serialize.hpp"
 
+#include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <tuple>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace aether {
@@ -175,13 +178,59 @@ template <class T> bool readAny(Reader& r, T& v) {
     }
 }
 
+// Byte-wise wire size of an aggregate with no dynamic fields (no padding counted) -- used to gate
+// the memcpy fast path below.
+template <class T> constexpr std::size_t serializedSize() noexcept;
+namespace detail {
+template <class F> constexpr std::size_t fieldWireSize() noexcept {
+    using U = std::remove_cvref_t<F>;
+    if      constexpr (std::is_enum_v<U>)       return sizeof(std::underlying_type_t<U>);
+    else if constexpr (std::is_same_v<U, bool>) return 1;
+    else if constexpr (std::is_aggregate_v<U>)  return aether::serializedSize<U>();
+    else                                        return sizeof(U);   // integral / floating-point
+}
+} // namespace detail
+template <class T> constexpr std::size_t serializedSize() noexcept {
+    using Tup = decltype(tieFields(std::declval<std::remove_cvref_t<T>&>()));
+    return []<std::size_t... I>(std::index_sequence<I...>) constexpr noexcept {
+        return (detail::fieldWireSize<std::tuple_element_t<I, Tup>>() + ... + std::size_t{ 0 });
+    }(std::make_index_sequence<std::tuple_size_v<Tup>>{});
+}
+
+// True when T's byte-wise wire form is bit-identical to its memory image: a trivially copyable
+// aggregate, no padding, on a little-endian target. Only then is one memcpy a valid (and much
+// faster) substitute for the per-field writes -- and the wire stays identical, so a big-endian
+// peer on the portable path still interoperates.
+template <class T> constexpr bool canMemcpySerialize() noexcept {
+    using U = std::remove_cvref_t<T>;
+    if constexpr (std::is_trivially_copyable_v<U> && std::is_aggregate_v<U>
+                  && std::endian::native == std::endian::little)
+        return sizeof(U) == serializedSize<U>();
+    else
+        return false;
+}
+
 // The framework API. Any plain struct, in or out, no boilerplate.
-template <class T> void serialize(Writer& w, const T& v) { writeAny(w, v); }
+template <class T> void serialize(Writer& w, const T& v) {
+    if constexpr (canMemcpySerialize<T>()) {
+        if (fits(w, sizeof(T))) { std::memcpy(w.buf + w.pos, &v, sizeof(T)); w.pos += sizeof(T); }
+    } else {
+        writeAny(w, v);
+    }
+}
 
 template <class T> std::optional<T> deserialize(Reader& r) {
-    T v{};
-    if (readAny(r, v)) return v;
-    return std::nullopt;
+    if constexpr (canMemcpySerialize<T>()) {
+        if (!has(r, sizeof(T))) return std::nullopt;
+        T v{};
+        std::memcpy(&v, r.buf + r.pos, sizeof(T));
+        r.pos += sizeof(T);
+        return v;
+    } else {
+        T v{};
+        if (readAny(r, v)) return v;
+        return std::nullopt;
+    }
 }
 
 } // namespace aether
