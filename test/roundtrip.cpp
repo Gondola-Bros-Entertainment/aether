@@ -356,6 +356,46 @@ int main() {
         std::printf("aether connection OK: reliable message a->b across %d payload packet(s)\n", delivered);
     }
 
+    // reliable delivery under packet loss: a reliable message must reach b even when ~40% of
+    // packets are dropped, by riding the ack + retransmit machinery. This is the test that makes
+    // "tested" mean something on a lossy link, not just a clean localhost handshake.
+    {
+        const aether::NetworkConfig cfg;
+        aether::Connection a = aether::newConnection(cfg, 111, aether::MonoTime{ 0 });
+        aether::Connection b = aether::newConnection(cfg, 222, aether::MonoTime{ 0 });
+        aether::markConnected(a, aether::MonoTime{ 0 });
+        aether::markConnected(b, aether::MonoTime{ 0 });
+
+        const aether::Bytes payload = { 0xCA, 0xFE, 0xBA, 0xBE };
+        assert(!aether::sendMessage(a, aether::ChannelId{ 0 }, payload, aether::MonoTime{ 0 }));   // channel 0 is reliable
+
+        std::uint64_t rng = 1;   // deterministic ~40% loss, so the test is reproducible
+        const auto lost = [&] { const auto r = aether::nextRandom(rng); rng = r.state; return aether::randomDouble(r.output) < 0.4; };
+        const auto shuttle = [&](aether::Connection& from, aether::Connection& to, aether::MonoTime now) {
+            for (const auto& pkt : aether::drainSendQueue(from)) {
+                if (lost()) continue;                            // dropped on the wire
+                aether::processIncomingHeader(to, pkt.header, now);
+                if (pkt.type == aether::PacketType::Payload && pkt.payload.size() >= 3) {
+                    const auto& w = pkt.payload;
+                    const auto chan = static_cast<std::uint8_t>(w[0] & 0x07);
+                    const aether::SequenceNum chSeq{ static_cast<std::uint16_t>((w[1] << 8) | w[2]) };
+                    aether::receiveIncomingPayload(to, aether::ChannelId{ chan }, chSeq,
+                                                   aether::Bytes(w.begin() + 3, w.end()), now);
+                }
+            }
+        };
+
+        bool got = false;
+        for (int tick = 1; tick <= 250 && !got; ++tick) {
+            const aether::MonoTime now{ static_cast<std::uint64_t>(tick) * 20000000ull };   // 20ms steps
+            aether::updateTick(a, now); shuttle(a, b, now);      // a -> b: data (lossy)
+            aether::updateTick(b, now); shuttle(b, a, now);      // b -> a: acks (lossy)
+            for (const auto& m : aether::receiveMessage(b, aether::ChannelId{ 0 })) if (m == payload) got = true;
+        }
+        assert(got);
+        std::printf("aether reliability-under-loss OK: reliable message survived ~40%% packet loss via retransmit\n");
+    }
+
     // util + full packet codec: PRNG is deterministic; a whole packet round-trips.
     {
         const auto r1 = aether::nextRandom(12345);
