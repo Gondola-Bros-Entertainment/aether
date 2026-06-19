@@ -92,7 +92,7 @@ inline std::optional<ChannelMessage> getOutgoingMessage(Channel& ch) {
         ChannelMessage& msg = it->second;
         if (msg.acked) { ch.sendBuffer.erase(it); continue; }
         if (msg.retryCount == 0) {
-            const ChannelMessage out = msg;
+            ChannelMessage out = msg;   // non-const so the return moves instead of copying the payload
             if (msg.reliable) msg.retryCount = 1;
             else              ch.sendBuffer.erase(it);
             return out;
