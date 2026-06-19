@@ -54,3 +54,20 @@ endforeach()
 add_executable(aether_bench bench/bench.cpp)
 target_link_libraries(aether_bench PRIVATE aether)
 target_compile_options(aether_bench PRIVATE -O3)
+
+# Opt-in comparison benchmark: aether vs zpp::bits. Fetches an external lib, so it is OFF by
+# default and never touches the library's zero-dependency build:
+#   cmake -B build -DAETHER_BENCH_COMPARE=ON && cmake --build build --target aether_bench_compare
+option(AETHER_BENCH_COMPARE "Build the serializer comparison benchmark (fetches zpp::bits)" OFF)
+if(AETHER_BENCH_COMPARE)
+    include(FetchContent)
+    FetchContent_Declare(zpp_bits
+        GIT_REPOSITORY https://github.com/eyalz800/zpp_bits.git
+        GIT_TAG v4.4.24
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(zpp_bits)
+    add_executable(aether_bench_compare bench/compare.cpp)
+    target_link_libraries(aether_bench_compare PRIVATE aether)
+    target_include_directories(aether_bench_compare PRIVATE ${zpp_bits_SOURCE_DIR})
+    target_compile_options(aether_bench_compare PRIVATE -O3)
+endif()
