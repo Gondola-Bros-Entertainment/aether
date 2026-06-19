@@ -5,9 +5,8 @@
 
 Reliable UDP netcode for games. C++20, header-only, zero dependencies.
 
-The headline: define a plain struct, and aether sends only the fields that changed since the
-last snapshot -- an automatic delta, computed by reflection. No macros, no codegen, no
-annotations.
+Define a plain struct, and aether sends only the fields that changed since the last snapshot:
+an automatic delta, computed by reflection. No macros, no codegen, no annotations.
 
 ```cpp
 struct PlayerState {
@@ -42,10 +41,6 @@ Data-first: plain structs and free functions, no inheritance or virtuals. State 
 place. One focused header per module under `include/aether/` -- include what you use, or pull
 the whole library with `<aether/aether.hpp>`. The only translation unit is the platform socket
 layer (`src/socket.cpp`); everything else is header-only.
-
-When you want to squeeze the wire further, the serializer has an optional bit-packing layer:
-wrap a field in `Ranged<Lo, Hi>` or `Quantized<Lo, Hi, Bits>` and it costs exactly the bits its
-range needs. Never required.
 
 ## Build
 
@@ -92,8 +87,7 @@ unreliable, or unreliable-sequenced -- so one packet stream carries mixed delive
 
 ## Squeezing the wire
 
-The automatic delta is already compact. When you know a field's range, wrap it and it costs
-exactly the bits it needs -- still nothing to annotate, just a typed field:
+Optional: when you know a field's range, wrap it and it costs exactly the bits the range needs.
 
 ```cpp
 struct Input {
@@ -108,10 +102,9 @@ aether::packBits(bw, input);                      // 23 bits -> 3 bytes on the w
 
 ## Wire size
 
-The delta is the point. On a 12-field snapshot with two fields changed, aether writes 8 bytes; a
-full-struct serializer like zpp::bits writes 40 -- 5x less, automatically, with zero annotations.
-Computing the diff costs a few nanoseconds of CPU, which on a bandwidth-bound network is the trade
-you want. Reproduce:
+On a 12-field snapshot with two fields changed, aether writes 8 bytes; zpp::bits writes 40. The
+diff costs a few nanoseconds of CPU; on a bandwidth-bound network, fewer bytes on the wire is the
+trade that matters. Reproduce:
 
 ```sh
 cmake -B build -DAETHER_BENCH_COMPARE=ON
