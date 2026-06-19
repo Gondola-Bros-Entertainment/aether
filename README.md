@@ -1,5 +1,8 @@
 # aether
 
+[![ci](https://github.com/Gondola-Bros-Entertainment/aether/actions/workflows/ci.yml/badge.svg)](https://github.com/Gondola-Bros-Entertainment/aether/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Reliable UDP netcode for games. C++20, header-only, zero dependencies.
 
 The headline: define a plain struct, and aether sends only the fields that changed since the
