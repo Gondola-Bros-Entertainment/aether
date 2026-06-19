@@ -1,6 +1,6 @@
 // aether - non-blocking UDP socket and address.
-// Data-first: plain Address / Socket structs, free functions. The header stays
-// platform-free; the OS calls live in socket.cpp.
+// Data-first: plain Address / Socket structs, free functions. The header stays platform-free
+// (bar one handle typedef); the OS calls live in socket_posix.cpp / socket_win.cpp.
 #pragma once
 
 #include <cstdint>
@@ -25,9 +25,20 @@ Address       addrV4(std::uint32_t ip, std::uint16_t port);
 std::uint16_t addrPort(const Address& a);
 bool          addrEqual(const Address& a, const Address& b);
 
-// A non-blocking UDP socket. fd < 0 means invalid. Stats are plain counters.
+// A UDP socket handle: an int fd on POSIX, but a Windows SOCKET is an unsigned pointer-width value
+// that does not fit in an int -- so the handle type is selected per platform. This typedef is the
+// one place portability reaches past the platform .cpp.
+#ifdef _WIN32
+using SocketHandle = std::uintptr_t;
+inline constexpr SocketHandle invalidSocket = ~static_cast<SocketHandle>(0);   // INVALID_SOCKET
+#else
+using SocketHandle = int;
+inline constexpr SocketHandle invalidSocket = -1;
+#endif
+
+// A non-blocking UDP socket. fd == invalidSocket means invalid. Stats are plain counters.
 struct Socket {
-    int           fd{ -1 };
+    SocketHandle  fd{ invalidSocket };
     std::uint64_t bytesSent{};
     std::uint64_t bytesRecv{};
     std::uint64_t packetsSent{};

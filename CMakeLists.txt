@@ -6,9 +6,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)   # so clangd knows it's C++20
 add_compile_options(-Wall -Wextra)
 
-# The library is header-only; src/ holds only the platform layer (one translation unit).
-file(GLOB AETHER_SRC CONFIGURE_DEPENDS src/*.cpp)
-add_library(aether STATIC ${AETHER_SRC})
+# Platform layer: the one translation unit. CMake selects the backend so neither file needs an
+# #ifdef -- socket_posix.cpp (BSD sockets, mac/linux) or socket_win.cpp (Winsock).
+if(WIN32)
+    add_library(aether STATIC src/socket_win.cpp)
+    target_link_libraries(aether PUBLIC ws2_32)
+else()
+    add_library(aether STATIC src/socket_posix.cpp)
+endif()
 target_include_directories(aether PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 enable_testing()
