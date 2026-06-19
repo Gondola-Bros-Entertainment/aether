@@ -19,8 +19,7 @@ jobs:
       - name: Run cppcheck
         run: >
           cppcheck --enable=warning,performance,portability --std=c++20
-          --error-exitcode=1 --quiet --inline-suppr
-          --suppress=missingIncludeSystem --suppress=uninitMemberVarNoCtor
+          --error-exitcode=1 --quiet
           -I include src test bench
 
   sanitizers:

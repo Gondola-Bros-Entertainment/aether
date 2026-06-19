@@ -29,9 +29,9 @@
 #include <cstring>
 
 struct PlayerState {
-    float               x, y;
-    std::uint8_t        health;
-    aether::SequenceNum seq;
+    float               x{}, y{};
+    std::uint8_t        health{};
+    aether::SequenceNum seq{};
 };
 
 struct Vec3   { float x, y, z; };
@@ -210,7 +210,7 @@ int main() {
             aether::Ranged<int, 0, 1023>       y;        // 10 bits
             aether::Quantized<-1.0f, 1.0f, 12> aimYaw;   // 12 bits
             aether::Ranged<int, 0, 7>          button;   //  3 bits
-            bool                               firing;   //  1 bit
+            bool                               firing{};   //  1 bit
         };
         const Move in{ 512, 1000, 0.5f, 5, true };       // 36 bits -> 5 bytes
 

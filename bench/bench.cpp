@@ -19,14 +19,14 @@ namespace {
 // A realistic replicated entity: position + velocity + a few stats. Trivially copyable, so
 // the memcpy path is legal. 12 fields -- a fair real-world size (the cap is 32).
 struct Entity {
-    float         px, py, pz;
-    float         vx, vy, vz;
-    int           health;
-    int           mana;
-    std::uint32_t flags;
-    std::uint16_t typeId;
-    std::uint8_t  team;
-    bool          alive;
+    float         px{}, py{}, pz{};
+    float         vx{}, vy{}, vz{};
+    int           health{};
+    int           mana{};
+    std::uint32_t flags{};
+    std::uint16_t typeId{};
+    std::uint8_t  team{};
+    bool          alive{};
 };
 
 // Keep the optimizer from deleting work whose result is never observed. The "memory"
