@@ -28,7 +28,14 @@ struct Entity {
     bool          alive{};
 };
 
-template <class T> inline void sink(const T& v) { asm volatile("" : : "m"(v) : "memory"); }
+template <class T> inline void sink(const T& v) {
+#if defined(_MSC_VER)
+    volatile char observed = *reinterpret_cast<const volatile char*>(&v);
+    (void)observed;
+#else
+    asm volatile("" : : "m"(v) : "memory");
+#endif
+}
 
 constexpr int kWarmup = 100000;
 constexpr int kIters  = 3000000;

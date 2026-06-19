@@ -29,9 +29,16 @@ struct Entity {
     bool          alive{};
 };
 
-// Keep the optimizer from deleting work whose result is never observed. The "memory"
-// clobber is the real barrier; "m"(v) just names something to anchor it to.
-template <class T> inline void sink(const T& v) { asm volatile("" : : "m"(v) : "memory"); }
+// Keep the optimizer from deleting work whose result is never observed. On GCC/Clang the "memory"
+// clobber is the barrier; MSVC has no inline asm, so a volatile read forces the value to exist.
+template <class T> inline void sink(const T& v) {
+#if defined(_MSC_VER)
+    volatile char observed = *reinterpret_cast<const volatile char*>(&v);
+    (void)observed;
+#else
+    asm volatile("" : : "m"(v) : "memory");
+#endif
+}
 
 constexpr int kWarmup = 100000;
 constexpr int kIters  = 3000000;
