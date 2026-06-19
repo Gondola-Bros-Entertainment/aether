@@ -1,6 +1,6 @@
 // aether - channel-based delivery with five reliability modes. Each channel owns its sequence
-// numbers, send/receive buffering, and
-// (for ordered mode) a reorder buffer. Data-first: a plain Channel struct + free funcs.
+// numbers, its send/receive buffering, and (for ordered mode) a reorder buffer. Data-first: a
+// plain Channel struct + free functions.
 #pragma once
 
 #include "aether/types.hpp"

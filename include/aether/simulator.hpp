@@ -1,6 +1,6 @@
-// aether - network condition simulator. Models loss,
-// latency, jitter, duplicates, reordering, and a token-bucket bandwidth cap for testing a real
-// send path. Addresses are opaque u64 keys. Data-first: a plain struct mutated by free functions.
+// aether - network condition simulator. Models loss, latency, jitter, duplicates, reordering,
+// and a token-bucket bandwidth cap for testing a real send path. Addresses are opaque u64 keys.
+// Data-first: a plain struct mutated by free functions.
 #pragma once
 
 #include "aether/config.hpp"

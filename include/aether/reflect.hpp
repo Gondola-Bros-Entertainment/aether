@@ -1,7 +1,8 @@
-// aether - generic struct serialization. Define a plain aggregate and serialize or
-// deserialize it instantly: no macros, no codegen, no boilerplate. This is the C++
-// answer to Haskell's deriveStorable -- aggregate reflection via structured bindings.
-// Works for any aggregate of primitives, enums, and nested aggregates.
+// aether - the reflection base layer. Define a plain aggregate and serialize or deserialize it
+// instantly: no macros, no codegen, no boilerplate -- aggregate reflection over structured
+// bindings. Provides fieldCount, the isStd* traits, tieFields, forEachField, and the byte-exact
+// writeAny/readAny that the rest of the serializer builds on. Works for any aggregate of
+// primitives, enums, std::array, and nested aggregates (plus string/vector/optional fields).
 #pragma once
 
 #include "aether/serialize.hpp"

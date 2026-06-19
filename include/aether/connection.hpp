@@ -1,7 +1,7 @@
-// aether - connection state machine. One peer
-// connection that ties together the handshake state machine, channels, reliability tracking,
-// and congestion control. Data-first: a plain Connection struct mutated by free functions;
-// operations that could fail return std::optional<ConnectionError> (nullopt = success).
+// aether - connection state machine for one peer: ties together the handshake state machine,
+// channels, reliability tracking, and congestion control. Data-first: a plain Connection struct
+// mutated by free functions; operations that can fail return std::optional<ConnectionError>
+// (nullopt = success).
 #pragma once
 
 #include "aether/channel.hpp"

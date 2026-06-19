@@ -1,6 +1,6 @@
-// aether - ChaCha20-Poly1305 AEAD for packet payloads (RFC 8439). Implemented from scratch --
-// no crypto dependency. Verified against the RFC 8439
-// section 2.8.2 test vector in the test suite. Data-first: plain key bytes, free functions.
+// aether - ChaCha20-Poly1305 AEAD for packet payloads (RFC 8439). Implemented from scratch, no
+// crypto dependency, and verified against the RFC 8439 section 2.8.2 test vector in the test
+// suite. Data-first: plain key bytes, free functions.
 //
 // Wire format of an encrypted payload: [counter:8 BE][ciphertext:N][auth tag:16].
 // The 12-byte ChaCha nonce is [counter:8 BE][protocolId:4 BE].

@@ -1,6 +1,6 @@
 // aether - message fragmentation, reassembly, and path-MTU discovery. Splits messages too big
-// for the MTU into 6-byte-headered
-// fragments, reassembles them, and probes the path MTU via binary search.
+// for the MTU into 6-byte-headered fragments, reassembles them, and probes the path MTU via
+// binary search.
 #pragma once
 
 #include "aether/types.hpp"

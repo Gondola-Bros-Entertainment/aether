@@ -1,7 +1,7 @@
 // aether - packet integrity, rate limiting, and connect tokens. CRC32C (Castagnoli) detects
-// corruption; the rate limiter throttles
-// connection requests per source; connect tokens authenticate clients with replay defense.
-// CRC is a compile-time table (software); a SIMD path is a later speed concern.
+// corruption; the rate limiter throttles connection requests per source; connect tokens
+// authenticate clients with replay defense. The CRC table is built at compile time (software);
+// a SIMD path is a later speed concern.
 #pragma once
 
 #include "aether/types.hpp"
