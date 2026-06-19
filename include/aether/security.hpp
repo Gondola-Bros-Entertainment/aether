@@ -129,7 +129,6 @@ struct TokenValidator {
     std::map<std::pair<std::uint64_t, std::uint64_t>, MonoTime> usedTokens;  // (clientId, createTime.ns) -> usedAt
     double tokenLifetimeMs  = 0.0;
     int    maxTrackedTokens = 0;
-    int    tokensEvicted    = 0;
 };
 
 inline TokenValidator newTokenValidator(double lifetimeMs, int maxTracked) {
@@ -146,11 +145,9 @@ inline void cleanupExpired(TokenValidator& tv, MonoTime now) {
 }
 inline void evictOldest(TokenValidator& tv) {
     if (tv.usedTokens.empty()) return;
-    auto oldest = tv.usedTokens.begin();
-    for (auto it = tv.usedTokens.begin(); it != tv.usedTokens.end(); ++it)
-        if (it->second.ns < oldest->second.ns) oldest = it;
+    const auto oldest = std::min_element(tv.usedTokens.begin(), tv.usedTokens.end(),
+                                         [](const auto& a, const auto& b) { return a.second.ns < b.second.ns; });
     tv.usedTokens.erase(oldest);
-    tv.tokensEvicted += 1;
 }
 inline void enforceLimit(TokenValidator& tv, MonoTime now) {
     if (static_cast<int>(tv.usedTokens.size()) <= tv.maxTrackedTokens) return;

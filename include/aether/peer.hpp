@@ -220,11 +220,13 @@ inline std::vector<PeerEvent> handleConnectionAccepted(NetPeer& peer, const Peer
     peer.pending.erase(pid);
     return { evConnected(pid, ConnectionDirection::Outbound) };
 }
-inline std::vector<PeerEvent> handleDisconnect(NetPeer& peer, const PeerId& pid) {
+inline std::vector<PeerEvent> handleDisconnect(NetPeer& peer, const PeerId& pid, const Packet& pkt) {
     if (peer.connections.count(pid)) {
         peer.connections.erase(pid);
         cleanupPeer(peer, pid);
-        return { evDisconnected(pid, DisconnectReason::Requested) };
+        const DisconnectReason reason = pkt.payload.empty() ? DisconnectReason::Requested
+                                                            : parseDisconnectReason(pkt.payload[0]);
+        return { evDisconnected(pid, reason) };
     }
     removePending(peer, pid);
     return {};
@@ -301,7 +303,7 @@ inline std::vector<PeerEvent> handlePacketByType(NetPeer& peer, const PeerId& pi
         case PacketType::ConnectionDenied:
             removePending(peer, pid);
             return { evDisconnected(pid, denyToDisconnectReason(decodeDenyReason(pkt.payload))) };
-        case PacketType::Disconnect:          return handleDisconnect(peer, pid);
+        case PacketType::Disconnect:          return handleDisconnect(peer, pid, pkt);
         case PacketType::Payload:
             return peer.connections.count(pid) ? handlePayload(peer, pid, pkt, now) : handleMigration(peer, pid, pkt, now);
         case PacketType::Keepalive:

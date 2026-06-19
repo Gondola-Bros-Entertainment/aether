@@ -21,7 +21,6 @@ using EncryptionKey = std::array<std::uint8_t, 32>;
 // Monotonically increasing nonce counter (one per connection direction).
 struct NonceCounter { std::uint64_t value{}; };
 
-inline constexpr int encryptionKeySize  = 32;
 inline constexpr int nonceSize          = 8;   // counter bytes on the wire
 inline constexpr int authTagSize        = 16;
 inline constexpr int encryptionOverhead = nonceSize + authTagSize;   // 24
