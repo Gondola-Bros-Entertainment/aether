@@ -37,7 +37,7 @@ inline NetworkSimulator newNetworkSimulator(const SimulationConfig& config, Mono
     return s;
 }
 
-inline std::uint64_t simNextRandom(NetworkSimulator& s) { const auto r = nextRandom(s.rngState); s.rngState = r.state; return r.output; }
+inline std::uint64_t simulatorNextRandom(NetworkSimulator& s) { const auto r = nextRandom(s.rngState); s.rngState = r.state; return r.output; }
 
 inline void refillTokens(NetworkSimulator& s, MonoTime now) {
     const double elapsedSecs = elapsedMs(s.lastTokenRefill, now) / 1000.0;
@@ -50,10 +50,10 @@ using SimPacket = std::pair<Bytes, std::uint64_t>;
 
 // Push an outgoing packet through the simulator; returns any packets to deliver immediately.
 inline std::vector<SimPacket> simulatorProcessSend(NetworkSimulator& s, const Bytes& data, std::uint64_t addr, MonoTime now) {
-    const std::uint64_t   r1  = simNextRandom(s);
-    const std::uint64_t   r2  = simNextRandom(s);
-    const std::uint64_t   r3  = simNextRandom(s);
-    const std::uint64_t   r4  = simNextRandom(s);
+    const std::uint64_t   r1  = simulatorNextRandom(s);
+    const std::uint64_t   r2  = simulatorNextRandom(s);
+    const std::uint64_t   r3  = simulatorNextRandom(s);
+    const std::uint64_t   r4  = simulatorNextRandom(s);
     const SimulationConfig& cfg = s.config;
 
     if (cfg.packetLoss > 0.0 && randomDouble(r1) < cfg.packetLoss) return {};
@@ -75,9 +75,9 @@ inline std::vector<SimPacket> simulatorProcessSend(NetworkSimulator& s, const By
     if (totalDelayMs < immediateDeliveryThresholdMs) immediate.push_back({ data, addr });
     else                                             s.delayedPackets.push_back({ data, addr, deliverAt });
 
-    const std::uint64_t rd = simNextRandom(s);
+    const std::uint64_t rd = simulatorNextRandom(s);
     if (cfg.duplicateChance > 0.0 && randomDouble(rd) < cfg.duplicateChance) {
-        const std::uint64_t rdJitter = simNextRandom(s);   // independent draw for the dup jitter, not the gate value
+        const std::uint64_t rdJitter = simulatorNextRandom(s);   // independent draw for the dup jitter, not the gate value
         const MonoTime dupAt{ now.ns + static_cast<std::uint64_t>((totalDelayMs + randomDouble(rdJitter) * duplicateJitterMs) * 1e6) };
         s.delayedPackets.push_back({ data, addr, dupAt });
     }
@@ -96,7 +96,7 @@ inline std::vector<SimPacket> simulatorReceiveReady(NetworkSimulator& s, MonoTim
     return ready;
 }
 
-inline int                     simulatorPendingCount(const NetworkSimulator& s) { return static_cast<int>(s.delayedPackets.size()); }
+inline int simulatorPendingCount(const NetworkSimulator& s) { return static_cast<int>(s.delayedPackets.size()); }
 inline const SimulationConfig& simulatorConfig(const NetworkSimulator& s) { return s.config; }
 
 } // namespace aether

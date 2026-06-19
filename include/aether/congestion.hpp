@@ -64,9 +64,8 @@ inline CongestionController newCongestionController(double baseSendRate, double 
 
 // Refill the per-tick byte budget = floor(rate * mtu).
 inline void ccRefillBudget(CongestionController& cc, int mtu) {
-    const int bytesPerTick = static_cast<int>(cc.currentSendRate * static_cast<double>(mtu));
-    cc.bytesPerTick         = bytesPerTick;
-    cc.budgetBytesRemaining = bytesPerTick;
+    cc.bytesPerTick         = static_cast<int>(cc.currentSendRate * static_cast<double>(mtu));
+    cc.budgetBytesRemaining = cc.bytesPerTick;
 }
 inline void ccDeductBudget(CongestionController& cc, int bytes) { cc.budgetBytesRemaining -= bytes; }
 

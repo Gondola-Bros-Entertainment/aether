@@ -472,6 +472,7 @@ int main() {
         aether::Reader ddr{ dbuf, ddw.pos, 0 };
         const auto deltaBack = aether::deltaUnpack(ddr, inv);
         assert(deltaBack && aether::fieldEqual(*deltaBack, moved));
+        std::printf("aether dynamic-fields OK: string/vector/optional round-trip through raw + varint + delta\n");
     }
 
     // audit-fix verification: each correctness bug from the audit, pinned by a test.

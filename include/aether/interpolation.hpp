@@ -53,7 +53,7 @@ template <class T> std::optional<T> sampleSnapshot(const SnapshotBuffer<T>& buf,
             const double duration = b.timestamp - a.timestamp;
             if (duration <= 0.0) return a.state;
             float t = static_cast<float>((targetTime - a.timestamp) / duration);
-            t = std::max(0.0f, std::min(1.0f, t));
+            t = std::clamp(t, 0.0f, 1.0f);
             return lerp(a.state, b.state, t);
         }
     }
@@ -67,6 +67,6 @@ template <class T> int    snapshotCount(const SnapshotBuffer<T>& buf) { return s
 template <class T> bool   snapshotIsEmpty(const SnapshotBuffer<T>& buf) { return buf.snapshots.empty(); }
 template <class T> bool   snapshotReady(const SnapshotBuffer<T>& buf) { return static_cast<int>(buf.snapshots.size()) >= buf.bufferDepth; }
 template <class T> double snapshotPlaybackDelayMs(const SnapshotBuffer<T>& buf) { return buf.playbackDelayMs; }
-template <class T> void   setPlaybackDelayMs(SnapshotBuffer<T>& buf, double delay) { buf.playbackDelayMs = delay; }
+template <class T> void   snapshotSetPlaybackDelayMs(SnapshotBuffer<T>& buf, double delay) { buf.playbackDelayMs = delay; }
 
 } // namespace aether

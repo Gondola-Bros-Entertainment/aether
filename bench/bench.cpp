@@ -17,7 +17,7 @@
 namespace {
 
 // A realistic replicated entity: position + velocity + a few stats. Trivially copyable, so
-// the memcpy path is legal. 12 fields -- the reflection cap and a fair real-world size.
+// the memcpy path is legal. 12 fields -- a fair real-world size (the cap is 32).
 struct Entity {
     float         px, py, pz;
     float         vx, vy, vz;

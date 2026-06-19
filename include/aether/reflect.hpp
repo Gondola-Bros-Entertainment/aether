@@ -159,10 +159,14 @@ template <class T> bool readAny(Reader& r, T& v) {
         return true;
     } else if constexpr (std::is_integral_v<T>) {
         using U = std::make_unsigned_t<T>;
-        if constexpr (sizeof(T) == 1) { const auto x = read<std::uint8_t >(r); if (!x) return false; v = static_cast<T>(static_cast<U>(*x)); return true; }
-        else if constexpr (sizeof(T) == 2) { const auto x = read<std::uint16_t>(r); if (!x) return false; v = static_cast<T>(static_cast<U>(*x)); return true; }
-        else if constexpr (sizeof(T) == 4) { const auto x = read<std::uint32_t>(r); if (!x) return false; v = static_cast<T>(static_cast<U>(*x)); return true; }
-        else                               { const auto x = read<std::uint64_t>(r); if (!x) return false; v = static_cast<T>(static_cast<U>(*x)); return true; }
+        std::optional<U> x;
+        if      constexpr (sizeof(T) == 1) x = read<std::uint8_t >(r);
+        else if constexpr (sizeof(T) == 2) x = read<std::uint16_t>(r);
+        else if constexpr (sizeof(T) == 4) x = read<std::uint32_t>(r);
+        else                               x = read<std::uint64_t>(r);
+        if (!x) return false;
+        v = static_cast<T>(*x);
+        return true;
     } else {
         const auto x = read<T>(r);   // float, double
         if (!x) return false;

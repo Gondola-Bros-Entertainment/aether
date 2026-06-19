@@ -43,10 +43,10 @@ struct PeerEvent {
     Bytes               data;                                        // Message
     PeerId              other{};                                     // Migrated: new id (peer = old)
 };
-inline PeerEvent evConnected(const PeerId& p, ConnectionDirection d) { PeerEvent e; e.kind = PeerEvent::Connected; e.peer = p; e.direction = d; return e; }
-inline PeerEvent evDisconnected(const PeerId& p, DisconnectReason r) { PeerEvent e; e.kind = PeerEvent::Disconnected; e.peer = p; e.reason = r; return e; }
-inline PeerEvent evMessage(const PeerId& p, ChannelId ch, Bytes d)   { PeerEvent e; e.kind = PeerEvent::Message; e.peer = p; e.channel = ch; e.data = std::move(d); return e; }
-inline PeerEvent evMigrated(const PeerId& oldP, const PeerId& newP)  { PeerEvent e; e.kind = PeerEvent::Migrated; e.peer = oldP; e.other = newP; return e; }
+inline PeerEvent evConnected(const PeerId& p, ConnectionDirection d) { return { .kind = PeerEvent::Connected, .peer = p, .direction = d }; }
+inline PeerEvent evDisconnected(const PeerId& p, DisconnectReason r) { return { .kind = PeerEvent::Disconnected, .peer = p, .reason = r }; }
+inline PeerEvent evMessage(const PeerId& p, ChannelId ch, Bytes d)   { return { .kind = PeerEvent::Message, .peer = p, .channel = ch, .data = std::move(d) }; }
+inline PeerEvent evMigrated(const PeerId& oldP, const PeerId& newP)  { return { .kind = PeerEvent::Migrated, .peer = oldP, .other = newP }; }
 
 struct IncomingPacket { PeerId from; Bytes data; };
 struct RawPacket      { PeerId to;   Bytes data; };

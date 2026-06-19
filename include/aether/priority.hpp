@@ -55,9 +55,9 @@ std::vector<Id> priorityDrainTop(PriorityAccumulator<Id>& pa, int budgetBytes, S
     return selected;
 }
 
-template <class Id> int  priorityCount(const PriorityAccumulator<Id>& pa) { return static_cast<int>(pa.entries.size()); }
+template <class Id> int priorityCount(const PriorityAccumulator<Id>& pa) { return static_cast<int>(pa.entries.size()); }
 template <class Id> bool priorityIsEmpty(const PriorityAccumulator<Id>& pa) { return pa.entries.empty(); }
-template <class Id> std::optional<float> getPriority(const PriorityAccumulator<Id>& pa, const Id& id) {
+template <class Id> std::optional<float> priorityGet(const PriorityAccumulator<Id>& pa, const Id& id) {
     const auto it = pa.entries.find(id);
     if (it == pa.entries.end()) return std::nullopt;
     return it->second.accumulated;

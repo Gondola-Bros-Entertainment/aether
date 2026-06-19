@@ -33,9 +33,9 @@ struct ChannelConfig {
     int          maxReliableRetries   = 10;
     std::uint8_t priority             = 0;
 };
-inline ChannelConfig unreliableChannel()        { ChannelConfig c; c.deliveryMode = DeliveryMode::Unreliable;        return c; }
-inline ChannelConfig reliableOrderedChannel()   { ChannelConfig c; c.deliveryMode = DeliveryMode::ReliableOrdered;   return c; }
-inline ChannelConfig reliableSequencedChannel() { ChannelConfig c; c.deliveryMode = DeliveryMode::ReliableSequenced; return c; }
+inline ChannelConfig unreliableChannel()        { return { .deliveryMode = DeliveryMode::Unreliable        }; }
+inline ChannelConfig reliableOrderedChannel()   { return { .deliveryMode = DeliveryMode::ReliableOrdered   }; }
+inline ChannelConfig reliableSequencedChannel() { return { .deliveryMode = DeliveryMode::ReliableSequenced }; }
 
 struct ChannelMessage {
     SequenceNum sequence{};

@@ -91,20 +91,17 @@ inline Connection newConnection(const NetworkConfig& config, std::uint64_t clien
     c.lastRecvTime = now;
 
     const int numChannels = config.maxChannels;
-    std::vector<ChannelConfig> configs;
-    configs.reserve(static_cast<std::size_t>(numChannels));
     c.channels.reserve(static_cast<std::size_t>(numChannels));
     for (int i = 0; i < numChannels; ++i) {
         const ChannelConfig cfg = (i < static_cast<int>(config.channelConfigs.size()))
                                       ? config.channelConfigs[static_cast<std::size_t>(i)]
                                       : config.defaultChannelConfig;
-        configs.push_back(cfg);
         c.channels.push_back(newChannel(static_cast<ChannelId>(i), cfg));
     }
     c.channelPriority.resize(static_cast<std::size_t>(numChannels));
     for (int i = 0; i < numChannels; ++i) c.channelPriority[static_cast<std::size_t>(i)] = i;
     std::stable_sort(c.channelPriority.begin(), c.channelPriority.end(),
-                     [&](int a, int b) { return configs[static_cast<std::size_t>(a)].priority > configs[static_cast<std::size_t>(b)].priority; });
+                     [&](int a, int b) { return c.channels[static_cast<std::size_t>(a)].config.priority > c.channels[static_cast<std::size_t>(b)].config.priority; });
 
     c.congestion = newCongestionController(config.sendRate, config.congestionBadLossThreshold,
                                            config.congestionGoodRttThreshold, config.congestionRecoveryTimeMs);
@@ -116,11 +113,11 @@ inline Connection newConnection(const NetworkConfig& config, std::uint64_t clien
 }
 
 // --- queries ---
-inline ConnectionState    connectionState(const Connection& c) noexcept { return c.state; }
-inline bool               isConnected(const Connection& c) noexcept { return c.state == ConnectionState::Connected; }
+inline ConnectionState     connectionState(const Connection& c) noexcept { return c.state; }
+inline bool                isConnected(const Connection& c) noexcept { return c.state == ConnectionState::Connected; }
 inline const NetworkStats& connectionStats(const Connection& c) noexcept { return c.stats; }
-inline SequenceNum        connRemoteSeq(const Connection& c) noexcept { return c.reliability.remoteSeq; }
-inline std::uint8_t       channelCount(const Connection& c) noexcept { return static_cast<std::uint8_t>(c.channels.size()); }
+inline SequenceNum         connRemoteSeq(const Connection& c) noexcept { return c.reliability.remoteSeq; }
+inline std::uint8_t        channelCount(const Connection& c) noexcept { return static_cast<std::uint8_t>(c.channels.size()); }
 
 // --- header creation ---
 inline PacketHeader createHeaderInternal(const Connection& conn) {
@@ -253,10 +250,10 @@ inline void processChannelMessages(Connection& conn, MonoTime now, int chIdx) {
         const int   wireSize   = static_cast<int>(wireData.size());
         const bool  isReliable = channelIsReliable(channel);
 
-        bool cwndAllows;
-        if (isReliable && wireSize <= smallReliableThreshold) cwndAllows = true;   // small reliable bypasses cwnd
-        else if (conn.cwnd) cwndAllows = cwCanSend(*conn.cwnd, wireSize) && cwCanSendPaced(*conn.cwnd, now);
-        else cwndAllows = true;
+        // small reliable messages bypass cwnd; otherwise honor the window if present
+        const bool cwndAllows = (isReliable && wireSize <= smallReliableThreshold)
+                              || !conn.cwnd
+                              || (cwCanSend(*conn.cwnd, wireSize) && cwCanSendPaced(*conn.cwnd, now));
         if (!cwndAllows) break;
 
         commitOutgoingMessage(channel);
