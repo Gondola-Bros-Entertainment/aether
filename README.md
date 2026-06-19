@@ -50,8 +50,9 @@ cmake --build build
 ctest --test-dir build
 ```
 
-Needs a C++20 compiler (clang or gcc). Sockets are POSIX; a Windows port touches only
-`src/socket.cpp`.
+Needs a C++20 compiler -- clang, gcc, or MSVC. The socket layer is the one platform file, split
+`src/socket_posix.cpp` (BSD sockets) / `src/socket_win.cpp` (Winsock); CMake picks one. CI builds
+and tests on all three compilers across Linux, macOS, and Windows.
 
 ## Getting started
 
@@ -116,9 +117,8 @@ cmake --build build --target aether_bench_compare && ./build/aether_bench_compar
 The netcode stack is complete and hardened. Reliable delivery is exercised under heavy simulated
 packet loss -- a message that must arrive does, by retransmit -- and the encryption is verified
 against the RFC 8439 vectors. CI is a staged pipeline: static analysis, then ASan/UBSan, then a
-build matrix across gcc and clang on Linux and macOS, all warning-clean under -Werror. Planned
-next: serializer benchmarks against other libraries, a Windows (Winsock) build, and NAT
-punch-through.
+build-and-test matrix across gcc, clang, and MSVC on Linux, macOS, and Windows, all warning-clean
+under -Werror. Planned next: NAT punch-through.
 
 ## License
 
