@@ -1,0 +1,14 @@
+# build output
+build/
+build-audit/
+.cache/
+*.o
+*.a
+compile_commands.json
+
+# OS
+.DS_Store
+
+# local working docs (not published)
+CLAUDE.md
+PLAN.md
