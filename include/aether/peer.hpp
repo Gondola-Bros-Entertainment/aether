@@ -40,7 +40,7 @@ struct PeerEvent {
     ConnectionDirection direction = ConnectionDirection::Inbound;   // Connected
     DisconnectReason    reason    = DisconnectReason::Requested;     // Disconnected
     ChannelId           channel   = ChannelId{};                     // Message
-    Bytes               data;                                        // Message
+    Bytes               data{};                                      // Message
     PeerId              other{};                                     // Migrated: new id (peer = old)
 };
 inline PeerEvent evConnected(const PeerId& p, ConnectionDirection d) { return { .kind = PeerEvent::Connected, .peer = p, .direction = d }; }
