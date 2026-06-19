@@ -111,19 +111,21 @@ inline void poly1305(const std::uint8_t key[32], const std::uint8_t* msg, std::s
         };
         h[0] += ext26(0); h[1] += ext26(26); h[2] += ext26(52); h[3] += ext26(78); h[4] += ext26(104);
 
-        unsigned __int128 d[5];
+        // 26-bit limbs keep every product under 2^58, so the multiply-reduce fits in uint64 --
+        // no 128-bit type needed (the poly1305-donna 32-bit approach; portable to MSVC).
+        std::uint64_t d[5];
         for (int m = 0; m < 5; ++m) {
-            unsigned __int128 acc = 0;
+            std::uint64_t acc = 0;
             for (int i = 0; i < 5; ++i) {
                 const int j = m - i;
-                if (j >= 0 && j < 5) acc += (unsigned __int128)h[i] * r[j];
+                if (j >= 0 && j < 5) acc += h[i] * r[j];
                 const int j2 = m + 5 - i;
-                if (j2 >= 0 && j2 < 5) acc += (unsigned __int128)(5 * h[i]) * r[j2];
+                if (j2 >= 0 && j2 < 5) acc += (5 * h[i]) * r[j2];
             }
             d[m] = acc;
         }
         std::uint64_t c = 0;
-        for (int m = 0; m < 5; ++m) { const unsigned __int128 v = d[m] + c; h[m] = std::uint64_t(v) & 0x3ffffff; c = std::uint64_t(v >> 26); }
+        for (int m = 0; m < 5; ++m) { const std::uint64_t v = d[m] + c; h[m] = v & 0x3ffffff; c = v >> 26; }
         h[0] += c * 5; c = h[0] >> 26; h[0] &= 0x3ffffff; h[1] += c;
         off += blk;
     }
@@ -139,12 +141,16 @@ inline void poly1305(const std::uint8_t key[32], const std::uint8_t* msg, std::s
     const bool ge = h[4] == 0x3ffffff && h[3] == 0x3ffffff && h[2] == 0x3ffffff && h[1] == 0x3ffffff && h[0] >= 0x3fffffb;
     if (ge) { std::uint64_t cc = 5; for (int m = 0; m < 5; ++m) { h[m] += cc; cc = h[m] >> 26; h[m] &= 0x3ffffff; } }
 
-    unsigned __int128 hv = (unsigned __int128)h[0] | ((unsigned __int128)h[1] << 26) | ((unsigned __int128)h[2] << 52)
-                         | ((unsigned __int128)h[3] << 78) | ((unsigned __int128)h[4] << 104);
-    const unsigned __int128 sv = (unsigned __int128)cryptoLe32(key + 16) | ((unsigned __int128)cryptoLe32(key + 20) << 32)
-                               | ((unsigned __int128)cryptoLe32(key + 24) << 64) | ((unsigned __int128)cryptoLe32(key + 28) << 96);
-    hv += sv;
-    for (int i = 0; i < 16; ++i) tag[i] = std::uint8_t(hv >> (8 * i));
+    // Reassemble the five 26-bit limbs into the low 128 bits as two uint64 halves, add the
+    // 128-bit s key with a manual carry, then serialize little-endian. Portable, no __int128.
+    const std::uint64_t lo  = h[0] | (h[1] << 26) | (h[2] << 52);
+    const std::uint64_t hi  = (h[2] >> 12) | (h[3] << 14) | (h[4] << 40);
+    const std::uint64_t sLo = std::uint64_t(cryptoLe32(key + 16)) | (std::uint64_t(cryptoLe32(key + 20)) << 32);
+    const std::uint64_t sHi = std::uint64_t(cryptoLe32(key + 24)) | (std::uint64_t(cryptoLe32(key + 28)) << 32);
+    const std::uint64_t rLo = lo + sLo;
+    const std::uint64_t rHi = hi + sHi + (rLo < lo ? 1 : 0);   // carry out of the low half
+    for (int i = 0; i < 8; ++i) tag[i]     = std::uint8_t(rLo >> (8 * i));
+    for (int i = 0; i < 8; ++i) tag[8 + i] = std::uint8_t(rHi >> (8 * i));
 }
 
 inline bool constTimeEq(const std::uint8_t* a, const std::uint8_t* b, std::size_t n) noexcept {
