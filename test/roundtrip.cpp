@@ -335,8 +335,10 @@ int main() {
         assert(aether::isConnected(a) && aether::isConnected(b));
 
         const aether::Bytes payload = { 0xDE, 0xAD, 0xBE, 0xEF };
-        assert(!aether::sendMessage(a, aether::ChannelId{ 0 }, payload, aether::MonoTime{ 0 }));
-        assert(!aether::updateTick(a, aether::MonoTime{ 1000000 }));      // 1ms: flush channel -> queue
+        const auto cSendErr = aether::sendMessage(a, aether::ChannelId{ 0 }, payload, aether::MonoTime{ 0 });
+        assert(!cSendErr);
+        const auto cUpdateErr = aether::updateTick(a, aether::MonoTime{ 1000000 });   // 1ms: flush channel -> queue
+        assert(!cUpdateErr);
         const auto outgoing = aether::drainSendQueue(a);
         assert(!outgoing.empty());
 
@@ -367,7 +369,8 @@ int main() {
         aether::markConnected(b, aether::MonoTime{ 0 });
 
         const aether::Bytes payload = { 0xCA, 0xFE, 0xBA, 0xBE };
-        assert(!aether::sendMessage(a, aether::ChannelId{ 0 }, payload, aether::MonoTime{ 0 }));   // channel 0 is reliable
+        const auto sendErr = aether::sendMessage(a, aether::ChannelId{ 0 }, payload, aether::MonoTime{ 0 });   // channel 0 is reliable
+        assert(!sendErr);
 
         std::uint64_t rng = 1;   // deterministic ~40% loss, so the test is reproducible
         const auto lost = [&] { const auto r = aether::nextRandom(rng); rng = r.state; return aether::randomDouble(r.output) < 0.4; };

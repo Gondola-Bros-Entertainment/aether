@@ -1,0 +1,21 @@
+# aether lint -- curated to signal, not style.
+#
+# On this hand-crafted, twice-audited codebase the stock readability/modernize/misc checks are
+# almost all noise: they fight the deliberate dense one-liners (braces-around-statements), the
+# lowercase literal suffixes, the C arrays, #pragma once, and explicit types. None of those are
+# bugs. So clang-tidy here is a bug/perf/portability safety net, not a style cop -- the families
+# below, minus a handful that false-positive on this code (branch-clone on `if constexpr` chains,
+# infinite-loop on the varint shift loop, incorrect-roundings on non-negative quantization).
+Checks: >
+  bugprone-*,
+  performance-*,
+  portability-*,
+  clang-analyzer-*,
+  -bugprone-branch-clone,
+  -bugprone-infinite-loop,
+  -bugprone-incorrect-roundings,
+  -bugprone-easily-swappable-parameters,
+  -performance-enum-size,
+  -portability-avoid-pragma-once
+WarningsAsErrors: ''
+HeaderFilterRegex: 'aether/.*'

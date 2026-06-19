@@ -65,7 +65,7 @@ inline void readWire(BitReader& rd, Ranged<T, Lo, Hi>& r) noexcept {
 template <float Lo, float Hi, int Bits>
 inline void writeWire(BitWriter& w, const Quantized<Lo, Hi, Bits>& q) noexcept {
     const float c = q.value < Lo ? Lo : (q.value > Hi ? Hi : q.value);
-    const std::uint32_t maxv = Bits >= 32 ? 0xFFFFFFFFu : ((std::uint32_t{1} << Bits) - 1);
+    const std::uint32_t maxv = static_cast<std::uint32_t>((std::uint64_t{ 1 } << Bits) - 1);   // 64-bit shift: valid for Bits up to 32
     // math in double: static_cast<float>(maxv) rounds 2^32-1 up to 2^32, so at Bits==32 a
     // value of Hi would cast an out-of-range float to uint32 (UB). double holds maxv exactly.
     const double norm = (static_cast<double>(c) - Lo) / (static_cast<double>(Hi) - Lo);
@@ -74,7 +74,7 @@ inline void writeWire(BitWriter& w, const Quantized<Lo, Hi, Bits>& q) noexcept {
 }
 template <float Lo, float Hi, int Bits>
 inline void readWire(BitReader& r, Quantized<Lo, Hi, Bits>& q) noexcept {
-    const std::uint32_t maxv = Bits >= 32 ? 0xFFFFFFFFu : ((std::uint32_t{1} << Bits) - 1);
+    const std::uint32_t maxv = static_cast<std::uint32_t>((std::uint64_t{ 1 } << Bits) - 1);   // 64-bit shift: valid for Bits up to 32
     const std::uint32_t qv = readBits(r, Bits);
     q.value = static_cast<float>(static_cast<double>(Lo) + static_cast<double>(qv) / maxv * (static_cast<double>(Hi) - Lo));
 }

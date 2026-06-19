@@ -1,6 +1,5 @@
 # build output
-build/
-build-audit/
+build*/
 .cache/
 *.o
 *.a

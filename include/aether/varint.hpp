@@ -33,6 +33,9 @@ inline std::optional<std::uint64_t> readVarU(Reader& r) noexcept {
 
 // Zig-zag maps signed to unsigned so that small |v| (positive or negative) encode small.
 inline std::uint64_t zigzag(std::int64_t v) noexcept {
+    // v >> 63 is an arithmetic shift -- well-defined for signed values in C++20 -- giving the
+    // sign-extended mask (0 or all-ones).
+    // cppcheck-suppress shiftTooManyBitsSigned
     return (static_cast<std::uint64_t>(v) << 1) ^ static_cast<std::uint64_t>(v >> 63);
 }
 inline std::int64_t unzigzag(std::uint64_t v) noexcept {

@@ -7,16 +7,53 @@ on:
 
 jobs:
   build-test:
+    name: ${{ matrix.os }} / ${{ matrix.cc }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - { os: ubuntu-latest, cc: gcc,   cxx: g++ }
+          - { os: ubuntu-latest, cc: clang, cxx: clang++ }
+          - { os: macos-latest,  cc: clang, cxx: clang++ }
     runs-on: ${{ matrix.os }}
+    env:
+      CC: ${{ matrix.cc }}
+      CXX: ${{ matrix.cxx }}
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -B build
+        run: cmake -B build -DCMAKE_CXX_FLAGS="-Werror"
       - name: Build
         run: cmake --build build -j
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  sanitizers:
+    name: asan + ubsan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -B build -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -g"
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  lint:
+    name: clang-tidy + cppcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update && sudo apt-get install -y clang-tidy cppcheck
+      - name: Configure
+        run: cmake -B build   # generates compile_commands.json + the per-header self-containment TUs
+      - name: clang-tidy
+        run: clang-tidy -p build --warnings-as-errors='*' build/selfcontained/*.cpp src/socket.cpp
+      - name: cppcheck
+        run: >
+          cppcheck --enable=warning,performance,portability --std=c++20
+          --error-exitcode=1 --quiet --inline-suppr
+          --suppress=missingIncludeSystem --suppress=uninitMemberVarNoCtor
+          -I include src test bench
