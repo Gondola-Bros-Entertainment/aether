@@ -20,20 +20,19 @@ using BaselineSeq = std::uint16_t;
 inline constexpr BaselineSeq noBaseline      = 0xFFFF;   // sentinel: no baseline, full state follows
 inline constexpr int         maxSnapshotBytes = 65536;   // scratch buffer cap for one snapshot
 
-// Pack a full snapshot / a delta into a Bytes buffer (delta.hpp writes into a fixed Writer).
+// Pack a full snapshot / a delta. A reused thread-local scratch (sized once per thread) avoids the
+// per-call 64KB allocation; only the right-sized result is copied out.
 template <class T> Bytes packFull(const T& v) {
-    Bytes buf(maxSnapshotBytes);
-    Writer w{ buf.data(), buf.size(), 0, true };
+    static thread_local Bytes scratch(maxSnapshotBytes);
+    Writer w{ scratch.data(), scratch.size(), 0, true };
     pack(w, v);
-    buf.resize(w.pos);
-    return buf;
+    return Bytes(scratch.data(), scratch.data() + w.pos);
 }
 template <class T> Bytes packDelta(const T& prev, const T& curr) {
-    Bytes buf(maxSnapshotBytes);
-    Writer w{ buf.data(), buf.size(), 0, true };
+    static thread_local Bytes scratch(maxSnapshotBytes);
+    Writer w{ scratch.data(), scratch.size(), 0, true };
     deltaPack(w, prev, curr);
-    buf.resize(w.pos);
-    return buf;
+    return Bytes(scratch.data(), scratch.data() + w.pos);
 }
 
 // --- sender side ---
