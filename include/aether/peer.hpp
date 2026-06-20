@@ -148,6 +148,13 @@ inline constexpr int    peerFragmentMaxBufferSize = 1024 * 1024;
 inline constexpr double migrationCooldownMs       = 5000.0;
 inline constexpr double resumeGraceMs             = 30000.0;   // window a dropped session token can reconnect in
 
+// A recently-dropped session kept briefly for a fast reconnect: when it dropped, plus the key it
+// negotiated -- restored on reconnect so a resumed session stays encrypted, not downgraded to plaintext.
+struct ResumableSession {
+    MonoTime                     at{};
+    std::optional<EncryptionKey> key;
+};
+
 struct NetPeer {
     Address                              localAddr{};
     std::map<PeerId, Connection>         connections;
@@ -158,7 +165,7 @@ struct NetPeer {
     std::uint64_t                        rngState = 0;
     std::map<PeerId, FragmentAssembler>  fragmentAssemblers;
     std::map<std::uint64_t, MonoTime>    migrationCooldowns;
-    std::map<std::uint64_t, MonoTime>    resumableTokens;     // recently-dropped session tokens (clientSalt -> drop time)
+    std::map<std::uint64_t, ResumableSession> resumableTokens; // recently-dropped sessions (clientSalt -> drop time + key)
     std::vector<RawPacket>               sendQueue;
     std::uint64_t                        rateLimitDrops = 0;
 };
@@ -217,14 +224,16 @@ inline std::vector<PeerEvent> handleConnectionRequest(NetPeer& peer, const PeerI
     if (peer.connections.count(pid)) { queueControlPacket(peer, PacketType::ConnectionAccepted, {}, pid); return {}; }
     // reconnect: a request carrying a recently-dropped session token re-establishes that session
     // fast, skipping the challenge -- the token (the original clientSalt) is the credential. The
-    // session uses the pre-shared key today; once X25519 lands, this token becomes a resumption
-    // ticket that also restores the negotiated key -- true QUIC-style 0-RTT resume. <X25519 upgrade>
+    // token is a resumption ticket: it also restores the key the session negotiated, so a resume
+    // stays encrypted and skips the key exchange too -- true QUIC-style 0-RTT resume.
     if (const auto tok = decodeSalt(pkt.payload)) {
         const auto rit = peer.resumableTokens.find(*tok);
-        if (rit != peer.resumableTokens.end() && elapsedMs(rit->second, now) < resumeGraceMs) {
+        if (rit != peer.resumableTokens.end() && elapsedMs(rit->second.at, now) < resumeGraceMs) {
+            const auto resumedKey = rit->second.key;   // the key the original handshake negotiated
             peer.resumableTokens.erase(rit);
             peer.pending.erase(pid);
             Connection conn = newConnection(peer.config, *tok, now);
+            if (resumedKey) conn.encryptionKey = resumedKey;   // 0-RTT: the resumed session stays encrypted
             touchRecvTime(conn, now);
             markConnected(conn, now);
             peer.connections[pid] = std::move(conn);
@@ -276,7 +285,13 @@ inline std::vector<PeerEvent> handleConnectionAccepted(NetPeer& peer, const Peer
     const auto it = peer.pending.find(pid);
     if (it == peer.pending.end() || it->second.direction != ConnectionDirection::Outbound) return {};
     Connection conn = newConnection(peer.config, it->second.clientSalt, now);
-    if (it->second.sessionKey) conn.encryptionKey = it->second.sessionKey;   // negotiated session key
+    if (it->second.sessionKey) {
+        conn.encryptionKey = it->second.sessionKey;            // freshly negotiated session key
+    } else if (const auto rit = peer.resumableTokens.find(it->second.clientSalt);
+               rit != peer.resumableTokens.end() && rit->second.key) {
+        conn.encryptionKey = rit->second.key;                  // 0-RTT reconnect: restore the cached key
+        peer.resumableTokens.erase(rit);
+    }
     touchRecvTime(conn, now);
     markConnected(conn, now);
     peer.connections[pid] = std::move(conn);
@@ -483,7 +498,7 @@ inline std::vector<PeerEvent> updateConnections(NetPeer& peer, MonoTime now) {
     std::vector<PeerId>    disconnected;
     for (auto& [pid, conn] : peer.connections) {
         if (updateTick(conn, now)) {
-            peer.resumableTokens[conn.clientSalt] = now;   // remember the token for a fast reconnect
+            peer.resumableTokens[conn.clientSalt] = { now, conn.encryptionKey };   // token + key, for an encrypted reconnect
             events.push_back(evDisconnected(pid, DisconnectReason::Timeout));
             disconnected.push_back(pid);
         } else if (connectionState(conn) == ConnectionState::Disconnected) {
@@ -501,7 +516,7 @@ inline std::vector<PeerEvent> updateConnections(NetPeer& peer, MonoTime now) {
         if (!(elapsedMs(it->second, now) < migrationCooldownMs)) it = peer.migrationCooldowns.erase(it);
         else                                                     ++it;
     for (auto it = peer.resumableTokens.begin(); it != peer.resumableTokens.end();)
-        if (elapsedMs(it->second, now) >= resumeGraceMs) it = peer.resumableTokens.erase(it);
+        if (elapsedMs(it->second.at, now) >= resumeGraceMs) it = peer.resumableTokens.erase(it);
         else                                             ++it;
     return events;
 }
