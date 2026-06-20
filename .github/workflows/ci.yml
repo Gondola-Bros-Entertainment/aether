@@ -13,7 +13,7 @@ jobs:
     name: cppcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install cppcheck
         run: sudo apt-get update && sudo apt-get install -y cppcheck
       - name: Run cppcheck
@@ -27,7 +27,7 @@ jobs:
     needs: cppcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Configure
         run: cmake -B build -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-sanitize-recover=all -g"
       - name: Build
@@ -50,7 +50,7 @@ jobs:
       CC: ${{ matrix.cc }}
       CXX: ${{ matrix.cxx }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Configure
         run: cmake -B build -DAETHER_WERROR=ON
       - name: Build
@@ -63,7 +63,7 @@ jobs:
     needs: sanitizers
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Debug, not Release: Release defines NDEBUG, which compiles out every assert() -- the whole
       # test suite checks through assert(), so a Release run is a build check, not a test run. /WX
       # makes MSVC warnings errors, matching the -Werror the gcc/clang legs use.

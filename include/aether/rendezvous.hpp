@@ -75,34 +75,45 @@ inline std::optional<std::pair<std::uint64_t, Bytes>> decodeRelay(const Bytes& b
 }
 
 // --- rendezvous server: pairs two peers per room, and relays between them when the punch fails ---
+inline constexpr double rendezvousTtlMs = 300000.0;   // drop a waiting peer / idle session after 5 min
+
+struct RendezvousSession { Address a; Address b; MonoTime at; };   // the paired peers + last activity
 struct RendezvousServer {
-    std::map<std::uint64_t, Address>                     waiting;    // roomId -> first peer, awaiting its pair
-    std::map<std::uint64_t, std::pair<Address, Address>> sessions;   // roomId -> the paired peers, for relaying
+    std::map<std::uint64_t, std::pair<Address, MonoTime>> waiting;    // roomId -> (first peer, when it registered)
+    std::map<std::uint64_t, RendezvousSession>            sessions;   // roomId -> the paired peers, for relaying
 };
 
-// Pure: a Register pairs with a waiting peer in the same room and returns the Paired replies to
-// send -- the waiter accepts, the newcomer connects. Testable without a socket.
+// Pure: a Register pairs with a waiting peer in the same room and returns the Paired replies to send
+// -- the waiter accepts, the newcomer connects. Stale waiters / idle sessions are swept by TTL each
+// call so a long-running server does not leak. Testable without a socket.
 inline std::vector<std::pair<Address, Bytes>> rendezvousProcess(
-        RendezvousServer& rv, const std::vector<std::pair<Address, Bytes>>& incoming) {
+        RendezvousServer& rv, const std::vector<std::pair<Address, Bytes>>& incoming, MonoTime now) {
+    for (auto it = rv.waiting.begin(); it != rv.waiting.end();)
+        if (elapsedMs(it->second.second, now) >= rendezvousTtlMs) it = rv.waiting.erase(it); else ++it;
+    for (auto it = rv.sessions.begin(); it != rv.sessions.end();)
+        if (elapsedMs(it->second.at, now) >= rendezvousTtlMs) it = rv.sessions.erase(it); else ++it;
+
     std::vector<std::pair<Address, Bytes>> out;
     for (const auto& [src, data] : incoming) {
         if (const auto room = decodeRegister(data)) {
             const auto it = rv.waiting.find(*room);
             if (it == rv.waiting.end()) {
-                rv.waiting[*room] = src;                                          // first peer waits
+                rv.waiting[*room] = { src, now };                                 // first peer waits
             } else {
-                const Address first = it->second;
+                const Address first = it->second.first;
                 rv.waiting.erase(it);
-                rv.sessions[*room] = { first, src };                             // remember the pair for relay fallback
-                out.emplace_back(first, encodePaired(PunchRole::Accept, src));    // the waiter accepts
-                out.emplace_back(src,   encodePaired(PunchRole::Connect, first)); // the newcomer connects
+                rv.sessions[*room] = { first, src, now };                         // remember the pair for relay fallback
+                out.emplace_back(first, encodePaired(PunchRole::Accept, src));     // the waiter accepts
+                out.emplace_back(src,   encodePaired(PunchRole::Connect, first));  // the newcomer connects
             }
         } else if (const auto relay = decodeRelay(data)) {
             if (const auto sit = rv.sessions.find(relay->first); sit != rv.sessions.end()) {
-                const bool isFirst  = addrEqual(src, sit->second.first);
-                const bool isSecond = addrEqual(src, sit->second.second);
-                if (isFirst || isSecond)   // only a paired member may relay -- not an open reflector for strangers
-                    out.emplace_back(isFirst ? sit->second.second : sit->second.first, relay->second);
+                const bool isFirst  = addrEqual(src, sit->second.a);
+                const bool isSecond = addrEqual(src, sit->second.b);
+                if (isFirst || isSecond) {   // only a paired member may relay -- not an open reflector
+                    sit->second.at = now;     // activity keeps the session alive
+                    out.emplace_back(isFirst ? sit->second.b : sit->second.a, relay->second);
+                }
             }
         }
     }
@@ -110,7 +121,7 @@ inline std::vector<std::pair<Address, Bytes>> rendezvousProcess(
 }
 
 // Drive the server over a real socket: drain Registers, send the Paired replies.
-inline void rendezvousTick(RendezvousServer& rv, Socket& sock) {
+inline void rendezvousTick(RendezvousServer& rv, Socket& sock, MonoTime now) {
     static thread_local std::vector<std::uint8_t> scratch(maxUdpPacketSize);
     std::vector<std::pair<Address, Bytes>> incoming;
     for (;;) {
@@ -119,7 +130,7 @@ inline void rendezvousTick(RendezvousServer& rv, Socket& sock) {
         if (n <= 0) break;
         incoming.emplace_back(from, Bytes(scratch.begin(), scratch.begin() + static_cast<std::ptrdiff_t>(n)));
     }
-    for (const auto& [addr, data] : rendezvousProcess(rv, incoming))
+    for (const auto& [addr, data] : rendezvousProcess(rv, incoming, now))
         sendTo(sock, std::span<const std::uint8_t>(data.data(), data.size()), addr);
 }
 

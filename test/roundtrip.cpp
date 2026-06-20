@@ -1050,9 +1050,9 @@ int main() {
         aether::RendezvousServer rv;
         const aether::Address a = aether::addrV4(0x0A000001u, 1111);
         const aether::Address b = aether::addrV4(0x0A000002u, 2222);
-        const auto out1 = aether::rendezvousProcess(rv, { { a, aether::encodeRegister(7) } });
+        const auto out1 = aether::rendezvousProcess(rv, { { a, aether::encodeRegister(7) } }, aether::MonoTime{ 0 });
         assert(out1.empty());                                  // A waits
-        const auto out2 = aether::rendezvousProcess(rv, { { b, aether::encodeRegister(7) } });
+        const auto out2 = aether::rendezvousProcess(rv, { { b, aether::encodeRegister(7) } }, aether::MonoTime{ 0 });
         assert(out2.size() == 2);                              // B's arrival pairs them
         const auto pa = aether::decodePaired(out2[0].second);  // -> A: accept, B's address
         const auto pb = aether::decodePaired(out2[1].second);  // -> B: connect, A's address
@@ -1066,17 +1066,32 @@ int main() {
         aether::RendezvousServer rv;
         const aether::Address a = aether::addrV4(0x0A000001u, 1111);
         const aether::Address b = aether::addrV4(0x0A000002u, 2222);
-        aether::rendezvousProcess(rv, { { a, aether::encodeRegister(7) } });
-        aether::rendezvousProcess(rv, { { b, aether::encodeRegister(7) } });   // paired -> session stored
+        aether::rendezvousProcess(rv, { { a, aether::encodeRegister(7) } }, aether::MonoTime{ 0 });
+        aether::rendezvousProcess(rv, { { b, aether::encodeRegister(7) } }, aether::MonoTime{ 0 });   // paired -> session stored
         const aether::Bytes inner = { 0xDE, 0xAD, 0xBE, 0xEF };
-        const auto fwd = aether::rendezvousProcess(rv, { { a, aether::encodeRelay(7, inner.data(), inner.size()) } });
+        const auto fwd = aether::rendezvousProcess(rv, { { a, aether::encodeRelay(7, inner.data(), inner.size()) } }, aether::MonoTime{ 0 });
         assert(fwd.size() == 1 && aether::addrEqual(fwd[0].first, b) && fwd[0].second == inner);   // A's relay -> B, intact
-        const auto back = aether::rendezvousProcess(rv, { { b, aether::encodeRelay(7, inner.data(), inner.size()) } });
+        const auto back = aether::rendezvousProcess(rv, { { b, aether::encodeRelay(7, inner.data(), inner.size()) } }, aether::MonoTime{ 0 });
         assert(back.size() == 1 && aether::addrEqual(back[0].first, a));                            // B's relay -> A
         const aether::Address c = aether::addrV4(0x0A000099u, 9999);                                 // not a session member
-        const auto none = aether::rendezvousProcess(rv, { { c, aether::encodeRelay(7, inner.data(), inner.size()) } });
+        const auto none = aether::rendezvousProcess(rv, { { c, aether::encodeRelay(7, inner.data(), inner.size()) } }, aether::MonoTime{ 0 });
         assert(none.empty());                                                                       // not an open reflector
         std::printf("aether relay OK: rendezvous forwards a relayed packet to the paired peer; rejects non-members\n");
+    }
+
+    // rendezvous TTL: a waiting peer that never gets paired is swept after the TTL, so a long-running
+    // matchmaker does not leak (past the TTL a later registrant is a fresh waiter, not paired with it).
+    {
+        aether::RendezvousServer rv;
+        const aether::Address a = aether::addrV4(0x0A000001u, 1111);
+        const aether::Address b = aether::addrV4(0x0A000002u, 2222);
+        const auto r0 = aether::rendezvousProcess(rv, { { a, aether::encodeRegister(9) } }, aether::MonoTime{ 0 });
+        assert(r0.empty() && rv.waiting.size() == 1);   // A waits
+        const auto r1 = aether::rendezvousProcess(rv, {}, aether::MonoTime{ 400ull * 1000000000 });   // > TTL -> sweep
+        assert(r1.empty() && rv.waiting.empty());        // A's stale wait was dropped
+        const auto r2 = aether::rendezvousProcess(rv, { { b, aether::encodeRegister(9) } }, aether::MonoTime{ 400ull * 1000000000 });
+        assert(r2.empty() && rv.waiting.size() == 1);   // B is a fresh waiter, not paired with the expired A
+        std::printf("aether rendezvous-ttl OK: a stale waiter is swept after the TTL\n");
     }
 
     // net: two real UDP hosts on localhost complete a full handshake over actual sockets.
@@ -1120,7 +1135,7 @@ int main() {
         std::uint64_t t = 0;
         for (int tick = 0; tick < 200 && !(aUp && bUp); ++tick) {
             t += 1000000;
-            aether::rendezvousTick(server, *rv);
+            aether::rendezvousTick(server, *rv, aether::MonoTime{ t });
             for (const auto& e : aether::hostTick(*hA, {}, aether::MonoTime{ t })) if (e.kind == aether::PeerEvent::Connected) aUp = true;
             for (const auto& e : aether::hostTick(*hB, {}, aether::MonoTime{ t })) if (e.kind == aether::PeerEvent::Connected) bUp = true;
             std::this_thread::yield();
@@ -1176,7 +1191,7 @@ int main() {
         std::uint64_t t = 0;
         for (int tick = 0; tick < 300 && !(aUp && bUp); ++tick) {
             t += 1000000;
-            aether::rendezvousTick(server, *rv);
+            aether::rendezvousTick(server, *rv, aether::MonoTime{ t });
             for (const auto& e : aether::hostTick(*hA, {}, aether::MonoTime{ t })) if (e.kind == aether::PeerEvent::Connected) aUp = true;
             for (const auto& e : aether::hostTick(*hB, {}, aether::MonoTime{ t })) if (e.kind == aether::PeerEvent::Connected) bUp = true;
             std::this_thread::yield();

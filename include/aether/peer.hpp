@@ -187,7 +187,6 @@ inline std::uint64_t sockAddrToKey(const Address& addr) noexcept {
 }
 
 // --- peer state ---
-inline constexpr int    cookieSecretSize          = 32;
 inline constexpr double peerFragmentTimeoutMs     = 5000.0;
 inline constexpr int    peerFragmentMaxBufferSize = 1024 * 1024;
 inline constexpr double migrationCooldownMs       = 5000.0;
@@ -209,7 +208,6 @@ struct NetPeer {
     std::map<PeerId, PendingConnection>  pending;
     NetworkConfig                        config;
     RateLimiter                          rateLimiter{};
-    Bytes                                cookieSecret;
     std::map<PeerId, FragmentAssembler>  fragmentAssemblers;
     std::map<std::uint64_t, MonoTime>    migrationCooldowns;
     std::map<std::uint64_t, ResumableSession> resumableTokens; // recently-dropped sessions (clientSalt -> drop time + key)
@@ -218,17 +216,11 @@ struct NetPeer {
     TokenValidator                       tokenValidator{};   // connect-token replay defense (server side)
 };
 
-inline Bytes generateCookieSecret() {
-    Bytes secret(cookieSecretSize);
-    secureRandomBytes(secret.data(), secret.size());   // an HMAC-grade secret, from the OS CSPRNG
-    return secret;
-}
 inline NetPeer newPeerState(const Address& localAddr, const NetworkConfig& config, MonoTime now) {
     NetPeer peer;
-    peer.localAddr    = localAddr;
-    peer.config       = config;
-    peer.rateLimiter  = newRateLimiter(config.rateLimitPerSecond, now);
-    peer.cookieSecret   = generateCookieSecret();
+    peer.localAddr      = localAddr;
+    peer.config         = config;
+    peer.rateLimiter    = newRateLimiter(config.rateLimitPerSecond, now);
     peer.tokenValidator = newTokenValidator(tokenReplayLifetimeMs, tokenReplayMaxTracked);
     return peer;
 }
