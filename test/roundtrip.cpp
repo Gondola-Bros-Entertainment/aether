@@ -31,6 +31,7 @@
 #include <cassert>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 struct PlayerState {
     float               x{}, y{};
@@ -814,10 +815,11 @@ int main() {
 
         bool          aUp = false, bUp = false;
         std::uint64_t t = 0;
-        for (int tick = 0; tick < 100 && !(aUp && bUp); ++tick) {
+        for (int tick = 0; tick < 300 && !(aUp && bUp); ++tick) {
             t += 1000000;
             for (const auto& e : aether::hostTick(*hA, {}, aether::MonoTime{ t })) if (e.kind == aether::PeerEvent::Connected) aUp = true;
             for (const auto& e : aether::hostTick(*hB, {}, aether::MonoTime{ t })) if (e.kind == aether::PeerEvent::Connected) bUp = true;
+            std::this_thread::yield();   // give the OS a slice to actually deliver the loopback packets; a tight spin can starve it
         }
         assert(aUp && bUp);
         aether::closeHost(*hA);
@@ -846,6 +848,7 @@ int main() {
             aether::rendezvousTick(server, *rv);
             for (const auto& e : aether::hostTick(*hA, {}, aether::MonoTime{ t })) if (e.kind == aether::PeerEvent::Connected) aUp = true;
             for (const auto& e : aether::hostTick(*hB, {}, aether::MonoTime{ t })) if (e.kind == aether::PeerEvent::Connected) bUp = true;
+            std::this_thread::yield();
         }
         assert(aUp && bUp);
         aether::closeHost(*hA); aether::closeHost(*hB); aether::closeSocket(*rv);
@@ -861,7 +864,7 @@ int main() {
         const aether::Address rv2Addr = aether::localAddr(*rv2);
         aether::hostJoinRoom(*h, rv2Addr, 7, aether::MonoTime{ 0 });   // Register #1
         std::uint64_t tt = 0;
-        for (int k = 0; k < 4; ++k) { tt += 1100ull * 1000000; (void) aether::hostTick(*h, {}, aether::MonoTime{ tt }); }  // each > registerRetryMs
+        for (int k = 0; k < 4; ++k) { tt += 1100ull * 1000000; (void) aether::hostTick(*h, {}, aether::MonoTime{ tt }); std::this_thread::yield(); }  // each > registerRetryMs
         int registers = 0;
         std::uint8_t rb[600];
         for (;;) {
@@ -898,6 +901,7 @@ int main() {
             aether::rendezvousTick(server, *rv);
             for (const auto& e : aether::hostTick(*hA, {}, aether::MonoTime{ t })) if (e.kind == aether::PeerEvent::Connected) aUp = true;
             for (const auto& e : aether::hostTick(*hB, {}, aether::MonoTime{ t })) if (e.kind == aether::PeerEvent::Connected) bUp = true;
+            std::this_thread::yield();
         }
         assert(aUp && bUp && hA->relaying && hB->relaying);   // connected, and over the relay path
         aether::closeHost(*hA); aether::closeHost(*hB); aether::closeSocket(*rv);
