@@ -806,5 +806,32 @@ int main() {
         std::printf("aether net OK: two real UDP hosts handshook over localhost\n");
     }
 
+    // NAT punch-through flow: a rendezvous pairs two real hosts; the Connect peer connects, the
+    // Accept peer hole-punches, and the handshake completes. Localhost stands in for the opened path
+    // (real NAT traversal needs real networks); this proves the rendezvous -> pair -> connect -> handshake flow.
+    {
+        const aether::NetworkConfig cfg2;
+        auto rv = aether::openUdp(aether::addrLocalhost(0));
+        auto hA = aether::openHost(aether::addrLocalhost(0), cfg2, aether::MonoTime{ 0 });
+        auto hB = aether::openHost(aether::addrLocalhost(0), cfg2, aether::MonoTime{ 777 });
+        assert(rv && hA && hB);
+        const aether::Address rvAddr = aether::localAddr(*rv);
+        aether::RendezvousServer server;
+        aether::hostJoinRoom(*hA, rvAddr, 42);
+        aether::hostJoinRoom(*hB, rvAddr, 42);
+
+        bool aUp = false, bUp = false;
+        std::uint64_t t = 0;
+        for (int tick = 0; tick < 200 && !(aUp && bUp); ++tick) {
+            t += 1000000;
+            aether::rendezvousTick(server, *rv);
+            for (const auto& e : aether::hostTick(*hA, {}, aether::MonoTime{ t })) if (e.kind == aether::PeerEvent::Connected) aUp = true;
+            for (const auto& e : aether::hostTick(*hB, {}, aether::MonoTime{ t })) if (e.kind == aether::PeerEvent::Connected) bUp = true;
+        }
+        assert(aUp && bUp);
+        aether::closeHost(*hA); aether::closeHost(*hB); aether::closeSocket(*rv);
+        std::printf("aether nat-punch OK: rendezvous paired two hosts, handshake completed over the punched path\n");
+    }
+
     return 0;
 }
