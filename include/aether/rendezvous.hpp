@@ -42,7 +42,8 @@ inline std::optional<Address> decodeAddr(const std::uint8_t* p, std::size_t n) {
 enum class RendezvousMsg : std::uint8_t { Register = 1, Paired = 2, Relay = 3 };
 enum class PunchRole     : std::uint8_t { Connect = 0, Accept = 1 };
 
-inline constexpr double registerRetryMs = 1000.0;   // re-send Register this often until the rendezvous pairs us
+inline constexpr double registerRetryMs       = 1000.0;   // re-send Register this often until the rendezvous pairs us
+inline constexpr double defaultPunchTimeoutMs = 5000.0;   // try the direct hole-punch this long, then fall back to relay
 
 inline Bytes encodeRegister(std::uint64_t roomId) {
     Bytes b;

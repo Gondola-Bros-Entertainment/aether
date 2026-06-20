@@ -876,5 +876,33 @@ int main() {
         std::printf("aether register-resend OK: a stranded join retries Register (%d datagrams)\n", registers);
     }
 
+    // NAT relay end-to-end: two hosts that skip the punch (punchTimeoutMs = 0) connect THROUGH the
+    // rendezvous relay -- every handshake packet is forwarded, and both sides end up connected + relaying.
+    {
+        const aether::NetworkConfig rcfg;
+        auto rv = aether::openUdp(aether::addrLocalhost(0));
+        auto hA = aether::openHost(aether::addrLocalhost(0), rcfg, aether::MonoTime{ 0 });
+        auto hB = aether::openHost(aether::addrLocalhost(0), rcfg, aether::MonoTime{ 5 });
+        assert(rv && hA && hB);
+        hA->punchTimeoutMs = 0.0;   // skip the direct punch -> relay immediately
+        hB->punchTimeoutMs = 0.0;
+        const aether::Address rvAddr = aether::localAddr(*rv);
+        aether::RendezvousServer server;
+        aether::hostJoinRoom(*hA, rvAddr, 55, aether::MonoTime{ 0 });
+        aether::hostJoinRoom(*hB, rvAddr, 55, aether::MonoTime{ 0 });
+
+        bool aUp = false, bUp = false;
+        std::uint64_t t = 0;
+        for (int tick = 0; tick < 300 && !(aUp && bUp); ++tick) {
+            t += 1000000;
+            aether::rendezvousTick(server, *rv);
+            for (const auto& e : aether::hostTick(*hA, {}, aether::MonoTime{ t })) if (e.kind == aether::PeerEvent::Connected) aUp = true;
+            for (const auto& e : aether::hostTick(*hB, {}, aether::MonoTime{ t })) if (e.kind == aether::PeerEvent::Connected) bUp = true;
+        }
+        assert(aUp && bUp && hA->relaying && hB->relaying);   // connected, and over the relay path
+        aether::closeHost(*hA); aether::closeHost(*hB); aether::closeSocket(*rv);
+        std::printf("aether relay-e2e OK: two hosts handshook through the rendezvous relay (punch skipped)\n");
+    }
+
     return 0;
 }
