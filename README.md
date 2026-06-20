@@ -26,12 +26,17 @@ auto restored = aether::deltaUnpack(r, prev); // std::optional<PlayerState>; unc
 
 On top of that delta core, aether is a full reliable-UDP stack:
 
-- reliable, unreliable, ordered, and sequenced channels
+- reliable, unreliable, ordered, and sequenced channels -- mixed delivery on one packet stream
 - sequence/ack reliability with RTT/RTO estimation and fast retransmit
+- packet coalescing -- many small messages ride a single datagram (one header, one auth tag)
 - fragmentation and reassembly for messages larger than the MTU
 - congestion control: a binary AIMD controller plus a TCP New Reno window
-- ChaCha20-Poly1305 packet encryption, written from scratch and checked against the RFC 8439 test vectors
-- a connection handshake with connect tokens and per-source rate limiting
+- encrypted by default -- an X25519 handshake negotiates a per-session key (no pre-shared secret),
+  then ChaCha20-Poly1305; both from scratch, checked against the RFC 7748 / 8439 vectors
+- a connection handshake with connect tokens, per-source rate limiting, and an OS CSPRNG for keys
+- reconnect -- a dropped session resumes via a token without a full re-handshake (Reconnected event)
+- migration -- a live connection follows a peer across an IP change (NAT rebind)
+- clock-offset sync -- a built-in ping/pong estimates the peer's clock for a shared timeline
 - snapshot replication: delta, interest management, priority, and interpolation
 - a deterministic in-memory network for fast, reproducible tests
 
@@ -39,8 +44,8 @@ On top of that delta core, aether is a full reliable-UDP stack:
 
 Data-first: plain structs and free functions, no inheritance or virtuals. State is mutated in
 place. One focused header per module under `include/aether/` -- include what you use, or pull
-the whole library with `<aether/aether.hpp>`. The only translation unit is the platform socket
-layer (`src/socket.cpp`); everything else is header-only.
+the whole library with `<aether/aether.hpp>`. The only translation units are the platform layer
+(`src/socket_posix.cpp` / `src/socket_win.cpp`); everything else is header-only.
 
 ## Build
 
@@ -71,6 +76,7 @@ std::vector<std::pair<aether::ChannelId, aether::Bytes>> broadcast;
 for (const aether::PeerEvent& ev : aether::hostTick(*server, broadcast, now)) {
     switch (ev.kind) {
         case aether::PeerEvent::Connected:    break;   // ev.peer joined
+        case aether::PeerEvent::Reconnected:  break;   // ev.peer resumed a dropped session
         case aether::PeerEvent::Message:      break;   // ev.data arrived on ev.channel
         case aether::PeerEvent::Disconnected: break;
         case aether::PeerEvent::Migrated:     break;   // ev.peer rebound to ev.other (NAT)
@@ -115,10 +121,11 @@ cmake --build build --target aether_bench_compare && ./build/aether_bench_compar
 ## Status
 
 The netcode stack is complete and hardened. Reliable delivery is exercised under heavy simulated
-packet loss -- a message that must arrive does, by retransmit -- and the encryption is verified
-against the RFC 8439 vectors. CI is a staged pipeline: static analysis, then ASan/UBSan, then a
-build-and-test matrix across gcc, clang, and MSVC on Linux, macOS, and Windows, all warning-clean
-under -Werror. Planned next: NAT punch-through.
+packet loss -- a message that must arrive does, by retransmit. Connections are encrypted by
+default: the X25519 key exchange is checked against RFC 7748, the ChaCha20-Poly1305 against RFC
+8439. CI is a staged pipeline -- static analysis, then ASan/UBSan, then a build-and-test matrix
+across gcc, clang, and MSVC on Linux, macOS, and Windows, all warning-clean under -Werror. Planned
+next: NAT punch-through.
 
 ## License
 
