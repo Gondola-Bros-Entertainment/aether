@@ -18,6 +18,7 @@
 #include "aether/random.hpp"
 #include "aether/reflect.hpp"
 #include "aether/reliability.hpp"
+#include "aether/rendezvous.hpp"
 #include "aether/replication.hpp"
 #include "aether/security.hpp"
 #include "aether/serialize.hpp"
@@ -750,6 +751,21 @@ int main() {
         assert(dec1 && dec1->hp == 100 && dec1->x == 11 && dec1->y == 20);
         std::printf("aether replication OK: interest + priority + interpolation + delta (full %zu B -> delta %zu B)\n",
                     enc0.size(), enc1.size());
+    }
+
+    // NAT rendezvous protocol: addresses + Register/Paired messages round-trip on the wire.
+    {
+        const aether::Address addr = aether::addrV4(0x01020304u, 9999);
+        const aether::Bytes enc = aether::encodeAddr(addr);
+        const auto back = aether::decodeAddr(enc.data(), enc.size());
+        assert(back && aether::addrEqual(*back, addr));
+
+        const auto room = aether::decodeRegister(aether::encodeRegister(0xABCDEF12u));
+        assert(room && *room == 0xABCDEF12u);
+
+        const auto pd = aether::decodePaired(aether::encodePaired(aether::PunchRole::Connect, addr));
+        assert(pd && pd->first == aether::PunchRole::Connect && aether::addrEqual(pd->second, addr));
+        std::printf("aether rendezvous-proto OK: address + Register/Paired round-trip\n");
     }
 
     // net: two real UDP hosts on localhost complete a full handshake over actual sockets.

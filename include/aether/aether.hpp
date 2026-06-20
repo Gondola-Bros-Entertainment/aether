@@ -48,6 +48,7 @@
 
 // IO + testing
 #include "aether/net.hpp"
+#include "aether/rendezvous.hpp"
 #include "aether/simulator.hpp"
 #include "aether/testnet.hpp"
 // IWYU pragma: end_exports
