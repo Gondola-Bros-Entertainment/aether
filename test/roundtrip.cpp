@@ -2,6 +2,7 @@
 // functions, data-first), and check sequence-number wraparound. No allocation.
 #include "aether/bitserialize.hpp"
 #include "aether/channel.hpp"
+#include "aether/clocksync.hpp"
 #include "aether/congestion.hpp"
 #include "aether/config.hpp"
 #include "aether/connection.hpp"
@@ -421,6 +422,26 @@ int main() {
         for (const auto& m : got) assert(m.size() == 3 && m[1] == 0xA0 && m[2] == 0xB0);
         std::printf("aether coalescing OK: %d unreliable messages -> %zu packet(s) (%zu batched), all delivered\n",
                     N, outgoing.size(), batched);
+    }
+
+    // clock sync: recover a known clock offset from timestamped round-trips (Cristian's algorithm).
+    {
+        aether::ClockSync cs;
+        constexpr double trueOffsetMs = 1000.0;   // the remote clock runs 1000ms ahead of ours
+        for (int i = 0; i < 20; ++i) {
+            const double t0     = static_cast<double>(i) * 100.0;             // local send
+            const double rtt    = 40.0 + static_cast<double>(i % 5) * 10.0;  // varying round-trip
+            const double t2     = t0 + rtt;                                  // local recv
+            const double remote = (t0 + t2) / 2.0 + trueOffsetMs;           // remote clock at the midpoint
+            aether::clockSyncObserve(cs, t0, remote, t2);
+        }
+        assert(cs.hasSample);
+        const double err = cs.offsetMs - trueOffsetMs;
+        assert(err > -1.0 && err < 1.0);                                     // recovered within 1ms
+        const double mapped = aether::localToRemoteMs(cs, 500.0);
+        assert(mapped > 1499.0 && mapped < 1501.0);
+        std::printf("aether clocksync OK: recovered %.1fms offset from round-trips (best rtt %.1fms)\n",
+                    cs.offsetMs, cs.bestRttMs);
     }
 
     // reliable delivery under packet loss: a reliable message must reach b even when ~40% of

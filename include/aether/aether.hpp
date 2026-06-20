@@ -41,6 +41,7 @@
 #include "aether/interest.hpp"
 #include "aether/priority.hpp"
 #include "aether/interpolation.hpp"
+#include "aether/clocksync.hpp"
 #include "aether/replication.hpp"
 
 // IO + testing
