@@ -6,9 +6,11 @@
 
 #include "aether/connection.hpp"
 #include "aether/fragment.hpp"
+#include "aether/random.hpp"
 #include "aether/security.hpp"
 #include "aether/socket.hpp"
 #include "aether/util.hpp"
+#include "aether/x25519.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -59,6 +61,10 @@ struct PendingConnection {
     MonoTime            createdAt{};
     int                 retryCount = 0;
     MonoTime            lastRetry{};
+    X25519Key                    ephemeralPriv{};         // our ephemeral X25519 secret
+    X25519Key                    ephemeralPub{};          // our ephemeral X25519 public key
+    std::optional<EncryptionKey> sessionKey;              // derived secret (client side; applied at Accepted)
+    bool                         ephemeralReady = false;  // generate the keypair once (retransmit-stable)
 };
 
 // --- pure protocol helpers (salts, deny reasons, payload header, FNV hash) ---
@@ -72,6 +78,33 @@ inline std::optional<std::uint64_t> decodeSalt(const Bytes& b) {
     std::uint64_t v = 0;
     for (int i = 0; i < 8; ++i) v |= static_cast<std::uint64_t>(b[static_cast<std::size_t>(i)]) << (8 * i);
     return v;
+}
+
+// salt + ephemeral public key -- the handshake key-exchange payload (8-byte salt + 32-byte key).
+inline Bytes encodeSaltAndKey(std::uint64_t salt, const X25519Key& pub) {
+    Bytes b = encodeSalt(salt);
+    b.insert(b.end(), pub.begin(), pub.end());
+    return b;
+}
+inline std::optional<std::pair<std::uint64_t, X25519Key>> decodeSaltAndKey(const Bytes& b) {
+    if (b.size() < 8 + static_cast<std::size_t>(x25519KeySize)) return std::nullopt;
+    const auto salt = decodeSalt(b);
+    if (!salt) return std::nullopt;
+    X25519Key pub{};
+    for (std::size_t i = 0; i < static_cast<std::size_t>(x25519KeySize); ++i) pub[i] = b[8 + i];
+    return std::pair<std::uint64_t, X25519Key>{ *salt, pub };
+}
+// An ephemeral keypair from the OS CSPRNG, and the X25519 shared secret used as the session key.
+inline void genEphemeralKeypair(X25519Key& priv, X25519Key& pub) {
+    secureRandomBytes(priv.data(), priv.size());
+    x25519Base(pub, priv);
+}
+inline EncryptionKey deriveSessionKey(const X25519Key& priv, const X25519Key& peerPub) {
+    X25519Key shared{};
+    x25519(shared, priv, peerPub);
+    EncryptionKey key{};
+    for (std::size_t i = 0; i < key.size(); ++i) key[i] = shared[i];   // direct use; HKDF is a future refinement
+    return key;
 }
 
 enum class DenyReason : std::uint8_t { ServerFull = 1, InvalidChallenge = 2 };
@@ -173,9 +206,11 @@ inline std::vector<PeerEvent> handleNewConnectionRequest(NetPeer& peer, const Pe
     pend.serverSalt = rng.output;
     pend.createdAt = now;
     pend.lastRetry = now;
+    genEphemeralKeypair(pend.ephemeralPriv, pend.ephemeralPub);   // server's ephemeral X25519 keypair
+    pend.ephemeralReady = true;
     peer.pending[pid] = pend;
     peer.rngState     = rng.state;
-    queueControlPacket(peer, PacketType::ConnectionChallenge, encodeSalt(rng.output), pid);
+    queueControlPacket(peer, PacketType::ConnectionChallenge, encodeSaltAndKey(rng.output, pend.ephemeralPub), pid);
     return {};
 }
 inline std::vector<PeerEvent> handleConnectionRequest(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
@@ -198,7 +233,7 @@ inline std::vector<PeerEvent> handleConnectionRequest(NetPeer& peer, const PeerI
         }
     }
     if (const auto it = peer.pending.find(pid); it != peer.pending.end()) {
-        queueControlPacket(peer, PacketType::ConnectionChallenge, encodeSalt(it->second.serverSalt), pid);
+        queueControlPacket(peer, PacketType::ConnectionChallenge, encodeSaltAndKey(it->second.serverSalt, it->second.ephemeralPub), pid);
         return {};
     }
     return handleNewConnectionRequest(peer, pid, now);
@@ -206,23 +241,30 @@ inline std::vector<PeerEvent> handleConnectionRequest(NetPeer& peer, const PeerI
 inline std::vector<PeerEvent> handleConnectionChallenge(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime) {
     const auto it = peer.pending.find(pid);
     if (it == peer.pending.end() || it->second.direction != ConnectionDirection::Outbound) return {};
-    const auto serverSalt = decodeSalt(pkt.payload);
-    if (!serverSalt) return {};
-    it->second.serverSalt = *serverSalt;
-    queueControlPacket(peer, PacketType::ConnectionResponse, encodeSalt(it->second.clientSalt), pid);
+    const auto sk = decodeSaltAndKey(pkt.payload);
+    if (!sk) return {};
+    it->second.serverSalt = sk->first;
+    if (!it->second.ephemeralReady) {   // generate our keypair once + derive the session key
+        genEphemeralKeypair(it->second.ephemeralPriv, it->second.ephemeralPub);
+        it->second.sessionKey     = deriveSessionKey(it->second.ephemeralPriv, sk->second);
+        it->second.ephemeralReady = true;
+    }
+    queueControlPacket(peer, PacketType::ConnectionResponse, encodeSaltAndKey(it->second.clientSalt, it->second.ephemeralPub), pid);
     return {};
 }
 inline std::vector<PeerEvent> handleConnectionResponse(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
     const auto it = peer.pending.find(pid);
     if (it == peer.pending.end() || it->second.direction != ConnectionDirection::Inbound) return {};
-    const auto clientSalt = decodeSalt(pkt.payload);
-    if (!clientSalt) return {};
-    if (*clientSalt == 0 || *clientSalt == it->second.serverSalt) {
+    const auto sk = decodeSaltAndKey(pkt.payload);
+    if (!sk) return {};
+    const std::uint64_t clientSalt = sk->first;
+    if (clientSalt == 0 || clientSalt == it->second.serverSalt) {
         removePending(peer, pid);
         queueControlPacket(peer, PacketType::ConnectionDenied, encodeDenyReason(DenyReason::InvalidChallenge), pid);
         return {};
     }
-    Connection conn = newConnection(peer.config, *clientSalt, now);
+    Connection conn = newConnection(peer.config, clientSalt, now);
+    conn.encryptionKey = deriveSessionKey(it->second.ephemeralPriv, sk->second);   // negotiated session key
     touchRecvTime(conn, now);
     markConnected(conn, now);
     peer.connections[pid] = std::move(conn);
@@ -234,6 +276,7 @@ inline std::vector<PeerEvent> handleConnectionAccepted(NetPeer& peer, const Peer
     const auto it = peer.pending.find(pid);
     if (it == peer.pending.end() || it->second.direction != ConnectionDirection::Outbound) return {};
     Connection conn = newConnection(peer.config, it->second.clientSalt, now);
+    if (it->second.sessionKey) conn.encryptionKey = it->second.sessionKey;   // negotiated session key
     touchRecvTime(conn, now);
     markConnected(conn, now);
     peer.connections[pid] = std::move(conn);

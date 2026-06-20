@@ -665,6 +665,12 @@ int main() {
         }
         assert(aUp && bUp && aether::peerIsConnected(A, idB) && aether::peerIsConnected(B, idA));
 
+        // X25519: the handshake negotiated a session key on both sides, and they agree (ECDH) --
+        // encrypted by default, no pre-shared key.
+        assert(A.connections.at(idB).encryptionKey && B.connections.at(idA).encryptionKey);
+        assert(*A.connections.at(idB).encryptionKey == *B.connections.at(idA).encryptionKey);
+        std::printf("aether x25519-handshake OK: session key negotiated + agrees on both sides\n");
+
         // clock sync: tick past the TimeSync interval a few times so pings/pongs flow and both
         // sides land an offset sample (same test clock here, so the offset is ~0 -- this proves the
         // round-trip exchange + estimator wiring; clocksync.hpp's unit test covers offset recovery).
