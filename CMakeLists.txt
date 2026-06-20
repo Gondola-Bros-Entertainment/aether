@@ -9,7 +9,11 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)   # so clangd knows it's C++20
 # so MSVC keeps its default /EHsc -- passing -DCMAKE_CXX_FLAGS=/WX would clobber that and break it.
 option(AETHER_WERROR "treat warnings as errors" OFF)
 if(MSVC)
-    add_compile_options(/W4)
+    # /W4 minus C4456 (the -Wshadow class). gcc/clang's -Wall -Wextra baseline deliberately does NOT
+    # enforce shadowing (it is noisy and usually harmless), so we keep MSVC's warning set consistent
+    # with that baseline instead of letting /W4 uniquely flag it. The library is shadow-clean; the
+    # only hits are benign same-name reuse across blocks in the test file.
+    add_compile_options(/W4 /wd4456)
     if(AETHER_WERROR)
         add_compile_options(/WX)
     endif()
