@@ -43,60 +43,66 @@ struct Vec3   { float x, y, z; };
 struct Entity { Vec3 pos; std::uint32_t id; std::uint8_t hp; aether::ChannelId ch; };
 
 int main() {
-    const PlayerState in{ 1.5f, -2.25f, 200, aether::SequenceNum{65535} };
-
-    std::uint8_t buf[64];
-    aether::Writer w{ buf, sizeof buf, 0, true };
-    write(w, in.x);
-    write(w, in.y);
-    write(w, in.health);
-    write(w, in.seq.value);
-    assert(w.ok);
-
-    aether::Reader r{ buf, w.pos, 0 };
-    const auto x = aether::read<float>(r);
-    const auto y = aether::read<float>(r);
-    const auto h = aether::read<std::uint8_t>(r);
-    const auto s = aether::read<std::uint16_t>(r);
-    assert(x && y && h && s);
-    const PlayerState out{ *x, *y, *h, aether::SequenceNum{*s} };
-
-    assert(out.x == in.x && out.y == in.y && out.health == in.health && out.seq == in.seq);
-
-    // large struct past the old 12-field cap: tieFields now reaches 32, so this instantiates
-    // the highest decomposition case (the pre-raise code static_assert-failed at 13 fields).
+    // foundation: round-trip a plain struct through the LE cursor, exercise a 32-field struct +
+    // delta, and check sequence-number wraparound. Scoped in its own block like every test below,
+    // so its locals do not leak into main() and shadow them.
     {
-        struct Big32 {
-            std::int32_t v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15,
-                         v16,v17,v18,v19,v20,v21,v22,v23,v24,v25,v26,v27,v28,v29,v30,v31;
-        };
-        static_assert(aether::fieldCount<Big32>() == 32, "tieFields should reach 32 fields");
-        Big32 big{ 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
-                   16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,-31 };
-        std::uint8_t bbuf[256];
-        aether::Writer bw{ bbuf, sizeof bbuf, 0, true };
-        aether::serialize(bw, big);
-        assert(bw.ok);
-        aether::Reader br{ bbuf, bw.pos, 0 };
-        const auto rt = aether::deserialize<Big32>(br);
-        assert(rt && aether::fieldEqual(*rt, big));
+        const PlayerState original{ 1.5f, -2.25f, 200, aether::SequenceNum{65535} };
 
-        Big32 moved = big; moved.v0 = 1000; moved.v31 = -9999;        // change first + last field
-        aether::Writer dw{ bbuf, sizeof bbuf, 0, true };
-        aether::deltaPack(dw, big, moved);
-        assert(dw.ok);
-        aether::Reader dr{ bbuf, dw.pos, 0 };
-        const auto back = aether::deltaUnpack(dr, big);
-        assert(back && aether::fieldEqual(*back, moved));
+        std::uint8_t buf[64];
+        aether::Writer writer{ buf, sizeof buf, 0, true };
+        write(writer, original.x);
+        write(writer, original.y);
+        write(writer, original.health);
+        write(writer, original.seq.value);
+        assert(writer.ok);
+
+        aether::Reader reader{ buf, writer.pos, 0 };
+        const auto readX      = aether::read<float>(reader);
+        const auto readY      = aether::read<float>(reader);
+        const auto readHealth = aether::read<std::uint8_t>(reader);
+        const auto readSeq    = aether::read<std::uint16_t>(reader);
+        assert(readX && readY && readHealth && readSeq);
+        const PlayerState restored{ *readX, *readY, *readHealth, aether::SequenceNum{*readSeq} };
+
+        assert(restored.x == original.x && restored.y == original.y
+            && restored.health == original.health && restored.seq == original.seq);
+
+        // large struct past the old 12-field cap: tieFields now reaches 32, so this instantiates
+        // the highest decomposition case (the pre-raise code static_assert-failed at 13 fields).
+        {
+            struct Big32 {
+                std::int32_t v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15,
+                             v16,v17,v18,v19,v20,v21,v22,v23,v24,v25,v26,v27,v28,v29,v30,v31;
+            };
+            static_assert(aether::fieldCount<Big32>() == 32, "tieFields should reach 32 fields");
+            Big32 big{ 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+                       16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,-31 };
+            std::uint8_t bbuf[256];
+            aether::Writer bw{ bbuf, sizeof bbuf, 0, true };
+            aether::serialize(bw, big);
+            assert(bw.ok);
+            aether::Reader br{ bbuf, bw.pos, 0 };
+            const auto rt = aether::deserialize<Big32>(br);
+            assert(rt && aether::fieldEqual(*rt, big));
+
+            Big32 moved = big; moved.v0 = 1000; moved.v31 = -9999;        // change first + last field
+            aether::Writer dw{ bbuf, sizeof bbuf, 0, true };
+            aether::deltaPack(dw, big, moved);
+            assert(dw.ok);
+            aether::Reader dr{ bbuf, dw.pos, 0 };
+            const auto back = aether::deltaUnpack(dr, big);
+            assert(back && aether::fieldEqual(*back, moved));
+        }
+
+        // wraparound: 0 is newer than 65535, never the reverse
+        assert(aether::newer(aether::SequenceNum{0}, aether::SequenceNum{65535}));
+        assert(!aether::newer(aether::SequenceNum{65535}, aether::SequenceNum{0}));
+
+        std::printf("aether roundtrip OK: x=%.2f y=%.2f hp=%u seq=%u (%zu bytes)\n",
+                    static_cast<double>(restored.x), static_cast<double>(restored.y),
+                    static_cast<unsigned>(restored.health), static_cast<unsigned>(restored.seq.value), writer.pos);
     }
-
-    // wraparound: 0 is newer than 65535, never the reverse
-    assert(aether::newer(aether::SequenceNum{0}, aether::SequenceNum{65535}));
-    assert(!aether::newer(aether::SequenceNum{65535}, aether::SequenceNum{0}));
-
-    std::printf("aether roundtrip OK: x=%.2f y=%.2f hp=%u seq=%u (%zu bytes)\n",
-                static_cast<double>(out.x), static_cast<double>(out.y),
-                static_cast<unsigned>(out.health), static_cast<unsigned>(out.seq.value), w.pos);
 
     // packet header: the bit-packed 9-byte header round-trips byte-exact
     {
