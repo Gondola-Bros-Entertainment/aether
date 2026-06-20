@@ -1,14 +1,18 @@
 // aether - packet integrity, rate limiting, and connect tokens. CRC32C (Castagnoli) detects
-// corruption; the rate limiter throttles connection requests per source; connect tokens
-// authenticate clients with replay defense. The CRC table is built at compile time (software);
-// a SIMD path is a later speed concern.
+// corruption; the rate limiter throttles connection requests per source; connect tokens are
+// AEAD-sealed credentials that authenticate a client's identity (with replay defense). The CRC table
+// is built at compile time (software); a SIMD path is a later speed concern.
 #pragma once
 
+#include "aether/crypto.hpp"
+#include "aether/random.hpp"
+#include "aether/serialize.hpp"
 #include "aether/types.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <optional>
 #include <utility>
@@ -108,64 +112,91 @@ inline bool rateLimiterAllow(RateLimiter& rl, std::uint64_t addrKey, MonoTime no
     return true;
 }
 
-// --- connect tokens ---
+// --- connect tokens (AEAD-sealed) ---
+// A connect token authenticates a client's IDENTITY. Your auth backend -- which holds the secret key
+// K, shared with the game servers -- seals one after a login (sealConnectToken); the game server
+// opens it with K (validateConnectToken) to learn the verified player id. Sealing is
+// ChaCha20-Poly1305, so only a key-holder can mint a token and any tampering is detected. aether
+// stays auth-provider-agnostic: the provider only ever touches your backend's seal step.
+inline constexpr std::uint32_t connectTokenDomain = 0x544f4b4eu;   // "TOKN": nonce domain for the seal
+
 struct ConnectToken {
-    std::uint64_t clientId         = 0;
-    MonoTime      createTime{};
-    double        expireDurationMs = 0.0;
-    Bytes         userData;
+    std::uint64_t playerId{};    // your verified player identity (e.g. a Firebase UID)
+    MonoTime      expiresAt{};   // absolute expiry; the server rejects the token at/after this
+    Bytes         userData;      // opaque app data carried to the server (role, region, ...)
 };
 
-inline ConnectToken newConnectToken(std::uint64_t clientId, double expireMs, const Bytes& userData, MonoTime now) {
-    return ConnectToken{ clientId, now, expireMs, userData };
-}
-inline bool isTokenExpired(MonoTime now, const ConnectToken& t) {
-    return elapsedMs(t.createTime, now) > t.expireDurationMs;
+// Seal a token under the server key -- call this in your backend, after the player authenticates.
+// Output is [nonce:8][ciphertext][tag:16]; the fresh random nonce per token keys replay defense.
+inline Bytes sealConnectToken(const EncryptionKey& key, const ConnectToken& t) {
+    Bytes pt(16 + t.userData.size());
+    putU64(pt.data(),     t.playerId);
+    putU64(pt.data() + 8, t.expiresAt.ns);
+    if (!t.userData.empty()) std::memcpy(pt.data() + 16, t.userData.data(), t.userData.size());
+    return encrypt(key, NonceCounter{ secureRandom64() }, connectTokenDomain, nullptr, 0, pt.data(), pt.size());
 }
 
-enum class TokenError { Expired, Replayed, Invalid };
+// A token whose seal + expiry checked out, plus the nonce that identifies it for replay defense.
+struct OpenedToken { ConnectToken token; std::uint64_t nonce{}; };
 
+// Verify a sealed token: seal authentic AND not expired. nullopt = forged, corrupt, or expired.
+// Replay is the caller's job (validateConnectToken does it).
+inline std::optional<OpenedToken> openConnectToken(const EncryptionKey& key, const Bytes& sealed, MonoTime now) {
+    const auto dec = decrypt(key, connectTokenDomain, nullptr, 0, sealed.data(), sealed.size());
+    if (!dec || dec->plaintext.size() < 16) return std::nullopt;
+    const std::uint8_t* p = dec->plaintext.data();
+    ConnectToken t;
+    t.playerId  = getU64(p);
+    t.expiresAt = MonoTime{ getU64(p + 8) };
+    t.userData.assign(dec->plaintext.begin() + 16, dec->plaintext.end());
+    if (now.ns >= t.expiresAt.ns) return std::nullopt;   // expired
+    return OpenedToken{ std::move(t), dec->counter.value };
+}
+
+enum class TokenError { Invalid, Replayed };
+
+// Replay tracker: remembers each accepted token's nonce so a captured token cannot be reused.
+// Bounded + self-cleaning.
 struct TokenValidator {
-    std::map<std::pair<std::uint64_t, std::uint64_t>, MonoTime> usedTokens;  // (clientId, createTime.ns) -> usedAt
+    std::map<std::uint64_t, MonoTime> usedNonces;   // token nonce -> when first accepted
     double tokenLifetimeMs  = 0.0;
     int    maxTrackedTokens = 0;
 };
-
 inline TokenValidator newTokenValidator(double lifetimeMs, int maxTracked) {
     TokenValidator tv;
     tv.tokenLifetimeMs  = lifetimeMs;
     tv.maxTrackedTokens = maxTracked;
     return tv;
 }
-
 inline void cleanupExpired(TokenValidator& tv, MonoTime now) {
-    for (auto it = tv.usedTokens.begin(); it != tv.usedTokens.end();)
-        if (!(elapsedMs(it->second, now) < tv.tokenLifetimeMs)) it = tv.usedTokens.erase(it);
+    for (auto it = tv.usedNonces.begin(); it != tv.usedNonces.end();)
+        if (!(elapsedMs(it->second, now) < tv.tokenLifetimeMs)) it = tv.usedNonces.erase(it);
         else                                                    ++it;
 }
 inline void evictOldest(TokenValidator& tv) {
-    if (tv.usedTokens.empty()) return;
-    const auto oldest = std::min_element(tv.usedTokens.begin(), tv.usedTokens.end(),
+    if (tv.usedNonces.empty()) return;
+    const auto oldest = std::min_element(tv.usedNonces.begin(), tv.usedNonces.end(),
                                          [](const auto& a, const auto& b) { return a.second.ns < b.second.ns; });
-    tv.usedTokens.erase(oldest);
+    tv.usedNonces.erase(oldest);
 }
 inline void enforceLimit(TokenValidator& tv, MonoTime now) {
-    if (static_cast<int>(tv.usedTokens.size()) <= tv.maxTrackedTokens) return;
+    if (static_cast<int>(tv.usedNonces.size()) <= tv.maxTrackedTokens) return;
     cleanupExpired(tv, now);
-    if (static_cast<int>(tv.usedTokens.size()) <= tv.maxTrackedTokens) return;
+    if (static_cast<int>(tv.usedNonces.size()) <= tv.maxTrackedTokens) return;
     evictOldest(tv);
 }
 
-struct TokenResult { std::optional<TokenError> error; std::uint64_t clientId = 0; };
+struct TokenResult { std::optional<TokenError> error; std::uint64_t playerId = 0; Bytes userData; };
 
-// Validate a token: rejects expired or replayed tokens, else records and accepts it.
-inline TokenResult validateToken(TokenValidator& tv, const ConnectToken& token, MonoTime now) {
-    if (isTokenExpired(now, token))            return { TokenError::Expired, 0 };
-    const auto key = std::make_pair(token.clientId, token.createTime.ns);
-    if (tv.usedTokens.count(key))              return { TokenError::Replayed, 0 };   // key on (id, createTime): a fresh token reconnect is not a replay
-    tv.usedTokens[key] = now;
+// Full server-side check: open + authenticate the sealed token, then reject replays. Records it on
+// success and returns the verified player id. This is what the handshake calls.
+inline TokenResult validateConnectToken(const EncryptionKey& key, TokenValidator& tv, const Bytes& sealed, MonoTime now) {
+    const auto opened = openConnectToken(key, sealed, now);
+    if (!opened)                            return { TokenError::Invalid, 0, {} };   // forged / corrupt / expired
+    if (tv.usedNonces.count(opened->nonce)) return { TokenError::Replayed, 0, {} };
+    tv.usedNonces[opened->nonce] = now;
     enforceLimit(tv, now);
-    return { std::nullopt, token.clientId };
+    return { std::nullopt, opened->token.playerId, opened->token.userData };
 }
 
 } // namespace aether

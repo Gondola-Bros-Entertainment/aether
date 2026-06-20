@@ -701,13 +701,25 @@ int main() {
         assert(aether::rateLimiterAllow(rl, 42, aether::MonoTime{ 1000000 }));
         assert(!aether::rateLimiterAllow(rl, 42, aether::MonoTime{ 2000000 }));   // 3rd within 1s -> denied
 
+        aether::EncryptionKey tk{};
+        for (int i = 0; i < 32; ++i) tk[static_cast<std::size_t>(i)] = std::uint8_t(i * 3 + 7);
         aether::TokenValidator tv = aether::newTokenValidator(5000.0, 100);
-        const aether::ConnectToken tok = aether::newConnectToken(7, 5000.0, {}, aether::MonoTime{ 0 });
-        const auto v1 = aether::validateToken(tv, tok, aether::MonoTime{ 1000000 });
-        assert(!v1.error && v1.clientId == 7);
-        const auto v2 = aether::validateToken(tv, tok, aether::MonoTime{ 2000000 });   // replay
-        assert(v2.error == aether::TokenError::Replayed);
-        std::printf("aether security OK: CRC32C vector + corruption detect + rate limit + token replay\n");
+        const aether::Bytes sealed = aether::sealConnectToken(tk, aether::ConnectToken{ 7, aether::MonoTime{ 5ull * 1000000000 }, {} });
+        const auto v1 = aether::validateConnectToken(tk, tv, sealed, aether::MonoTime{ 1000000 });
+        assert(!v1.error && v1.playerId == 7);                                // opens + authenticates
+        const auto v2 = aether::validateConnectToken(tk, tv, sealed, aether::MonoTime{ 2000000 });
+        assert(v2.error == aether::TokenError::Replayed);                     // same sealed bytes -> replay
+
+        aether::Bytes tampered = sealed; tampered[tampered.size() - 1] ^= 0x01;
+        const auto openTampered = aether::openConnectToken(tk, tampered, aether::MonoTime{ 1000000 });
+        assert(!openTampered);                                               // tampered tag -> rejected
+        aether::EncryptionKey wrongKey{}; wrongKey[0] = 1;
+        const auto openWrongKey = aether::openConnectToken(wrongKey, sealed, aether::MonoTime{ 1000000 });
+        assert(!openWrongKey);                                               // wrong key -> rejected
+        const aether::Bytes shortLived = aether::sealConnectToken(tk, aether::ConnectToken{ 9, aether::MonoTime{ 1000 }, {} });
+        const auto openExpired = aether::openConnectToken(tk, shortLived, aether::MonoTime{ 2000 });
+        assert(!openExpired);                                                // expired -> rejected
+        std::printf("aether security OK: CRC32C vector + corruption detect + rate limit + sealed token (open/replay/tamper/expiry)\n");
     }
 
     // dynamic fields: a struct with std::string / std::vector / std::optional round-trips through
@@ -757,14 +769,19 @@ int main() {
         assert(aether::rbExists(rb, aether::SequenceNum{ 65535 }));
         assert(!aether::rbExists(rb, aether::SequenceNum{ 0 }));
 
-        // security: a reconnect with a fresh token (same clientId, new createTime) is NOT a
-        // replay; resending the exact same token is. (Old code keyed on clientId alone.)
+        // security: re-presenting the SAME sealed token is a replay; a freshly sealed token for the
+        // same player (new nonce) is not -- a legit reconnect still works, a captured token cannot.
+        aether::EncryptionKey tk2{};
+        for (int i = 0; i < 32; ++i) tk2[static_cast<std::size_t>(i)] = std::uint8_t(i * 5 + 1);
         aether::TokenValidator tv = aether::newTokenValidator(10000.0, 64);
-        const aether::ConnectToken t1 = aether::newConnectToken(42, 5000.0, {}, aether::MonoTime{ 0 });
-        assert(!aether::validateToken(tv, t1, aether::MonoTime{ 1 }).error);
-        assert(aether::validateToken(tv, t1, aether::MonoTime{ 2 }).error == aether::TokenError::Replayed);
-        const aether::ConnectToken t2 = aether::newConnectToken(42, 5000.0, {}, aether::MonoTime{ 3 });
-        assert(!aether::validateToken(tv, t2, aether::MonoTime{ 4 }).error);
+        const aether::Bytes s1 = aether::sealConnectToken(tk2, aether::ConnectToken{ 42, aether::MonoTime{ 5ull * 1000000000 }, {} });
+        const auto a1 = aether::validateConnectToken(tk2, tv, s1, aether::MonoTime{ 1 });
+        assert(!a1.error && a1.playerId == 42);                              // first use OK
+        const auto a2 = aether::validateConnectToken(tk2, tv, s1, aether::MonoTime{ 2 });
+        assert(a2.error == aether::TokenError::Replayed);                    // same bytes -> replay
+        const aether::Bytes s2 = aether::sealConnectToken(tk2, aether::ConnectToken{ 42, aether::MonoTime{ 5ull * 1000000000 }, {} });
+        const auto a3 = aether::validateConnectToken(tk2, tv, s2, aether::MonoTime{ 3 });
+        assert(!a3.error);                                                   // fresh seal (new nonce) OK
 
         // wire: Quantized at the full 32-bit width must round-trip a value at Hi (the old code
         // cast an out-of-range float to uint32 there -- UB that silently encoded Hi as Lo).
@@ -923,6 +940,57 @@ int main() {
         for (const auto& e : rb2.events) assert(e.kind != aether::PeerEvent::Migrated);
         assert(!aether::peerIsConnected(B, idX) && aether::peerIsConnected(B, idA2));
         std::printf("aether migration OK: encrypted packet from a new address migrates; spoof does not\n");
+    }
+
+    // connect-token auth: a server with a token key requires a valid sealed token. A client that
+    // presents one (minted by the "backend") connects and the verified playerId arrives on Connected;
+    // a tokenless client is rejected. (open/replay/tamper/expiry are covered by the unit test above.)
+    {
+        aether::EncryptionKey K{};   // the backend<->game-server shared key
+        for (int i = 0; i < 32; ++i) K[static_cast<std::size_t>(i)] = std::uint8_t(i * 9 + 5);
+        aether::NetworkConfig serverCfg; serverCfg.tokenKey = K;   // server requires a token
+        const aether::NetworkConfig clientCfg;                     // client needs no key
+
+        const aether::Address addrS = aether::addrLocalhost(7101);
+        const aether::Address addrC = aether::addrLocalhost(7102);
+        const aether::PeerId  idS{ addrS }, idC{ addrC };
+        aether::NetPeer S = aether::newPeerState(addrS, serverCfg, aether::MonoTime{ 0 });
+        aether::NetPeer C = aether::newPeerState(addrC, clientCfg, aether::MonoTime{ 1 });
+
+        // the "backend" mints a token for player 12345, the client presents it
+        const aether::Bytes token = aether::sealConnectToken(K, aether::ConnectToken{ 12345, aether::MonoTime{ 3600ull * 1000000000 }, {} });
+        aether::peerConnectWithToken(C, idS, token, aether::MonoTime{ 0 });
+
+        std::vector<aether::IncomingPacket> toS, toC;
+        std::uint64_t t = 0, connectedPlayer = 0;
+        bool up = false;
+        for (int k = 0; k < 14 && !up; ++k) {
+            t += 1000000;
+            const auto rc = aether::peerProcess(C, aether::MonoTime{ t }, toC); toC.clear();
+            const auto rs = aether::peerProcess(S, aether::MonoTime{ t }, toS); toS.clear();
+            for (const auto& p : rc.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toS.push_back(aether::IncomingPacket{ idC, *s });
+            for (const auto& p : rs.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toC.push_back(aether::IncomingPacket{ idS, *s });
+            for (const auto& e : rs.events) if (e.kind == aether::PeerEvent::Connected) { up = true; connectedPlayer = e.playerId; }
+        }
+        assert(up && connectedPlayer == 12345 && aether::peerIsConnected(S, idC));   // server authenticated the player
+
+        // a client with NO token is rejected (server requires one): it never connects.
+        const aether::PeerId idX{ aether::addrLocalhost(7103) };
+        aether::NetPeer X = aether::newPeerState(aether::addrLocalhost(7103), clientCfg, aether::MonoTime{ 2 });
+        aether::peerConnect(X, idS, aether::MonoTime{ t });   // no token
+        std::vector<aether::IncomingPacket> toS2, toX;
+        bool xUp = false;
+        for (int k = 0; k < 14 && !xUp; ++k) {
+            t += 1000000;
+            const auto rx = aether::peerProcess(X, aether::MonoTime{ t }, toX);  toX.clear();
+            const auto rs = aether::peerProcess(S, aether::MonoTime{ t }, toS2); toS2.clear();
+            for (const auto& p : rx.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toS2.push_back(aether::IncomingPacket{ idX, *s });
+            for (const auto& p : rs.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toX.push_back(aether::IncomingPacket{ idS, *s });
+            for (const auto& e : rs.events) if (e.kind == aether::PeerEvent::Connected) xUp = true;
+        }
+        assert(!xUp && !aether::peerIsConnected(S, idX));   // no valid token -> never connected
+        std::printf("aether auth OK: valid token connects (playerId %llu surfaced), tokenless client rejected\n",
+                    static_cast<unsigned long long>(connectedPlayer));
     }
 
     // replication: interest filtering, priority budgeting, interpolation, and delta snapshots.

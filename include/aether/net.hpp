@@ -113,6 +113,11 @@ inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<Chan
 }
 
 inline void hostConnect(Host& h, const Address& addr, MonoTime now) { peerConnect(h.peer, PeerId{ addr }, now); }
+// Connect presenting a sealed connect token (minted by your auth backend); the server must be opened
+// with the matching config.tokenKey. The verified playerId arrives on the Connected event.
+inline void hostConnectWithToken(Host& h, const Address& addr, const Bytes& token, MonoTime now) {
+    peerConnectWithToken(h.peer, PeerId{ addr }, token, now);
+}
 // Join a room on the rendezvous server; once paired, hostTick auto-connects (or hole-punches) to the
 // peer. Register is re-sent each tick until paired, so a lost first datagram does not strand the join.
 inline void hostJoinRoom(Host& h, const Address& rendezvous, std::uint64_t roomId, MonoTime now) {

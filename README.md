@@ -34,9 +34,11 @@ On top of that delta core, aether is a full reliable-UDP stack:
 - encrypted by default -- an X25519 handshake derives per-direction ChaCha20-Poly1305 keys (no
   pre-shared secret); the packet header is authenticated and replays are windowed. Both primitives
   are from scratch, checked against the RFC 7748 / 8439 vectors
-- a challenge/response handshake: per-source rate limiting, an OS CSPRNG for all key material, and a
-  ConnectToken primitive for app-level player authentication (encryption gives you confidentiality
-  and integrity; binding a session to a player identity is the app's call)
+- a challenge/response handshake with per-source rate limiting and an OS CSPRNG for all key material
+- optional connect-token authentication -- your backend seals a token after a login and the server
+  verifies it during the handshake (provider-agnostic: Firebase, Steam, OIDC, custom), so connections
+  are gated, a verified playerId arrives on the Connected event, and spoofed-source floods are
+  shielded before any keygen
 - reconnect -- a dropped session resumes via a token without a full re-handshake (Reconnected event)
 - migration -- a live connection follows a peer across an IP change (NAT rebind)
 - NAT traversal -- a rendezvous pairs two peers behind NATs and they hole-punch a direct path, with
@@ -104,6 +106,28 @@ rendezvous if the punch fails.
 ```cpp
 aether::hostJoinRoom(host, rendezvousAddr, roomId, now);   // paired by room, then punched or relayed
 ```
+
+## Authentication
+
+Gate connections behind a signed token from your own auth backend -- Firebase, Steam, OIDC, anything.
+Your backend holds a secret key `K` shared with the game servers, seals a token after a login, and
+the server verifies it during the handshake. aether never talks to the provider, so it works with any
+of them; the provider only ever touches your backend's seal step.
+
+```cpp
+// your backend, after the player logs in (Firebase/Steam/...), holding the shared key K:
+aether::Bytes token = aether::sealConnectToken(K, aether::ConnectToken{ playerId, expiresAt, userData });
+//                    ...hand the token bytes to the client over HTTPS...
+
+// server: require a token by setting the key; the verified playerId arrives on Connected
+cfg.tokenKey = K;   // open the server host with this config; ev.playerId is the authenticated id
+
+// client: present the token your backend gave you
+aether::hostConnectWithToken(*client, serverAddr, token, now);
+```
+
+The server validates the token *before* any keygen, so it also shields the handshake from
+spoofed-source floods. A token is single-use (replay-protected); mint a fresh one per connect.
 
 ## Squeezing the wire
 

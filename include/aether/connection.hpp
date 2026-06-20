@@ -74,6 +74,7 @@ struct Connection {
     ConnectionState              state      = ConnectionState::Disconnected;
     std::uint64_t                clientSalt = 0;
     std::uint64_t                serverSalt = 0;
+    std::uint64_t                playerId   = 0;   // verified connect-token identity (server side); 0 when auth is off
     MonoTime                     lastSendTime{};
     MonoTime                     lastRecvTime{};
     std::optional<MonoTime>      startTime;

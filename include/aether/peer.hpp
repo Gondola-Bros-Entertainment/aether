@@ -43,8 +43,9 @@ struct PeerEvent {
     ChannelId           channel   = ChannelId{};                     // Message
     Bytes               data{};                                      // Message
     PeerId              other{};                                     // Migrated: new id (peer = old)
+    std::uint64_t       playerId = 0;                                // Connected: verified connect-token identity (server side)
 };
-inline PeerEvent evConnected(const PeerId& p, ConnectionDirection d) { return { .kind = PeerEvent::Connected, .peer = p, .direction = d }; }
+inline PeerEvent evConnected(const PeerId& p, ConnectionDirection d, std::uint64_t playerId = 0) { return { .kind = PeerEvent::Connected, .peer = p, .direction = d, .playerId = playerId }; }
 inline PeerEvent evDisconnected(const PeerId& p, DisconnectReason r) { return { .kind = PeerEvent::Disconnected, .peer = p, .reason = r }; }
 inline PeerEvent evMessage(const PeerId& p, ChannelId ch, Bytes d)   { return { .kind = PeerEvent::Message, .peer = p, .channel = ch, .data = std::move(d) }; }
 inline PeerEvent evMigrated(const PeerId& oldP, const PeerId& newP)  { return { .kind = PeerEvent::Migrated, .peer = oldP, .other = newP }; }
@@ -66,6 +67,8 @@ struct PendingConnection {
     std::uint64_t                reconnectSalt = 0;       // fresh per-reconnect salt, mixed into the resumed keys
     bool                         isReconnect   = false;   // this pending is a token reconnect, not a fresh handshake
     bool                         ephemeralReady = false;  // generate the keypair once (retransmit-stable)
+    Bytes                        connectToken;            // client: the sealed token to present (and retransmit)
+    std::uint64_t                playerId = 0;            // server: the verified identity from the client's token
 };
 
 // --- pure protocol helpers (salts, deny reasons, payload header, FNV hash) ---
@@ -150,13 +153,14 @@ inline void applySessionKeys(Connection& conn, const X25519Key& shared, std::uin
     conn.resumeMaster = shared;
 }
 
-enum class DenyReason : std::uint8_t { ServerFull = 1, InvalidChallenge = 2 };
+enum class DenyReason : std::uint8_t { ServerFull = 1, InvalidChallenge = 2, InvalidToken = 3 };
 inline Bytes encodeDenyReason(DenyReason r) { return Bytes{ static_cast<std::uint8_t>(r) }; }
 inline DenyReason decodeDenyReason(const Bytes& d) { return static_cast<DenyReason>(d.empty() ? 0 : d[0]); }
 inline DisconnectReason denyToDisconnectReason(DenyReason r) {
     switch (r) {
         case DenyReason::ServerFull:       return DisconnectReason::ServerFull;
         case DenyReason::InvalidChallenge: return DisconnectReason::ProtocolMismatch;
+        case DenyReason::InvalidToken:     return DisconnectReason::ProtocolMismatch;
         default:                           return static_cast<DisconnectReason>(static_cast<std::uint8_t>(r));
     }
 }
@@ -196,6 +200,9 @@ struct ResumableSession {
     std::optional<X25519Key> master;   // ECDH shared secret, to re-key a resumed session with a fresh salt
 };
 
+inline constexpr double tokenReplayLifetimeMs = 86400000.0;   // remember a used token nonce this long (replay defense)
+inline constexpr int    tokenReplayMaxTracked = 65536;        // cap on tracked token nonces (bounded memory)
+
 struct NetPeer {
     Address                              localAddr{};
     std::map<PeerId, Connection>         connections;
@@ -208,6 +215,7 @@ struct NetPeer {
     std::map<std::uint64_t, ResumableSession> resumableTokens; // recently-dropped sessions (clientSalt -> drop time + key)
     std::vector<RawPacket>               sendQueue;
     std::uint64_t                        rateLimitDrops = 0;
+    TokenValidator                       tokenValidator{};   // connect-token replay defense (server side)
 };
 
 inline Bytes generateCookieSecret() {
@@ -220,7 +228,8 @@ inline NetPeer newPeerState(const Address& localAddr, const NetworkConfig& confi
     peer.localAddr    = localAddr;
     peer.config       = config;
     peer.rateLimiter  = newRateLimiter(config.rateLimitPerSecond, now);
-    peer.cookieSecret = generateCookieSecret();
+    peer.cookieSecret   = generateCookieSecret();
+    peer.tokenValidator = newTokenValidator(tokenReplayLifetimeMs, tokenReplayMaxTracked);
     return peer;
 }
 
@@ -235,7 +244,13 @@ inline void queueControlPacket(NetPeer& peer, PacketType ptype, const Bytes& pay
 }
 
 // --- handshake handlers ---
-inline std::vector<PeerEvent> handleNewConnectionRequest(NetPeer& peer, const PeerId& pid, MonoTime now) {
+inline std::vector<PeerEvent> handleNewConnectionRequest(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
+    std::uint64_t playerId = 0;
+    if (peer.config.tokenKey) {   // auth on: a valid sealed token gates everything below (incl. keygen) -- the DoS shield
+        const auto tr = validateConnectToken(*peer.config.tokenKey, peer.tokenValidator, pkt.payload, now);
+        if (tr.error) { queueControlPacket(peer, PacketType::ConnectionDenied, encodeDenyReason(DenyReason::InvalidToken), pid); return {}; }
+        playerId = tr.playerId;
+    }
     const bool allowed = rateLimiterAllow(peer.rateLimiter, sockAddrToKey(pid.addr), now);
     if (!allowed)                                                       { peer.rateLimitDrops += 1; return {}; }
     if (static_cast<int>(peer.pending.size()) >= peer.config.maxClients) { peer.rateLimitDrops += 1; return {}; }
@@ -245,6 +260,7 @@ inline std::vector<PeerEvent> handleNewConnectionRequest(NetPeer& peer, const Pe
     }
     PendingConnection pend;
     pend.direction  = ConnectionDirection::Inbound;
+    pend.playerId   = playerId;
     pend.serverSalt = secureRandom64();   // anti-spoof challenge salt, from the CSPRNG (not the game PRNG)
     pend.createdAt  = now;
     pend.lastRetry  = now;
@@ -279,7 +295,7 @@ inline std::vector<PeerEvent> handleConnectionRequest(NetPeer& peer, const PeerI
         queueControlPacket(peer, PacketType::ConnectionChallenge, encodeSaltAndKey(it->second.serverSalt, it->second.ephemeralPub), pid);
         return {};
     }
-    return handleNewConnectionRequest(peer, pid, now);
+    return handleNewConnectionRequest(peer, pid, pkt, now);
 }
 inline std::vector<PeerEvent> handleConnectionChallenge(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime) {
     const auto it = peer.pending.find(pid);
@@ -307,14 +323,16 @@ inline std::vector<PeerEvent> handleConnectionResponse(NetPeer& peer, const Peer
         return {};
     }
     Connection conn = newConnection(peer.config, clientSalt, now);
+    conn.playerId = it->second.playerId;   // the identity validated from the client's connect token (0 if auth off)
     const X25519Key shared = x25519Shared(it->second.ephemeralPriv, sk->second);
     applySessionKeys(conn, shared, clientSalt, /*isServer=*/true);   // salt = the client's fresh salt
     touchRecvTime(conn, now);
     markConnected(conn, now);
+    const std::uint64_t playerId = conn.playerId;
     peer.connections[pid] = std::move(conn);
     peer.pending.erase(pid);
     queueControlPacket(peer, PacketType::ConnectionAccepted, {}, pid);
-    return { evConnected(pid, ConnectionDirection::Inbound) };
+    return { evConnected(pid, ConnectionDirection::Inbound, playerId) };
 }
 inline std::vector<PeerEvent> handleConnectionAccepted(NetPeer& peer, const PeerId& pid, MonoTime now) {
     const auto it = peer.pending.find(pid);
@@ -576,7 +594,7 @@ inline void retryPendingConnections(NetPeer& peer, MonoTime now) {
         if (elapsedMs(pending.lastRetry, now) > retryInterval && pending.retryCount < cfg.connectionRequestMaxRetries) {
             pending.retryCount += 1;
             pending.lastRetry   = now;
-            const Bytes payload = pending.isReconnect ? encodeResume(pending.clientSalt, pending.reconnectSalt) : Bytes{};
+            const Bytes payload = pending.isReconnect ? encodeResume(pending.clientSalt, pending.reconnectSalt) : pending.connectToken;
             queueControlPacket(peer, PacketType::ConnectionRequest, payload, pid);
         }
     }
@@ -622,6 +640,19 @@ inline void peerConnect(NetPeer& peer, const PeerId& pid, MonoTime now) {
     pend.lastRetry  = now;
     peer.pending[pid] = pend;
     queueControlPacket(peer, PacketType::ConnectionRequest, {}, pid);
+}
+// Connect presenting a sealed connect token (minted by your auth backend). The server validates it
+// before doing any work; the verified playerId arrives on the server-side Connected event.
+inline void peerConnectWithToken(NetPeer& peer, const PeerId& pid, const Bytes& token, MonoTime now) {
+    if (peer.connections.count(pid) || peer.pending.count(pid)) return;
+    PendingConnection pend;
+    pend.direction    = ConnectionDirection::Outbound;
+    pend.clientSalt   = secureRandom64();
+    pend.connectToken = token;
+    pend.createdAt    = now;
+    pend.lastRetry    = now;
+    peer.pending[pid] = pend;
+    queueControlPacket(peer, PacketType::ConnectionRequest, token, pid);
 }
 // Reconnect a dropped session: present the token (captured while connected via peerSessionToken).
 // The server fast-paths it if still within the resume grace window; otherwise it is a normal connect.

@@ -3,6 +3,7 @@
 #pragma once
 
 #include "aether/channel.hpp"
+#include "aether/crypto.hpp"
 #include "aether/reliability.hpp"
 
 #include <cmath>
@@ -95,6 +96,7 @@ struct NetworkConfig {
     bool          enableConnectionMigration   = true;
     double        deltaBaselineTimeoutMs      = defaultDeltaBaselineTimeoutMs;
     int           maxBaselineSnapshots        = defaultMaxBaselineSnapshots;
+    std::optional<EncryptionKey> tokenKey;   // server: the connect-token sealing key K; if set, a valid token is required to connect
 };
 
 enum class ConfigError {
