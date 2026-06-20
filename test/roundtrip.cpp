@@ -15,6 +15,7 @@
 #include "aether/packet.hpp"
 #include "aether/peer.hpp"
 #include "aether/priority.hpp"
+#include "aether/random.hpp"
 #include "aether/reflect.hpp"
 #include "aether/reliability.hpp"
 #include "aether/replication.hpp"
@@ -342,6 +343,17 @@ int main() {
         aether::x25519(ss2, bPriv, aPub);
         assert(ss1 == ss2);
         std::printf("aether x25519 OK: RFC 7748 vector matches + ECDH shared secret agrees\n");
+    }
+    // secure randomness: the OS CSPRNG fills the buffer and varies between calls (a sanity check,
+    // not a proof of randomness quality -- that lives in the OS).
+    {
+        std::array<std::uint8_t, 32> r1{}, r2{};
+        aether::secureRandomBytes(r1.data(), r1.size());
+        aether::secureRandomBytes(r2.data(), r2.size());
+        bool allZero = true;
+        for (const auto x : r1) if (x != 0) allZero = false;
+        assert(!allZero && r1 != r2);
+        std::printf("aether random OK: OS CSPRNG fills + varies\n");
     }
     // congestion: window grows on ack in slow start, halves on loss; batching round-trips.
     {

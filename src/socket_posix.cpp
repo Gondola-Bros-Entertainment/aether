@@ -1,9 +1,11 @@
 // aether - UDP socket platform layer (POSIX/BSD sockets; macOS + Linux).
+#include "aether/random.hpp"
 #include "aether/socket.hpp"
 
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -92,6 +94,15 @@ int recvFrom(Socket& s, std::span<std::uint8_t> buf, Address& from) {
     s.bytesRecv   += static_cast<std::uint64_t>(n);
     s.packetsRecv += 1;
     return static_cast<int>(n);
+}
+
+void secureRandomBytes(std::uint8_t* out, std::size_t len) {
+    std::size_t off = 0;
+    while (off < len) {
+        const std::size_t chunk = (len - off < 256) ? (len - off) : 256;   // getentropy caps at 256 bytes
+        if (::getentropy(out + off, chunk) != 0) return;                   // only fails on a broken system
+        off += chunk;
+    }
 }
 
 } // namespace aether

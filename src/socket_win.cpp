@@ -1,12 +1,15 @@
 // aether - UDP socket platform layer (Winsock; Windows).
+#include "aether/random.hpp"
 #include "aether/socket.hpp"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <bcrypt.h>
 
 #include <cstring>
 
 #pragma comment(lib, "ws2_32.lib")   // also linked via CMake; harmless to repeat
+#pragma comment(lib, "bcrypt.lib")   // BCryptGenRandom
 
 namespace aether {
 
@@ -109,6 +112,10 @@ int recvFrom(Socket& s, std::span<std::uint8_t> buf, Address& from) {
     s.bytesRecv   += static_cast<std::uint64_t>(n);
     s.packetsRecv += 1;
     return n;
+}
+
+void secureRandomBytes(std::uint8_t* out, std::size_t len) {
+    BCryptGenRandom(nullptr, out, static_cast<ULONG>(len), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 }
 
 } // namespace aether

@@ -14,7 +14,7 @@ endif()
 # #ifdef -- socket_posix.cpp (BSD sockets, mac/linux) or socket_win.cpp (Winsock).
 if(WIN32)
     add_library(aether STATIC src/socket_win.cpp)
-    target_link_libraries(aether PUBLIC ws2_32)
+    target_link_libraries(aether PUBLIC ws2_32 bcrypt)
 else()
     add_library(aether STATIC src/socket_posix.cpp)
 endif()
