@@ -125,8 +125,9 @@ The netcode stack is complete and hardened. Reliable delivery is exercised under
 packet loss -- a message that must arrive does, by retransmit. Connections are encrypted by
 default: the X25519 key exchange is checked against RFC 7748, the ChaCha20-Poly1305 against RFC
 8439. CI is a staged pipeline -- static analysis, then ASan/UBSan, then a build-and-test matrix
-across gcc, clang, and MSVC on Linux, macOS, and Windows, all warning-clean under -Werror. Planned
-next: NAT punch-through.
+across gcc, clang, and MSVC on Linux, macOS, and Windows, all warning-clean under -Werror. NAT
+punch-through pairs peers behind NATs (rendezvous + hole-punch); a relay fallback for symmetric NATs
+is the planned next step.
 
 ## License
 
