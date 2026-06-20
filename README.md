@@ -3,7 +3,7 @@
 [![ci](https://github.com/Gondola-Bros-Entertainment/aether/actions/workflows/ci.yml/badge.svg)](https://github.com/Gondola-Bros-Entertainment/aether/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Reliable UDP netcode for games. C++20, header-only, zero dependencies.
+Reliable, encrypted UDP netcode for games. C++20, header-only, zero dependencies.
 
 Define a plain struct, and aether sends only the fields that changed since the last snapshot:
 an automatic delta, computed by reflection. No macros, no codegen, no annotations.
@@ -93,6 +93,14 @@ aether::hostSend(*client, serverAddr, aether::ChannelId{ 0 }, payload, now);
 
 Each channel picks its own guarantee -- reliable-ordered, reliable-unordered, reliable-sequenced,
 unreliable, or unreliable-sequenced -- so one packet stream carries mixed delivery semantics.
+
+Two peers behind NATs don't need each other's address: they join a shared room on a rendezvous
+server, and aether establishes the link -- hole-punching a direct path, or relaying through the
+rendezvous if the punch fails.
+
+```cpp
+aether::hostJoinRoom(host, rendezvousAddr, roomId, now);   // paired by room, then punched or relayed
+```
 
 ## Squeezing the wire
 
