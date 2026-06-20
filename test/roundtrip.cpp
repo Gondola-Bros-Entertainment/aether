@@ -768,6 +768,22 @@ int main() {
         std::printf("aether rendezvous-proto OK: address + Register/Paired round-trip\n");
     }
 
+    // NAT rendezvous server: two peers registering for the same room get paired with correct roles.
+    {
+        aether::RendezvousServer rv;
+        const aether::Address a = aether::addrV4(0x0A000001u, 1111);
+        const aether::Address b = aether::addrV4(0x0A000002u, 2222);
+        const auto out1 = aether::rendezvousProcess(rv, { { a, aether::encodeRegister(7) } });
+        assert(out1.empty());                                  // A waits
+        const auto out2 = aether::rendezvousProcess(rv, { { b, aether::encodeRegister(7) } });
+        assert(out2.size() == 2);                              // B's arrival pairs them
+        const auto pa = aether::decodePaired(out2[0].second);  // -> A: accept, B's address
+        const auto pb = aether::decodePaired(out2[1].second);  // -> B: connect, A's address
+        assert(aether::addrEqual(out2[0].first, a) && pa && pa->first == aether::PunchRole::Accept  && aether::addrEqual(pa->second, b));
+        assert(aether::addrEqual(out2[1].first, b) && pb && pb->first == aether::PunchRole::Connect && aether::addrEqual(pb->second, a));
+        std::printf("aether rendezvous OK: two peers paired, roles + addresses correct\n");
+    }
+
     // net: two real UDP hosts on localhost complete a full handshake over actual sockets.
     {
         const aether::NetworkConfig cfg;
