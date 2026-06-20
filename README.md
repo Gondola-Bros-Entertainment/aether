@@ -36,6 +36,7 @@ On top of that delta core, aether is a full reliable-UDP stack:
 - a connection handshake with connect tokens, per-source rate limiting, and an OS CSPRNG for keys
 - reconnect -- a dropped session resumes via a token without a full re-handshake (Reconnected event)
 - migration -- a live connection follows a peer across an IP change (NAT rebind)
+- NAT punch-through -- a rendezvous pairs two peers behind NATs, then both hole-punch so the handshake completes over a direct path
 - clock-offset sync -- a built-in ping/pong estimates the peer's clock for a shared timeline
 - snapshot replication: delta, interest management, priority, and interpolation
 - a deterministic in-memory network for fast, reproducible tests
