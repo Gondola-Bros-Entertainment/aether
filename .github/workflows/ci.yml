@@ -52,7 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure
-        run: cmake -B build -DCMAKE_CXX_FLAGS="-Werror"
+        run: cmake -B build -DAETHER_WERROR=ON
       - name: Build
         run: cmake --build build -j
       - name: Test
@@ -68,7 +68,7 @@ jobs:
       # test suite checks through assert(), so a Release run is a build check, not a test run. /WX
       # makes MSVC warnings errors, matching the -Werror the gcc/clang legs use.
       - name: Configure
-        run: cmake -B build -DCMAKE_CXX_FLAGS="/WX"
+        run: cmake -B build -DAETHER_WERROR=ON
       - name: Build
         run: cmake --build build --config Debug
       - name: Test

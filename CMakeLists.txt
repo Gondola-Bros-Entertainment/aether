@@ -4,10 +4,20 @@ project(aether CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)   # so clangd knows it's C++20
+# Warnings always on; warnings-as-errors is opt-in (ON in CI, off for consumers, so a newer
+# compiler's new warnings never break someone just using the library). add_compile_options appends,
+# so MSVC keeps its default /EHsc -- passing -DCMAKE_CXX_FLAGS=/WX would clobber that and break it.
+option(AETHER_WERROR "treat warnings as errors" OFF)
 if(MSVC)
     add_compile_options(/W4)
+    if(AETHER_WERROR)
+        add_compile_options(/WX)
+    endif()
 else()
     add_compile_options(-Wall -Wextra)
+    if(AETHER_WERROR)
+        add_compile_options(-Werror)
+    endif()
 endif()
 
 # Platform layer: the one translation unit. CMake selects the backend so neither file needs an
