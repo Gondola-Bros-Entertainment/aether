@@ -690,6 +690,8 @@ int main() {
         // token -- a fast token-authenticated reconnect (no challenge); the server fires Reconnected.
         const auto token = aether::peerSessionToken(A, idB);
         assert(token);
+        const auto origKey = B.connections.at(idA).encryptionKey;   // the X25519 session key, pre-drop
+        assert(origKey);                                            // encrypted before the drop
         t += 11000ull * 1000000;   // > connectionTimeoutMs: both time out this tick
         aether::peerProcess(A, aether::MonoTime{ t }, {});
         aether::peerProcess(B, aether::MonoTime{ t }, {});
@@ -706,7 +708,9 @@ int main() {
             for (const auto& e : rb2.events) if (e.kind == aether::PeerEvent::Reconnected) reconnected = true;
         }
         assert(reconnected && aether::peerIsConnected(A, idB) && aether::peerIsConnected(B, idA));
-        std::printf("aether reconnect OK: timed-out session re-established via token, server fired Reconnected\n");
+        // 0-RTT: the reconnect restored the negotiated key on both sides -- not a plaintext downgrade.
+        assert(B.connections.at(idA).encryptionKey == origKey && A.connections.at(idB).encryptionKey == origKey);
+        std::printf("aether reconnect OK: timed-out session re-established via token (0-RTT, encryption restored), server fired Reconnected\n");
 
         // peerShutdown drains a Disconnect packet per live connection, so a process that exits
         // immediately still notifies its peers instead of leaving them to time out.
