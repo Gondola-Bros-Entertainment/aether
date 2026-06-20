@@ -44,6 +44,7 @@ int main() {
         (void) aether::decodeDenyReason(data);
         (void) aether::decodeRegister(data);
         (void) aether::decodePaired(data);
+        (void) aether::decodeRelay(data);
         (void) aether::decodeAddr(data.data(), data.size());
 
         // fragment header parse + reassembly (fresh assembler per input -- this checks per-call safety)

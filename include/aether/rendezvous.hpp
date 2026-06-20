@@ -39,7 +39,7 @@ inline std::optional<Address> decodeAddr(const std::uint8_t* p, std::size_t n) {
 // --- rendezvous wire protocol ---
 // Register: a peer joins a room. Paired: once two peers share a room, the server returns the other
 // peer's public address + a role (one connects, the other accepts).
-enum class RendezvousMsg : std::uint8_t { Register = 1, Paired = 2 };
+enum class RendezvousMsg : std::uint8_t { Register = 1, Paired = 2, Relay = 3 };
 enum class PunchRole     : std::uint8_t { Connect = 0, Accept = 1 };
 
 inline constexpr double registerRetryMs = 1000.0;   // re-send Register this often until the rendezvous pairs us
@@ -72,9 +72,26 @@ inline std::optional<std::pair<PunchRole, Address>> decodePaired(const Bytes& b)
     return std::pair<PunchRole, Address>{ role, *addr };
 }
 
-// --- rendezvous server: pairs two peers that register for the same room ---
+// Relay: a punch-failed peer wraps each packet for the rendezvous to forward to its session partner.
+inline Bytes encodeRelay(std::uint64_t roomId, const std::uint8_t* inner, std::size_t n) {
+    Bytes b;
+    b.reserve(static_cast<std::size_t>(9) + n);
+    b.push_back(static_cast<std::uint8_t>(RendezvousMsg::Relay));
+    for (int i = 0; i < 8; ++i) b.push_back(static_cast<std::uint8_t>(roomId >> (8 * i)));
+    b.insert(b.end(), inner, inner + n);
+    return b;
+}
+inline std::optional<std::pair<std::uint64_t, Bytes>> decodeRelay(const Bytes& b) {
+    if (b.size() < 9 || b[0] != static_cast<std::uint8_t>(RendezvousMsg::Relay)) return std::nullopt;
+    std::uint64_t room = 0;
+    for (std::size_t i = 0; i < 8; ++i) room |= static_cast<std::uint64_t>(b[1 + i]) << (8 * i);
+    return std::pair<std::uint64_t, Bytes>{ room, Bytes(b.begin() + 9, b.end()) };
+}
+
+// --- rendezvous server: pairs two peers per room, and relays between them when the punch fails ---
 struct RendezvousServer {
-    std::map<std::uint64_t, Address> waiting;   // roomId -> the first peer's public address
+    std::map<std::uint64_t, Address>                     waiting;    // roomId -> first peer, awaiting its pair
+    std::map<std::uint64_t, std::pair<Address, Address>> sessions;   // roomId -> the paired peers, for relaying
 };
 
 // Pure: a Register pairs with a waiting peer in the same room and returns the Paired replies to
@@ -83,16 +100,22 @@ inline std::vector<std::pair<Address, Bytes>> rendezvousProcess(
         RendezvousServer& rv, const std::vector<std::pair<Address, Bytes>>& incoming) {
     std::vector<std::pair<Address, Bytes>> out;
     for (const auto& [src, data] : incoming) {
-        const auto room = decodeRegister(data);
-        if (!room) continue;
-        const auto it = rv.waiting.find(*room);
-        if (it == rv.waiting.end()) {
-            rv.waiting[*room] = src;                                          // first peer waits
-        } else {
-            const Address first = it->second;
-            rv.waiting.erase(it);
-            out.emplace_back(first, encodePaired(PunchRole::Accept, src));    // the waiter accepts
-            out.emplace_back(src,   encodePaired(PunchRole::Connect, first)); // the newcomer connects
+        if (const auto room = decodeRegister(data)) {
+            const auto it = rv.waiting.find(*room);
+            if (it == rv.waiting.end()) {
+                rv.waiting[*room] = src;                                          // first peer waits
+            } else {
+                const Address first = it->second;
+                rv.waiting.erase(it);
+                rv.sessions[*room] = { first, src };                             // remember the pair for relay fallback
+                out.emplace_back(first, encodePaired(PunchRole::Accept, src));    // the waiter accepts
+                out.emplace_back(src,   encodePaired(PunchRole::Connect, first)); // the newcomer connects
+            }
+        } else if (const auto relay = decodeRelay(data)) {
+            if (const auto sit = rv.sessions.find(relay->first); sit != rv.sessions.end()) {
+                const Address& dst = addrEqual(src, sit->second.first) ? sit->second.second : sit->second.first;
+                out.emplace_back(dst, relay->second);                            // forward the inner packet to the partner
+            }
         }
     }
     return out;

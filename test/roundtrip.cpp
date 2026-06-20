@@ -788,6 +788,21 @@ int main() {
         std::printf("aether rendezvous OK: two peers paired, roles + addresses correct\n");
     }
 
+    // NAT relay fallback: after pairing, a Relay-wrapped packet is forwarded to the session partner.
+    {
+        aether::RendezvousServer rv;
+        const aether::Address a = aether::addrV4(0x0A000001u, 1111);
+        const aether::Address b = aether::addrV4(0x0A000002u, 2222);
+        aether::rendezvousProcess(rv, { { a, aether::encodeRegister(7) } });
+        aether::rendezvousProcess(rv, { { b, aether::encodeRegister(7) } });   // paired -> session stored
+        const aether::Bytes inner = { 0xDE, 0xAD, 0xBE, 0xEF };
+        const auto fwd = aether::rendezvousProcess(rv, { { a, aether::encodeRelay(7, inner.data(), inner.size()) } });
+        assert(fwd.size() == 1 && aether::addrEqual(fwd[0].first, b) && fwd[0].second == inner);   // A's relay -> B, intact
+        const auto back = aether::rendezvousProcess(rv, { { b, aether::encodeRelay(7, inner.data(), inner.size()) } });
+        assert(back.size() == 1 && aether::addrEqual(back[0].first, a));                            // B's relay -> A
+        std::printf("aether relay OK: rendezvous forwards a relayed packet to the paired peer\n");
+    }
+
     // net: two real UDP hosts on localhost complete a full handshake over actual sockets.
     {
         const aether::NetworkConfig cfg;
