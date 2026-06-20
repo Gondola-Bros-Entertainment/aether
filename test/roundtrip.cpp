@@ -242,14 +242,14 @@ int main() {
     // unseen ones (UDP reorders) -- and rejects replays + too-old counters. The old check required
     // strictly increasing counters, so it dropped every reordered datagram as a "replay".
     {
-        aether::ReplayWindow w;
-        assert(aether::replayAccept(w, 5));    // first seen
-        assert(aether::replayAccept(w, 7));    // forward
-        assert(aether::replayAccept(w, 6));    // reordered but unseen -> accepted (strict-increasing dropped this)
-        assert(!aether::replayAccept(w, 6));   // replay -> rejected
-        assert(!aether::replayAccept(w, 7));   // replay -> rejected
-        assert(aether::replayAccept(w, 200));  // big forward jump
-        assert(!aether::replayAccept(w, 5));   // now far outside the window -> rejected
+        aether::ReplayWindow w;   // hoist each call out of assert() -- the side effect must run even under NDEBUG
+        const bool r1 = aether::replayAccept(w, 5);   assert(r1);    // first seen
+        const bool r2 = aether::replayAccept(w, 7);   assert(r2);    // forward
+        const bool r3 = aether::replayAccept(w, 6);   assert(r3);    // reordered but unseen -> accepted (strict-increasing dropped this)
+        const bool r4 = aether::replayAccept(w, 6);   assert(!r4);   // replay -> rejected
+        const bool r5 = aether::replayAccept(w, 7);   assert(!r5);   // replay -> rejected
+        const bool r6 = aether::replayAccept(w, 200); assert(r6);    // big forward jump
+        const bool r7 = aether::replayAccept(w, 5);   assert(!r7);   // now far outside the window -> rejected
         std::printf("aether replay-window OK: reorder accepted, replays + stale rejected\n");
     }
 
@@ -260,8 +260,10 @@ int main() {
         cc.messageBufferSize = 3;
         cc.blockOnFull       = false;   // even so, a RELIABLE channel must not drop
         aether::Channel ch = aether::newChannel(aether::ChannelId{ 0 }, cc);
-        for (std::uint8_t i = 0; i < 3; ++i)
-            assert(aether::channelSend(ch, aether::Bytes{ i }, aether::MonoTime{ 0 }).error == aether::ChannelError::None);
+        for (std::uint8_t i = 0; i < 3; ++i) {
+            const auto sr = aether::channelSend(ch, aether::Bytes{ i }, aether::MonoTime{ 0 });
+            assert(sr.error == aether::ChannelError::None);
+        }
         const auto over = aether::channelSend(ch, aether::Bytes{ 99 }, aether::MonoTime{ 0 });
         assert(over.error == aether::ChannelError::BufferFull);                                    // backpressure...
         assert(ch.sendBuffer.size() == 3 && ch.sendBuffer.count(aether::SequenceNum{ 0 }) == 1);   // ...oldest still buffered
@@ -273,7 +275,8 @@ int main() {
     {
         aether::FragmentAssembler a = aether::newFragmentAssembler(5000.0, 1 << 20, 8);   // cap 8 concurrent buffers
         const std::uint8_t f0[7] = { 0, 0, 0, 0, 0, 0, 0 };   // msgId 0, index 0, count 0 -> malformed
-        assert(!aether::processFragment(a, f0, sizeof f0, aether::MonoTime{ 0 }));
+        const auto bad0 = aether::processFragment(a, f0, sizeof f0, aether::MonoTime{ 0 });
+        assert(!bad0);
         assert(a.buffers.empty());
         for (std::uint32_t id = 1; id <= 100; ++id) {
             std::uint8_t f[8];
@@ -509,7 +512,8 @@ int main() {
         aether::NetworkConfig bad;
         bad.fragmentThreshold = bad.mtu + 1;
         assert(aether::validateConfig(bad) == aether::ConfigError::FragmentThresholdExceedsMtu);
-        assert(!aether::openHost(aether::addrLocalhost(0), bad, aether::MonoTime{ 0 }));   // openHost now refuses an invalid config
+        const auto rejected = aether::openHost(aether::addrLocalhost(0), bad, aether::MonoTime{ 0 });
+        assert(!rejected);   // openHost now refuses an invalid config
         assert(aether::assessConnectionQuality(20.0, 0.0)  == aether::ConnectionQuality::Excellent);
         assert(aether::assessConnectionQuality(600.0, 0.0) == aether::ConnectionQuality::Bad);
         std::printf("aether config/stats OK: defaults valid, bad config + quality assessment caught\n");
