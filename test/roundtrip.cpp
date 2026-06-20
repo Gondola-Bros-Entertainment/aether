@@ -637,6 +637,28 @@ int main() {
         std::printf("aether timesync OK: offset estimated both ways (A<->B %.2fms over a shared clock)\n",
                     aether::clockOffsetMs(A.connections.at(idB)));
 
+        // reconnect: idle past the timeout so both sides drop, then re-establish via the session
+        // token -- a fast token-authenticated reconnect (no challenge); the server fires Reconnected.
+        const auto token = aether::peerSessionToken(A, idB);
+        assert(token);
+        t += 11000ull * 1000000;   // > connectionTimeoutMs: both time out this tick
+        aether::peerProcess(A, aether::MonoTime{ t }, {});
+        aether::peerProcess(B, aether::MonoTime{ t }, {});
+        assert(!aether::peerIsConnected(A, idB) && !aether::peerIsConnected(B, idA));
+
+        aether::peerReconnect(A, idB, *token, aether::MonoTime{ t });
+        bool reconnected = false;
+        for (int rc = 0; rc < 16 && !(reconnected && aether::peerIsConnected(A, idB)); ++rc) {
+            t += 1000000;
+            const auto ra2 = aether::peerProcess(A, aether::MonoTime{ t }, toA); toA.clear();
+            const auto rb2 = aether::peerProcess(B, aether::MonoTime{ t }, toB); toB.clear();
+            for (const auto& p : ra2.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toB.push_back(aether::IncomingPacket{ idA, *s });
+            for (const auto& p : rb2.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toA.push_back(aether::IncomingPacket{ idB, *s });
+            for (const auto& e : rb2.events) if (e.kind == aether::PeerEvent::Reconnected) reconnected = true;
+        }
+        assert(reconnected && aether::peerIsConnected(A, idB) && aether::peerIsConnected(B, idA));
+        std::printf("aether reconnect OK: timed-out session re-established via token, server fired Reconnected\n");
+
         // peerShutdown drains a Disconnect packet per live connection, so a process that exits
         // immediately still notifies its peers instead of leaving them to time out.
         const auto closeA = aether::peerShutdown(A, aether::MonoTime{ t });

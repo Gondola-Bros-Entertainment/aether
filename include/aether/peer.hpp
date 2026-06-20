@@ -34,7 +34,7 @@ enum class ConnectionDirection { Inbound, Outbound };
 
 // --- events emitted by peer processing ---
 struct PeerEvent {
-    enum Kind { Connected, Disconnected, Message, Migrated };
+    enum Kind { Connected, Disconnected, Message, Migrated, Reconnected };
     Kind                kind      = Connected;
     PeerId              peer{};
     ConnectionDirection direction = ConnectionDirection::Inbound;   // Connected
@@ -47,6 +47,7 @@ inline PeerEvent evConnected(const PeerId& p, ConnectionDirection d) { return { 
 inline PeerEvent evDisconnected(const PeerId& p, DisconnectReason r) { return { .kind = PeerEvent::Disconnected, .peer = p, .reason = r }; }
 inline PeerEvent evMessage(const PeerId& p, ChannelId ch, Bytes d)   { return { .kind = PeerEvent::Message, .peer = p, .channel = ch, .data = std::move(d) }; }
 inline PeerEvent evMigrated(const PeerId& oldP, const PeerId& newP)  { return { .kind = PeerEvent::Migrated, .peer = oldP, .other = newP }; }
+inline PeerEvent evReconnected(const PeerId& p)                      { return { .kind = PeerEvent::Reconnected, .peer = p }; }
 
 struct IncomingPacket { PeerId from; Bytes data; };
 struct RawPacket      { PeerId to;   Bytes data; };
@@ -112,6 +113,7 @@ inline constexpr int    cookieSecretSize          = 32;
 inline constexpr double peerFragmentTimeoutMs     = 5000.0;
 inline constexpr int    peerFragmentMaxBufferSize = 1024 * 1024;
 inline constexpr double migrationCooldownMs       = 5000.0;
+inline constexpr double resumeGraceMs             = 30000.0;   // window a dropped session token can reconnect in
 
 struct NetPeer {
     Address                              localAddr{};
@@ -123,6 +125,7 @@ struct NetPeer {
     std::uint64_t                        rngState = 0;
     std::map<PeerId, FragmentAssembler>  fragmentAssemblers;
     std::map<std::uint64_t, MonoTime>    migrationCooldowns;
+    std::map<std::uint64_t, MonoTime>    resumableTokens;     // recently-dropped session tokens (clientSalt -> drop time)
     std::vector<RawPacket>               sendQueue;
     std::uint64_t                        rateLimitDrops = 0;
 };
@@ -175,8 +178,25 @@ inline std::vector<PeerEvent> handleNewConnectionRequest(NetPeer& peer, const Pe
     queueControlPacket(peer, PacketType::ConnectionChallenge, encodeSalt(rng.output), pid);
     return {};
 }
-inline std::vector<PeerEvent> handleConnectionRequest(NetPeer& peer, const PeerId& pid, MonoTime now) {
+inline std::vector<PeerEvent> handleConnectionRequest(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
     if (peer.connections.count(pid)) { queueControlPacket(peer, PacketType::ConnectionAccepted, {}, pid); return {}; }
+    // reconnect: a request carrying a recently-dropped session token re-establishes that session
+    // fast, skipping the challenge -- the token (the original clientSalt) is the credential. The
+    // session uses the pre-shared key today; once X25519 lands, this token becomes a resumption
+    // ticket that also restores the negotiated key -- true QUIC-style 0-RTT resume. <X25519 upgrade>
+    if (const auto tok = decodeSalt(pkt.payload)) {
+        const auto rit = peer.resumableTokens.find(*tok);
+        if (rit != peer.resumableTokens.end() && elapsedMs(rit->second, now) < resumeGraceMs) {
+            peer.resumableTokens.erase(rit);
+            peer.pending.erase(pid);
+            Connection conn = newConnection(peer.config, *tok, now);
+            touchRecvTime(conn, now);
+            markConnected(conn, now);
+            peer.connections[pid] = std::move(conn);
+            queueControlPacket(peer, PacketType::ConnectionAccepted, {}, pid);
+            return { evReconnected(pid) };
+        }
+    }
     if (const auto it = peer.pending.find(pid); it != peer.pending.end()) {
         queueControlPacket(peer, PacketType::ConnectionChallenge, encodeSalt(it->second.serverSalt), pid);
         return {};
@@ -332,7 +352,7 @@ inline std::vector<PeerEvent> handleTimeSyncPong(NetPeer& peer, const PeerId& pi
 }
 inline std::vector<PeerEvent> handlePacketByType(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now, PacketType ptype) {
     switch (ptype) {
-        case PacketType::ConnectionRequest:   return handleConnectionRequest(peer, pid, now);
+        case PacketType::ConnectionRequest:   return handleConnectionRequest(peer, pid, pkt, now);
         case PacketType::ConnectionChallenge: return handleConnectionChallenge(peer, pid, pkt, now);
         case PacketType::ConnectionResponse:  return handleConnectionResponse(peer, pid, pkt, now);
         case PacketType::ConnectionAccepted:  return handleConnectionAccepted(peer, pid, now);
@@ -420,6 +440,7 @@ inline std::vector<PeerEvent> updateConnections(NetPeer& peer, MonoTime now) {
     std::vector<PeerId>    disconnected;
     for (auto& [pid, conn] : peer.connections) {
         if (updateTick(conn, now)) {
+            peer.resumableTokens[conn.clientSalt] = now;   // remember the token for a fast reconnect
             events.push_back(evDisconnected(pid, DisconnectReason::Timeout));
             disconnected.push_back(pid);
         } else if (connectionState(conn) == ConnectionState::Disconnected) {
@@ -436,6 +457,9 @@ inline std::vector<PeerEvent> updateConnections(NetPeer& peer, MonoTime now) {
     for (auto it = peer.migrationCooldowns.begin(); it != peer.migrationCooldowns.end();)
         if (!(elapsedMs(it->second, now) < migrationCooldownMs)) it = peer.migrationCooldowns.erase(it);
         else                                                     ++it;
+    for (auto it = peer.resumableTokens.begin(); it != peer.resumableTokens.end();)
+        if (elapsedMs(it->second, now) >= resumeGraceMs) it = peer.resumableTokens.erase(it);
+        else                                             ++it;
     return events;
 }
 inline void retryPendingConnections(NetPeer& peer, MonoTime now) {
@@ -494,6 +518,18 @@ inline void peerConnect(NetPeer& peer, const PeerId& pid, MonoTime now) {
     peer.rngState     = rng.state;
     queueControlPacket(peer, PacketType::ConnectionRequest, {}, pid);
 }
+// Reconnect a dropped session: present the token (captured while connected via peerSessionToken).
+// The server fast-paths it if still within the resume grace window; otherwise it is a normal connect.
+inline void peerReconnect(NetPeer& peer, const PeerId& pid, std::uint64_t token, MonoTime now) {
+    if (peer.connections.count(pid) || peer.pending.count(pid)) return;
+    PendingConnection pend;
+    pend.direction  = ConnectionDirection::Outbound;
+    pend.clientSalt = token;
+    pend.createdAt  = now;
+    pend.lastRetry  = now;
+    peer.pending[pid] = pend;
+    queueControlPacket(peer, PacketType::ConnectionRequest, encodeSalt(token), pid);
+}
 inline void peerDisconnect(NetPeer& peer, const PeerId& pid, MonoTime now) {
     if (const auto it = peer.connections.find(pid); it != peer.connections.end()) disconnect(it->second, DisconnectReason::Requested, now);
 }
@@ -524,6 +560,12 @@ inline void peerBroadcast(NetPeer& peer, ChannelId channel, const Bytes& dat, co
 // --- queries ---
 inline int  peerCount(const NetPeer& peer) noexcept { return static_cast<int>(peer.connections.size()); }
 inline bool peerIsConnected(const NetPeer& peer, const PeerId& pid) { return peer.connections.count(pid) > 0; }
+// The session token (clientSalt) for a live connection. Capture it while connected; pass it to
+// peerReconnect after a drop to re-establish fast.
+inline std::optional<std::uint64_t> peerSessionToken(const NetPeer& peer, const PeerId& pid) {
+    const auto it = peer.connections.find(pid);
+    return it == peer.connections.end() ? std::nullopt : std::optional<std::uint64_t>(it->second.clientSalt);
+}
 inline std::optional<NetworkStats> peerStats(const NetPeer& peer, const PeerId& pid) {
     const auto it = peer.connections.find(pid);
     if (it == peer.connections.end()) return std::nullopt;
