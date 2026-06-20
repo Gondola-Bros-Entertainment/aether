@@ -36,7 +36,8 @@ On top of that delta core, aether is a full reliable-UDP stack:
 - a connection handshake with connect tokens, per-source rate limiting, and an OS CSPRNG for keys
 - reconnect -- a dropped session resumes via a token without a full re-handshake (Reconnected event)
 - migration -- a live connection follows a peer across an IP change (NAT rebind)
-- NAT punch-through -- a rendezvous pairs two peers behind NATs, then both hole-punch so the handshake completes over a direct path
+- NAT traversal -- a rendezvous pairs two peers behind NATs and they hole-punch a direct path, with
+  a relay fallback through the rendezvous when the punch fails (symmetric NATs)
 - clock-offset sync -- a built-in ping/pong estimates the peer's clock for a shared timeline
 - snapshot replication: delta, interest management, priority, and interpolation
 - a deterministic in-memory network for fast, reproducible tests
@@ -124,10 +125,11 @@ cmake --build build --target aether_bench_compare && ./build/aether_bench_compar
 The netcode stack is complete and hardened. Reliable delivery is exercised under heavy simulated
 packet loss -- a message that must arrive does, by retransmit. Connections are encrypted by
 default: the X25519 key exchange is checked against RFC 7748, the ChaCha20-Poly1305 against RFC
-8439. CI is a staged pipeline -- static analysis, then ASan/UBSan, then a build-and-test matrix
-across gcc, clang, and MSVC on Linux, macOS, and Windows, all warning-clean under -Werror. NAT
-punch-through pairs peers behind NATs (rendezvous + hole-punch); a relay fallback for symmetric NATs
-is the planned next step.
+8439. Every decoder is fuzzed against random and truncated input and the serializer is property-tested
+over arbitrary values, both under ASan/UBSan. CI is a staged pipeline -- static analysis, then
+ASan/UBSan, then a build-and-test matrix across gcc, clang, and MSVC on Linux, macOS, and Windows,
+all warning-clean under -Werror. NAT traversal pairs peers behind NATs and hole-punches, with a relay
+fallback through the rendezvous when the punch fails.
 
 ## License
 
