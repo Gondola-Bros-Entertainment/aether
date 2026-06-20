@@ -28,6 +28,7 @@
 #include "aether/channel.hpp"
 #include "aether/stats.hpp"
 #include "aether/crypto.hpp"
+#include "aether/x25519.hpp"
 #include "aether/config.hpp"
 #include "aether/congestion.hpp"
 #include "aether/connection.hpp"
