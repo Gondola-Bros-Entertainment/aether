@@ -14,8 +14,10 @@
 #include "aether/types.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <vector>
 
 namespace aether {
@@ -52,6 +54,13 @@ struct OutgoingPacket {
     Bytes        payload;
 };
 
+// A channel-message wire awaiting coalescing into a packet (accumulated per tick, flushed batched).
+struct PendingWire {
+    Bytes      wire;        // [channel/fragment byte][seq][data]
+    bool       reliable{};
+    ChannelMsg msg{};       // (channel, channelSeq) -- used for reliability when reliable
+};
+
 // One peer connection.
 struct Connection {
     NetworkConfig                config;
@@ -72,6 +81,7 @@ struct Connection {
     BandwidthTracker             bandwidthUp{};
     BandwidthTracker             bandwidthDown{};
     std::vector<OutgoingPacket>  sendQueue;
+    std::vector<PendingWire>     pendingWires;   // accumulated this tick, flushed (coalesced) at tick end
     NetworkStats                 stats{};
     std::optional<MonoTime>      disconnectTime;
     int                          disconnectRetries = 0;
@@ -156,16 +166,58 @@ inline Bytes encodeChannelWire(int chIdx, const ChannelMessage& msg) {
     return wire;
 }
 
-// Enqueue a Payload packet; reliable messages are registered with the reliability tracker.
-inline void enqueuePayload(Connection& conn, bool trackReliable, MonoTime now, int chIdx,
-                           const ChannelMessage& msg, const Bytes& wireData, int wireSize) {
-    PacketHeader header = createHeaderInternal(conn);
-    header.type = PacketType::Payload;
-    conn.sendQueue.push_back(OutgoingPacket{ header, PacketType::Payload, wireData });
-    if (trackReliable)
-        onPacketSent(conn.reliability, conn.localSeq, now, static_cast<ChannelId>(chIdx), msg.sequence, wireSize);
-    conn.localSeq          = next(conn.localSeq);
-    conn.dataSentThisTick  = true;
+// Accumulate a channel-message wire for this tick; flushPendingWires coalesces them into packets.
+inline void enqueuePayload(Connection& conn, bool trackReliable, int chIdx,
+                           const ChannelMessage& msg, const Bytes& wireData) {
+    conn.pendingWires.push_back(
+        PendingWire{ wireData, trackReliable, ChannelMsg{ static_cast<ChannelId>(chIdx), msg.sequence } });
+}
+
+// Coalesce this tick's accumulated wires into packets: a lone wire stays a plain Payload; several
+// become one PayloadBatch ([u8 count][u16 len][wire]...). Each packet gets one sequence, and every
+// reliable message it carries is registered under that sequence.
+inline void flushPendingWires(Connection& conn, MonoTime now) {
+    const int   mtu = conn.config.mtu;
+    std::size_t i   = 0;
+    while (i < conn.pendingWires.size()) {
+        std::size_t n          = 0;
+        int         groupBytes = batchHeaderSize;
+        while (i + n < conn.pendingWires.size() && n < maxMsgsPerPacket) {
+            const int add = batchLengthSize + static_cast<int>(conn.pendingWires[i + n].wire.size());
+            if (n > 0 && groupBytes + add > mtu) break;   // keep within the MTU (always take >= 1)
+            groupBytes += add;
+            ++n;
+        }
+        std::array<ChannelMsg, maxMsgsPerPacket> relMsgs{};
+        std::uint8_t relCount = 0;
+        Bytes        payload;
+        PacketType   type;
+        if (n == 1) {
+            type    = PacketType::Payload;
+            payload = conn.pendingWires[i].wire;
+            if (conn.pendingWires[i].reliable) relMsgs[relCount++] = conn.pendingWires[i].msg;
+        } else {
+            type = PacketType::PayloadBatch;
+            payload.push_back(static_cast<std::uint8_t>(n));
+            for (std::size_t k = 0; k < n; ++k) {
+                const PendingWire& pw = conn.pendingWires[i + k];
+                payload.push_back(static_cast<std::uint8_t>(pw.wire.size() >> 8));
+                payload.push_back(static_cast<std::uint8_t>(pw.wire.size() & 0xFF));
+                payload.insert(payload.end(), pw.wire.begin(), pw.wire.end());
+                if (pw.reliable) relMsgs[relCount++] = pw.msg;
+            }
+        }
+        PacketHeader header = createHeaderInternal(conn);
+        header.type = type;
+        conn.sendQueue.push_back(OutgoingPacket{ header, type, std::move(payload) });
+        if (relCount > 0)
+            onPacketSent(conn.reliability, conn.localSeq, now,
+                         std::span<const ChannelMsg>(relMsgs.data(), relCount), groupBytes);
+        conn.localSeq         = next(conn.localSeq);
+        conn.dataSentThisTick = true;
+        i += n;
+    }
+    conn.pendingWires.clear();
 }
 
 // --- operations ---
@@ -240,15 +292,14 @@ inline void processIncomingHeader(Connection& conn, const PacketHeader& header, 
 
 // --- per-tick channel output ---
 inline void processChannelMessages(Connection& conn, MonoTime now, int chIdx) {
-    const int mtu     = conn.config.mtu;
-    Channel&  channel = conn.channels[static_cast<std::size_t>(chIdx)];
+    Channel& channel = conn.channels[static_cast<std::size_t>(chIdx)];
     for (;;) {
-        if (!ccCanSend(conn.congestion, 0, mtu)) break;            // binary rate gate
         const auto peek = peekOutgoingMessage(channel);
         if (!peek) break;
         const Bytes wireData   = encodeChannelWire(chIdx, *peek);
         const int   wireSize   = static_cast<int>(wireData.size());
         const bool  isReliable = channelIsReliable(channel);
+        if (!ccCanSend(conn.congestion, 0, wireSize)) break;       // rate gate, by actual message size
 
         // small reliable messages bypass cwnd; otherwise honor the window if present
         const bool cwndAllows = (isReliable && wireSize <= smallReliableThreshold)
@@ -259,7 +310,7 @@ inline void processChannelMessages(Connection& conn, MonoTime now, int chIdx) {
         commitOutgoingMessage(channel);
         ccDeductBudget(conn.congestion, wireSize);
         if (conn.cwnd) cwOnSend(*conn.cwnd, wireSize, now);
-        enqueuePayload(conn, isReliable, now, chIdx, *peek, wireData, wireSize);
+        enqueuePayload(conn, isReliable, chIdx, *peek, wireData);
     }
 }
 
@@ -272,15 +323,14 @@ inline void processChannelOutput(Connection& conn, MonoTime now) {
 
 // Re-send reliable messages whose RTO has elapsed (congestion budget still applies).
 inline void processRetransmissions(Connection& conn, MonoTime now, double rto) {
-    const int mtu = conn.config.mtu;
     for (int chIdx = 0; chIdx < static_cast<int>(conn.channels.size()); ++chIdx) {
         const std::vector<ChannelMessage> retransmits = getRetransmitMessages(conn.channels[static_cast<std::size_t>(chIdx)], now, rto);
         for (const ChannelMessage& msg : retransmits) {
-            if (!ccCanSend(conn.congestion, 0, mtu)) break;
             const Bytes wireData = encodeChannelWire(chIdx, msg);
             const int   wireSize = static_cast<int>(wireData.size());
+            if (!ccCanSend(conn.congestion, 0, wireSize)) break;
             ccDeductBudget(conn.congestion, wireSize);
-            enqueuePayload(conn, true, now, chIdx, msg, wireData, wireSize);
+            enqueuePayload(conn, true, chIdx, msg, wireData);
         }
     }
 }
@@ -292,6 +342,7 @@ inline void resetConnection(Connection& conn) {
     conn.requestTime      = std::nullopt;
     conn.localSeq         = SequenceNum{ 0 };
     conn.sendQueue.clear();
+    conn.pendingWires.clear();
     conn.disconnectTime   = std::nullopt;
     conn.disconnectRetries = 0;
     conn.pendingAck       = false;
@@ -321,6 +372,7 @@ inline void updateConnectedPure(Connection& conn, MonoTime now) {
 
     processChannelOutput(conn, now);
     processRetransmissions(conn, now, conn.reliability.rto);
+    flushPendingWires(conn, now);
     for (Channel& ch : conn.channels) channelUpdate(ch, now);
 
     if (conn.pendingAck && !conn.dataSentThisTick) sendAckOnly(conn);

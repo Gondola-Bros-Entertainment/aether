@@ -148,7 +148,7 @@ inline NetPeer newPeerState(const Address& localAddr, const NetworkConfig& confi
 // --- internal helpers ---
 inline void cleanupPeer(NetPeer& peer, const PeerId& pid)   { peer.fragmentAssemblers.erase(pid); }
 inline void removePending(NetPeer& peer, const PeerId& pid) { peer.pending.erase(pid); }
-inline bool isPostHandshake(PacketType t) noexcept { return t == PacketType::Payload || t == PacketType::Keepalive || t == PacketType::Disconnect; }
+inline bool isPostHandshake(PacketType t) noexcept { return t == PacketType::Payload || t == PacketType::PayloadBatch || t == PacketType::Keepalive || t == PacketType::Disconnect; }
 
 inline void queueControlPacket(NetPeer& peer, PacketType ptype, const Bytes& payload, const PeerId& pid) {
     const PacketHeader header{ ptype, SequenceNum{ 0 }, SequenceNum{ 0 }, 0 };
@@ -256,19 +256,32 @@ inline std::vector<PeerEvent> handleFragment(NetPeer& peer, const PeerId& pid, C
         receiveIncomingPayload(it->second, channel, cs->first, cs->second, now);
     return {};
 }
+// Route one channel-wire ([channel/fragment byte][seq][data]) into the connection's channels.
+inline void receiveChannelWire(NetPeer& peer, const PeerId& pid, Connection& conn, const Bytes& wire, MonoTime now) {
+    if (wire.empty()) return;
+    const auto [channel, isFragment] = decodePayloadHeader(wire[0]);
+    const Bytes rest(wire.begin() + 1, wire.end());
+    if (isFragment) { handleFragment(peer, pid, channel, rest, now); return; }
+    if (static_cast<int>(wire.size()) < minPayloadSize) return;
+    if (const auto cs = decodeChannelSeq(rest))
+        receiveIncomingPayload(conn, channel, cs->first, cs->second, now);
+}
 inline std::vector<PeerEvent> handlePayload(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
     const auto it = peer.connections.find(pid);
     if (it == peer.connections.end()) return {};
     processIncomingHeader(it->second, pkt.header, now);
     touchRecvTime(it->second, now);
-    const Bytes& payload = pkt.payload;
-    if (payload.empty()) return {};
-    const auto [channel, isFragment] = decodePayloadHeader(payload[0]);
-    const Bytes rest(payload.begin() + 1, payload.end());
-    if (isFragment) return handleFragment(peer, pid, channel, rest, now);
-    if (static_cast<int>(payload.size()) < minPayloadSize) return {};
-    if (const auto cs = decodeChannelSeq(rest))
-        receiveIncomingPayload(it->second, channel, cs->first, cs->second, now);
+    receiveChannelWire(peer, pid, it->second, pkt.payload, now);
+    return {};
+}
+// A coalesced payload: one packet (one sequence) carrying several channel-wires.
+inline std::vector<PeerEvent> handlePayloadBatch(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
+    const auto it = peer.connections.find(pid);
+    if (it == peer.connections.end()) return {};
+    processIncomingHeader(it->second, pkt.header, now);
+    touchRecvTime(it->second, now);
+    if (const auto wires = unbatchMessages(pkt.payload))
+        for (const Bytes& wire : *wires) receiveChannelWire(peer, pid, it->second, wire, now);
     return {};
 }
 inline std::vector<PeerEvent> handleMigration(NetPeer& peer, const PeerId& newPid, const Packet& pkt, MonoTime now) {
@@ -290,7 +303,10 @@ inline std::vector<PeerEvent> handleMigration(NetPeer& peer, const PeerId& newPi
         peer.fragmentAssemblers.erase(fa);
     }
     std::vector<PeerEvent> events{ evMigrated(cand->oldPeer, newPid) };
-    for (auto& e : handlePayload(peer, newPid, pkt, now)) events.push_back(std::move(e));
+    auto more = (pkt.header.type == PacketType::PayloadBatch)
+                  ? handlePayloadBatch(peer, newPid, pkt, now)
+                  : handlePayload(peer, newPid, pkt, now);
+    for (auto& e : more) events.push_back(std::move(e));
     return events;
 }
 
@@ -306,6 +322,8 @@ inline std::vector<PeerEvent> handlePacketByType(NetPeer& peer, const PeerId& pi
         case PacketType::Disconnect:          return handleDisconnect(peer, pid, pkt);
         case PacketType::Payload:
             return peer.connections.count(pid) ? handlePayload(peer, pid, pkt, now) : handleMigration(peer, pid, pkt, now);
+        case PacketType::PayloadBatch:
+            return peer.connections.count(pid) ? handlePayloadBatch(peer, pid, pkt, now) : handleMigration(peer, pid, pkt, now);
         case PacketType::Keepalive:
             if (const auto it = peer.connections.find(pid); it != peer.connections.end()) {
                 processIncomingHeader(it->second, pkt.header, now);

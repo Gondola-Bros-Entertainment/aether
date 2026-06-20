@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -28,6 +29,7 @@ inline constexpr std::uint16_t defaultMaxSequenceDistance = 32768;
 inline constexpr int           defaultMaxInFlight         = 256;
 inline constexpr int           sentBufferSize             = 256;     // ring; power of 2
 inline constexpr int           recvBufferSize             = 256;
+inline constexpr std::uint8_t  maxMsgsPerPacket           = 16;      // cap on coalesced messages per sent packet
 
 // --- 256-bit rolling loss window (1 = lost) ---
 struct LossWindow { std::uint64_t bits[4]{}; };
@@ -92,9 +94,12 @@ inline void rbInsert(ReceivedBuffer& b, SequenceNum s) noexcept {
 }
 
 // --- sent-packet ring buffer (ack processing + RTT) ---
+// A reliable channel message (channel + its per-channel sequence). Defined here because the sent
+// record stores a list of them: one packet can carry several once coalesced.
+struct ChannelMsg { ChannelId channel{}; SequenceNum seq{}; };
 struct SentPacketRecord {
-    ChannelId    channelId{};
-    SequenceNum  channelSeq{};
+    std::array<ChannelMsg, maxMsgsPerPacket> msgs{};
+    std::uint8_t msgCount{};
     MonoTime     sendTime{};
     int          size{};
     std::uint8_t nackCount{};
@@ -130,7 +135,6 @@ inline bool spbFindOldest(const SentPacketBuffer& b, SequenceNum& outSeq) noexce
 }
 
 // --- the reliable endpoint ---
-struct ChannelMsg { ChannelId channel{}; SequenceNum seq{}; };
 struct AckResult {
     std::vector<ChannelMsg> acked;
     std::vector<ChannelMsg> fastRetransmit;
@@ -180,14 +184,25 @@ inline void recordLossSample(ReliableEndpoint& ep, bool lost) {
 }
 
 inline void onPacketSent(ReliableEndpoint& ep, SequenceNum seq, MonoTime sendTime,
-                         ChannelId ch, SequenceNum chSeq, int size) {
+                         std::span<const ChannelMsg> msgs, int size) {
     if (ep.sent.count >= ep.maxInFlight) {
         SequenceNum worst{};
         if (spbFindOldest(ep.sent, worst)) { spbDelete(ep.sent, worst); ep.packetsEvicted += 1; }
     }
-    spbInsert(ep.sent, seq, SentPacketRecord{ ch, chSeq, sendTime, size, 0 });
+    SentPacketRecord rec{};
+    rec.msgCount = static_cast<std::uint8_t>(std::min<std::size_t>(msgs.size(), maxMsgsPerPacket));
+    for (std::uint8_t i = 0; i < rec.msgCount; ++i) rec.msgs[i] = msgs[i];
+    rec.sendTime = sendTime;
+    rec.size     = size;
+    spbInsert(ep.sent, seq, rec);
     ep.totalSent += 1;
     ep.bytesSent += static_cast<std::uint64_t>(size);
+}
+// convenience: a single (channel, seq) message -- the non-coalesced path.
+inline void onPacketSent(ReliableEndpoint& ep, SequenceNum seq, MonoTime sendTime,
+                         ChannelId ch, SequenceNum chSeq, int size) {
+    const ChannelMsg m{ ch, chSeq };
+    onPacketSent(ep, seq, sendTime, std::span<const ChannelMsg>(&m, 1), size);
 }
 
 inline void onPacketsReceived(ReliableEndpoint& ep, const SequenceNum* seqs, std::size_t n) {
@@ -218,7 +233,7 @@ inline AckResult processAcks(ReliableEndpoint& ep, SequenceNum ackSeq, std::uint
         SentPacketRecord* rec = spbLookup(ep.sent, seq);
         if (!rec) continue;
         if (bitSet) {
-            result.acked.push_back({ rec->channelId, rec->channelSeq });
+            for (std::uint8_t k = 0; k < rec->msgCount; ++k) result.acked.push_back(rec->msgs[k]);
             rttSum += elapsedMs(rec->sendTime, now);
             ++rttCnt;
             bAcked += static_cast<std::uint64_t>(rec->size);
@@ -226,7 +241,7 @@ inline AckResult processAcks(ReliableEndpoint& ep, SequenceNum ackSeq, std::uint
         } else {
             rec->nackCount = static_cast<std::uint8_t>(std::min(255, rec->nackCount + 1));
             if (rec->nackCount == fastRetransmitThreshold)
-                result.fastRetransmit.push_back({ rec->channelId, rec->channelSeq });
+                for (std::uint8_t k = 0; k < rec->msgCount; ++k) result.fastRetransmit.push_back(rec->msgs[k]);
         }
     }
     if (rttCnt > 0) updateRtt(ep, rttSum / rttCnt);

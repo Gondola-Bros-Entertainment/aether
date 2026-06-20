@@ -375,6 +375,54 @@ int main() {
         std::printf("aether connection OK: reliable message a->b across %d payload packet(s)\n", delivered);
     }
 
+    // coalescing: several messages sent in one tick ride a single PayloadBatch packet, and the
+    // receiver unbatches all of them -- fewer datagrams + auth tags, identical delivery.
+    {
+        aether::NetworkConfig cfg;
+        cfg.channelConfigs = { aether::unreliableChannel() };   // channel 0 unreliable: all messages drain per tick
+        aether::Connection a = aether::newConnection(cfg, 111, aether::MonoTime{ 0 });
+        aether::Connection b = aether::newConnection(cfg, 222, aether::MonoTime{ 0 });
+        aether::markConnected(a, aether::MonoTime{ 0 });
+        aether::markConnected(b, aether::MonoTime{ 0 });
+
+        constexpr int N = 6;
+        for (int k = 0; k < N; ++k) {
+            const aether::Bytes m{ static_cast<std::uint8_t>(k), 0xA0, 0xB0 };
+            const auto sendErr = aether::sendMessage(a, aether::ChannelId{ 0 }, m, aether::MonoTime{ 0 });
+            assert(!sendErr);
+        }
+        const auto flushErr = aether::updateTick(a, aether::MonoTime{ 1000000 });   // flush -> coalesce this tick
+        assert(!flushErr);
+        const auto outgoing = aether::drainSendQueue(a);
+
+        std::size_t batched = 0;
+        for (const auto& p : outgoing) if (p.type == aether::PacketType::PayloadBatch) ++batched;
+        assert(outgoing.size() < static_cast<std::size_t>(N) && batched >= 1);   // fewer packets, >=1 batch
+
+        const auto deliver = [&](const aether::Bytes& wire) {
+            if (wire.size() < 3) return;
+            const auto chan = static_cast<std::uint8_t>(wire[0] & 0x07);
+            const aether::SequenceNum chSeq{ static_cast<std::uint16_t>((wire[1] << 8) | wire[2]) };
+            aether::receiveIncomingPayload(b, aether::ChannelId{ chan }, chSeq,
+                                           aether::Bytes(wire.begin() + 3, wire.end()), aether::MonoTime{ 2000000 });
+        };
+        for (const auto& pkt : outgoing) {
+            aether::processIncomingHeader(b, pkt.header, aether::MonoTime{ 2000000 });
+            if (pkt.type == aether::PacketType::PayloadBatch) {
+                const auto wires = aether::unbatchMessages(pkt.payload);
+                assert(wires);
+                for (const auto& wire : *wires) deliver(wire);
+            } else if (pkt.type == aether::PacketType::Payload) {
+                deliver(pkt.payload);
+            }
+        }
+        const auto got = aether::receiveMessage(b, aether::ChannelId{ 0 });
+        assert(got.size() == static_cast<std::size_t>(N));
+        for (const auto& m : got) assert(m.size() == 3 && m[1] == 0xA0 && m[2] == 0xB0);
+        std::printf("aether coalescing OK: %d unreliable messages -> %zu packet(s) (%zu batched), all delivered\n",
+                    N, outgoing.size(), batched);
+    }
+
     // reliable delivery under packet loss: a reliable message must reach b even when ~40% of
     // packets are dropped, by riding the ack + retransmit machinery. This is the test that makes
     // "tested" mean something on a lossy link, not just a clean localhost handshake.
