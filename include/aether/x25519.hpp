@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 
 namespace aether {
@@ -23,7 +24,7 @@ inline void gfSub(Gf& o, const Gf& a, const Gf& b) noexcept { for (int i = 0; i 
 
 // Propagate carries and fold 2^256 == 38 (mod 2^255-19) back into limb 0.
 inline void gfCarry(Gf& o) noexcept {
-    for (int i = 0; i < 16; ++i) {
+    for (std::size_t i = 0; i < 16; ++i) {
         o[i] += std::int64_t{ 1 } << 16;
         const std::int64_t c = o[i] >> 16;
         o[(i + 1) * (i < 15)] += c - 1 + 37 * (c - 1) * (i == 15);
@@ -54,7 +55,7 @@ inline void gfCswap(Gf& a, Gf& b, std::int64_t bit) noexcept {
 }
 
 inline void gfUnpack(Gf& o, const std::uint8_t* n) noexcept {
-    for (int i = 0; i < 16; ++i)
+    for (std::size_t i = 0; i < 16; ++i)
         o[i] = static_cast<std::int64_t>(n[2 * i]) + (static_cast<std::int64_t>(n[2 * i + 1]) << 8);
     o[15] &= 0x7fff;   // a u-coordinate is 255 bits
 }
@@ -75,7 +76,7 @@ inline void gfPack(std::uint8_t* o, const Gf& n) noexcept {
         m[14] &= 0xffff;
         gfCswap(t, m, 1 - carry);
     }
-    for (int i = 0; i < 16; ++i) {
+    for (std::size_t i = 0; i < 16; ++i) {
         o[2 * i]     = static_cast<std::uint8_t>(t[i] & 0xff);
         o[2 * i + 1] = static_cast<std::uint8_t>(t[i] >> 8);
     }
