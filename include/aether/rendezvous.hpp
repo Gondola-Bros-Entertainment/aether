@@ -42,6 +42,8 @@ inline std::optional<Address> decodeAddr(const std::uint8_t* p, std::size_t n) {
 enum class RendezvousMsg : std::uint8_t { Register = 1, Paired = 2 };
 enum class PunchRole     : std::uint8_t { Connect = 0, Accept = 1 };
 
+inline constexpr double registerRetryMs = 1000.0;   // re-send Register this often until the rendezvous pairs us
+
 inline Bytes encodeRegister(std::uint64_t roomId) {
     Bytes b;
     b.push_back(static_cast<std::uint8_t>(RendezvousMsg::Register));

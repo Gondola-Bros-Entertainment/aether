@@ -821,8 +821,8 @@ int main() {
         assert(rv && hA && hB);
         const aether::Address rvAddr = aether::localAddr(*rv);
         aether::RendezvousServer server;
-        aether::hostJoinRoom(*hA, rvAddr, 42);
-        aether::hostJoinRoom(*hB, rvAddr, 42);
+        aether::hostJoinRoom(*hA, rvAddr, 42, aether::MonoTime{ 0 });
+        aether::hostJoinRoom(*hB, rvAddr, 42, aether::MonoTime{ 777 });
 
         bool aUp = false, bUp = false;
         std::uint64_t t = 0;
@@ -835,6 +835,30 @@ int main() {
         assert(aUp && bUp);
         aether::closeHost(*hA); aether::closeHost(*hB); aether::closeSocket(*rv);
         std::printf("aether nat-punch OK: rendezvous paired two hosts, handshake completed over the punched path\n");
+    }
+
+    // rendezvous Register re-send: a stranded join (rendezvous never replies) must keep retrying.
+    {
+        const aether::NetworkConfig rcfg;
+        auto rv2 = aether::openUdp(aether::addrLocalhost(0));
+        auto h   = aether::openHost(aether::addrLocalhost(0), rcfg, aether::MonoTime{ 0 });
+        assert(rv2 && h);
+        const aether::Address rv2Addr = aether::localAddr(*rv2);
+        aether::hostJoinRoom(*h, rv2Addr, 7, aether::MonoTime{ 0 });   // Register #1
+        std::uint64_t tt = 0;
+        for (int k = 0; k < 4; ++k) { tt += 1100ull * 1000000; (void) aether::hostTick(*h, {}, aether::MonoTime{ tt }); }  // each > registerRetryMs
+        int registers = 0;
+        std::uint8_t rb[600];
+        for (;;) {
+            aether::Address from{};
+            const int n = aether::recvFrom(*rv2, std::span<std::uint8_t>(rb, sizeof rb), from);
+            if (n <= 0) break;
+            if (aether::decodeRegister(aether::Bytes(rb, rb + n))) ++registers;
+        }
+        assert(registers >= 2);   // re-sent, not sent once
+        aether::closeHost(*h);
+        aether::closeSocket(*rv2);
+        std::printf("aether register-resend OK: a stranded join retries Register (%d datagrams)\n", registers);
     }
 
     return 0;

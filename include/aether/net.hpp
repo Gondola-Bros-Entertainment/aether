@@ -18,10 +18,12 @@
 namespace aether {
 
 struct Host {
-    Socket                 socket{};
-    NetPeer                peer;
-    std::optional<Address> rendezvousAddr;   // set by hostJoinRoom; replies from here are Paired messages
-    std::optional<Address> punchTarget;      // an Accept peer hole-punches this address until connected
+    Socket                       socket{};
+    NetPeer                      peer;
+    std::optional<Address>       rendezvousAddr;   // set by hostJoinRoom; replies from here are Paired messages
+    std::optional<Address>       punchTarget;      // an Accept peer hole-punches this address until connected
+    std::optional<std::uint64_t> pendingRoom;      // room awaiting pairing -- Register is re-sent until paired
+    MonoTime                     lastRegister{};
 };
 
 // Open a host bound to bindAddr (use addrAny(port) for a server, addrLocalhost(0) for ephemeral).
@@ -47,6 +49,7 @@ inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<Chan
         Bytes raw(scratch.begin(), scratch.begin() + n);
         if (h.rendezvousAddr && addrEqual(from, *h.rendezvousAddr)) {   // a pairing reply from the rendezvous
             if (const auto paired = decodePaired(raw)) {
+                h.pendingRoom = std::nullopt;   // paired -- stop re-registering
                 if (paired->first == PunchRole::Connect) peerConnect(h.peer, PeerId{ paired->second }, now);
                 else                                     h.punchTarget = paired->second;   // Accept: punch this open
             }
@@ -71,13 +74,23 @@ inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<Chan
             sendTo(h.socket, std::span<const std::uint8_t>(&punch, 1), *h.punchTarget);
         }
     }
+
+    // re-send Register until the rendezvous pairs us -- UDP, so the first one can be lost.
+    if (h.pendingRoom && h.rendezvousAddr && elapsedMs(h.lastRegister, now) >= registerRetryMs) {
+        const Bytes reg = encodeRegister(*h.pendingRoom);
+        sendTo(h.socket, std::span<const std::uint8_t>(reg.data(), reg.size()), *h.rendezvousAddr);
+        h.lastRegister = now;
+    }
     return std::move(result.events);
 }
 
 inline void hostConnect(Host& h, const Address& addr, MonoTime now) { peerConnect(h.peer, PeerId{ addr }, now); }
-// Join a room on the rendezvous server; once paired, hostTick auto-connects (or hole-punches) to the peer.
-inline void hostJoinRoom(Host& h, const Address& rendezvous, std::uint64_t roomId) {
+// Join a room on the rendezvous server; once paired, hostTick auto-connects (or hole-punches) to the
+// peer. Register is re-sent each tick until paired, so a lost first datagram does not strand the join.
+inline void hostJoinRoom(Host& h, const Address& rendezvous, std::uint64_t roomId, MonoTime now) {
     h.rendezvousAddr = rendezvous;
+    h.pendingRoom    = roomId;
+    h.lastRegister   = now;
     const Bytes reg = encodeRegister(roomId);
     sendTo(h.socket, std::span<const std::uint8_t>(reg.data(), reg.size()), rendezvous);
 }
