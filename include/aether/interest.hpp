@@ -28,7 +28,9 @@ inline float priorityMod(const RadiusInterest& ri, Position entity, Position obs
 
 // --- grid-based: entities in the same or a neighboring cell are relevant ---
 struct GridInterest { float cellSize = 0.0f; float invCellSize = 0.0f; };
-inline GridInterest newGridInterest(float cellSize) { return { cellSize, 1.0f / cellSize }; }
+// cellSize <= 0 is degenerate; map everything to one cell (invCellSize 0) rather than divide by zero
+// (which would feed NaN into the int casts in relevant() -- undefined behavior).
+inline GridInterest newGridInterest(float cellSize) { return { cellSize, cellSize > 0.0f ? 1.0f / cellSize : 0.0f }; }
 inline float gridInterestCellSize(const GridInterest& gi) noexcept { return gi.cellSize; }
 
 inline bool relevant(const GridInterest& gi, Position entity, Position observer) noexcept {

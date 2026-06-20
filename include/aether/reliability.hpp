@@ -18,7 +18,7 @@
 namespace aether {
 
 inline constexpr double        initialRtoMs               = 100.0;
-inline constexpr int           ackBitsWindow              = 64;
+inline constexpr int           ackBitsWindow              = 32;   // matches the 32-bit ackBits wire field
 inline constexpr double        rttAlpha                   = 0.125;   // Jacobson/Karels SRTT
 inline constexpr double        rttBeta                    = 0.25;    // ...RTTVAR
 inline constexpr double        minRtoMs                   = 50.0;
@@ -237,15 +237,18 @@ inline AckResult processAcks(ReliableEndpoint& ep, SequenceNum ackSeq, std::uint
             rttSum += elapsedMs(rec->sendTime, now);
             ++rttCnt;
             bAcked += static_cast<std::uint64_t>(rec->size);
+            recordLossSample(ep, false);   // one sample per packet: this one arrived
             spbDelete(ep.sent, seq);
         } else {
             rec->nackCount = static_cast<std::uint8_t>(std::min(255, rec->nackCount + 1));
-            if (rec->nackCount == fastRetransmitThreshold)
+            if (rec->nackCount == fastRetransmitThreshold) {   // crosses the loss threshold exactly once
+                recordLossSample(ep, true);                    // ...so packetLossPercent actually moves off zero
+                ep.totalLost += 1;
                 for (std::uint8_t k = 0; k < rec->msgCount; ++k) result.fastRetransmit.push_back(rec->msgs[k]);
+            }
         }
     }
     if (rttCnt > 0) updateRtt(ep, rttSum / rttCnt);
-    for (std::size_t k = 0; k < result.acked.size(); ++k) recordLossSample(ep, false);
     ep.totalAcked += result.acked.size();
     ep.bytesAcked += bAcked;
     return result;

@@ -33,6 +33,7 @@ struct Host {
 
 // Open a host bound to bindAddr (use addrAny(port) for a server, addrLocalhost(0) for ephemeral).
 inline std::optional<Host> openHost(const Address& bindAddr, const NetworkConfig& config, MonoTime now) {
+    if (validateConfig(config)) return std::nullopt;   // reject an invalid config rather than run with it
     auto sock = openUdp(bindAddr);
     if (!sock) return std::nullopt;
     Host h;

@@ -24,15 +24,21 @@ inline constexpr int         maxSnapshotBytes = 65536;   // scratch buffer cap f
 // per-call 64KB allocation; only the right-sized result is copied out.
 template <class T> Bytes packFull(const T& v) {
     static thread_local Bytes scratch(maxSnapshotBytes);
-    Writer w{ scratch.data(), scratch.size(), 0, true };
-    pack(w, v);
-    return Bytes(scratch.data(), scratch.data() + w.pos);
+    for (;;) {
+        Writer w{ scratch.data(), scratch.size(), 0, true };
+        pack(w, v);
+        if (w.ok) return Bytes(scratch.data(), scratch.data() + w.pos);
+        scratch.resize(scratch.size() * 2);   // snapshot outgrew the scratch -> grow + retry, never truncate
+    }
 }
 template <class T> Bytes packDelta(const T& prev, const T& curr) {
     static thread_local Bytes scratch(maxSnapshotBytes);
-    Writer w{ scratch.data(), scratch.size(), 0, true };
-    deltaPack(w, prev, curr);
-    return Bytes(scratch.data(), scratch.data() + w.pos);
+    for (;;) {
+        Writer w{ scratch.data(), scratch.size(), 0, true };
+        deltaPack(w, prev, curr);
+        if (w.ok) return Bytes(scratch.data(), scratch.data() + w.pos);
+        scratch.resize(scratch.size() * 2);   // grow + retry rather than silently truncate the delta
+    }
 }
 
 // --- sender side ---

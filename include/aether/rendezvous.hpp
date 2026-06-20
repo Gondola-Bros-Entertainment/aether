@@ -18,23 +18,8 @@
 
 namespace aether {
 
-// --- address serialization: the raw sockaddr bytes (family/port/ip line up across platforms) ---
-inline Bytes encodeAddr(const Address& a) {
-    Bytes b;
-    b.reserve(static_cast<std::size_t>(1) + a.len);
-    b.push_back(static_cast<std::uint8_t>(a.len));
-    b.insert(b.end(), a.storage, a.storage + a.len);
-    return b;
-}
-inline std::optional<Address> decodeAddr(const std::uint8_t* p, std::size_t n) {
-    if (n == 0) return std::nullopt;
-    const std::uint32_t len = p[0];
-    if (len > addrStorageSize || n < static_cast<std::size_t>(1) + len) return std::nullopt;
-    Address a{};
-    a.len = len;
-    for (std::uint32_t i = 0; i < len; ++i) a.storage[i] = p[1 + i];
-    return a;
-}
+// Addresses go on the wire via the canonical {family, port, ip} form (socket.hpp's serializeAddr /
+// deserializeAddr) so a mac peer and a linux/windows peer agree -- raw sockaddr bytes would not.
 
 // --- rendezvous wire protocol ---
 // Register: a peer joins a room. Paired: once two peers share a room, the server returns the other
@@ -61,14 +46,14 @@ inline Bytes encodePaired(PunchRole role, const Address& peerAddr) {
     Bytes b;
     b.push_back(static_cast<std::uint8_t>(RendezvousMsg::Paired));
     b.push_back(static_cast<std::uint8_t>(role));
-    const Bytes addr = encodeAddr(peerAddr);
+    const Bytes addr = serializeAddr(peerAddr);
     b.insert(b.end(), addr.begin(), addr.end());
     return b;
 }
 inline std::optional<std::pair<PunchRole, Address>> decodePaired(const Bytes& b) {
     if (b.size() < 2 || b[0] != static_cast<std::uint8_t>(RendezvousMsg::Paired)) return std::nullopt;
     const auto role = static_cast<PunchRole>(b[1]);
-    const auto addr = decodeAddr(b.data() + 2, b.size() - 2);
+    const auto addr = deserializeAddr(b.data() + 2, b.size() - 2);
     if (!addr) return std::nullopt;
     return std::pair<PunchRole, Address>{ role, *addr };
 }
@@ -114,8 +99,10 @@ inline std::vector<std::pair<Address, Bytes>> rendezvousProcess(
             }
         } else if (const auto relay = decodeRelay(data)) {
             if (const auto sit = rv.sessions.find(relay->first); sit != rv.sessions.end()) {
-                const Address& dst = addrEqual(src, sit->second.first) ? sit->second.second : sit->second.first;
-                out.emplace_back(dst, relay->second);                            // forward the inner packet to the partner
+                const bool isFirst  = addrEqual(src, sit->second.first);
+                const bool isSecond = addrEqual(src, sit->second.second);
+                if (isFirst || isSecond)   // only a paired member may relay -- not an open reflector for strangers
+                    out.emplace_back(isFirst ? sit->second.second : sit->second.first, relay->second);
             }
         }
     }

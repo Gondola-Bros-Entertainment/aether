@@ -63,6 +63,7 @@ endforeach()
 add_executable(aether_bench bench/bench.cpp)
 target_link_libraries(aether_bench PRIVATE aether)
 target_compile_options(aether_bench PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/O2,-O3>)
+add_test(NAME bench COMMAND aether_bench)   # smoke: the bench must actually run (catches a DCE/UB regression)
 
 # Opt-in comparison benchmark: aether vs zpp::bits. Fetches an external lib, so it is OFF by
 # default and never touches the library's zero-dependency build:

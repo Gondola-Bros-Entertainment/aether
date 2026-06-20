@@ -23,7 +23,7 @@ enum class PacketType : std::uint8_t {
     Keepalive           = 5,   // keep the connection alive
     ConnectionChallenge = 6,   // server challenge (+ 64-bit server salt)
     ConnectionResponse  = 7,   // client response (+ 64-bit client salt)
-    PayloadBatch        = 8,   // several coalesced channel messages (batchMessages framing)
+    PayloadBatch        = 8,   // several coalesced channel messages (count + length-prefixed framing)
     TimeSyncPing        = 9,   // clock sync: [u64 sender ns]
     TimeSyncPong        = 10,  // clock sync reply: [u64 echoed ns][u64 responder ns]
 };

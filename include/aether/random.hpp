@@ -12,4 +12,13 @@ namespace aether {
 // Fill out[0..len) with cryptographically secure random bytes.
 void secureRandomBytes(std::uint8_t* out, std::size_t len);
 
+// A cryptographically secure 64-bit value (little-endian over 8 CSPRNG bytes), for salts and tokens.
+inline std::uint64_t secureRandom64() {
+    std::uint8_t b[8];
+    secureRandomBytes(b, sizeof b);
+    std::uint64_t v = 0;
+    for (std::size_t i = 0; i < 8; ++i) v |= static_cast<std::uint64_t>(b[i]) << (8 * i);
+    return v;
+}
+
 } // namespace aether

@@ -3,6 +3,8 @@
 // (bar one handle typedef); the OS calls live in socket_posix.cpp / socket_win.cpp.
 #pragma once
 
+#include "aether/types.hpp"
+
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -24,6 +26,13 @@ Address       addrLocalhost(std::uint16_t port);   // 127.0.0.1:port
 Address       addrV4(std::uint32_t ip, std::uint16_t port);
 std::uint16_t addrPort(const Address& a);
 bool          addrEqual(const Address& a, const Address& b);
+
+// Canonical, cross-platform address wire form: [family:1 (4|6)][port:2 BE][ip: 4 or 16 bytes]. Send
+// an address between peers with this, NOT the raw sockaddr bytes -- sockaddr layout differs across
+// platforms (e.g. macOS has a leading sin_len byte), so raw bytes mis-parse between a mac and a
+// linux/windows peer.
+Bytes                  serializeAddr(const Address& a);
+std::optional<Address> deserializeAddr(const std::uint8_t* p, std::size_t n);
 
 // A UDP socket handle: an int fd on POSIX, but a Windows SOCKET is an unsigned pointer-width value
 // that does not fit in an int -- so the handle type is selected per platform. This typedef is the

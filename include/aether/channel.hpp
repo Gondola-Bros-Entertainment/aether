@@ -41,9 +41,10 @@ struct ChannelMessage {
     SequenceNum sequence{};
     Bytes       data;
     MonoTime    sendTime{};
-    bool        acked      = false;
-    int         retryCount = 0;
-    bool        reliable   = false;
+    bool        acked           = false;
+    int         retryCount      = 0;
+    bool        reliable        = false;
+    bool        forceRetransmit = false;   // set by a triple-NACK: resend on the next pass, ignoring the RTO
 };
 
 enum class ChannelError { None, BufferFull, MessageTooLarge };
@@ -74,9 +75,12 @@ struct SendResult { ChannelError error = ChannelError::None; SequenceNum seq{}; 
 
 inline SendResult channelSend(Channel& ch, const Bytes& payload, MonoTime now) {
     if (static_cast<int>(payload.size()) > ch.config.maxMessageSize) return { ChannelError::MessageTooLarge, {} };
-    const bool full = static_cast<int>(ch.sendBuffer.size()) >= ch.config.messageBufferSize;
-    if (full && ch.config.blockOnFull) return { ChannelError::BufferFull, {} };
-    if (full) ch.sendBuffer.erase(ch.sendBuffer.begin());   // drop oldest to make room
+    if (static_cast<int>(ch.sendBuffer.size()) >= ch.config.messageBufferSize) {
+        // A reliable channel must never silently drop a buffered message -- it would break the
+        // delivery guarantee and stall the receiver's ordering -- so it backpressures instead.
+        if (ch.config.blockOnFull || isReliable(ch.config.deliveryMode)) return { ChannelError::BufferFull, {} };
+        ch.sendBuffer.erase(ch.sendBuffer.begin());   // unreliable: drop oldest to make room
+    }
     const SequenceNum seq = ch.localSeq;
     ch.sendBuffer[seq] = ChannelMessage{ seq, payload, now, false, 0, isReliable(ch.config.deliveryMode) };
     ch.localSeq = next(ch.localSeq);
@@ -84,41 +88,22 @@ inline SendResult channelSend(Channel& ch, const Bytes& payload, MonoTime now) {
     return { ChannelError::None, seq };
 }
 
-// Next message to put on the wire, in sequence order. Reliable msgs stay buffered for
-// retransmit; unreliable are removed (fire and forget). nullopt = nothing new to send.
-inline std::optional<ChannelMessage> getOutgoingMessage(Channel& ch) {
-    while (!ch.sendBuffer.empty()) {
-        auto it = ch.sendBuffer.begin();
-        ChannelMessage& msg = it->second;
-        if (msg.acked) { ch.sendBuffer.erase(it); continue; }
-        if (msg.retryCount == 0) {
-            ChannelMessage out = msg;   // non-const so the return moves instead of copying the payload
-            if (msg.reliable) msg.retryCount = 1;
-            else              ch.sendBuffer.erase(it);
-            return out;
-        }
-        return std::nullopt;   // head already sent, awaiting ack
-    }
-    return std::nullopt;
-}
-
-// Peek the next message to send WITHOUT committing (cleans acked entries off the front).
-// Lets the caller check congestion/cwnd before consuming it via commitOutgoingMessage.
+// Peek the next UNSENT message (lowest sequence first), looking PAST in-flight ones so several
+// messages can be in flight at once -- a sliding window, not stop-and-wait (one per RTT). Cleans
+// acked entries out. Does not consume; commitOutgoingMessage(seq) consumes the peeked message.
 inline std::optional<ChannelMessage> peekOutgoingMessage(Channel& ch) {
-    while (!ch.sendBuffer.empty()) {
-        auto it = ch.sendBuffer.begin();
-        if (it->second.acked) { ch.sendBuffer.erase(it); continue; }
-        if (it->second.retryCount == 0) return it->second;
-        return std::nullopt;   // head already sent, awaiting ack
+    for (auto it = ch.sendBuffer.begin(); it != ch.sendBuffer.end(); ) {
+        if (it->second.acked)           { it = ch.sendBuffer.erase(it); continue; }
+        if (it->second.retryCount == 0) return it->second;   // first not-yet-sent message
+        ++it;                                                // in flight, awaiting ack -> look past it
     }
     return std::nullopt;
 }
-// Commit the head message returned by peekOutgoingMessage: reliable -> mark sent (retry 1),
-// unreliable -> remove (fire and forget). Call only right after a successful peek.
-inline void commitOutgoingMessage(Channel& ch) {
-    if (ch.sendBuffer.empty()) return;
-    auto it = ch.sendBuffer.begin();
-    if (it->second.acked || it->second.retryCount != 0) return;
+// Consume the message peekOutgoingMessage returned (by sequence): reliable -> mark sent (retry 1,
+// kept for retransmit), unreliable -> remove (fire and forget).
+inline void commitOutgoingMessage(Channel& ch, SequenceNum seq) {
+    auto it = ch.sendBuffer.find(seq);
+    if (it == ch.sendBuffer.end() || it->second.acked || it->second.retryCount != 0) return;
     if (it->second.reliable) it->second.retryCount = 1;
     else                     ch.sendBuffer.erase(it);
 }
@@ -131,7 +116,8 @@ inline std::vector<ChannelMessage> getRetransmitMessages(Channel& ch, MonoTime n
         ChannelMessage& msg = it->second;
         if (msg.acked || msg.retryCount == 0) { ++it; continue; }
         if (msg.retryCount > ch.config.maxReliableRetries) { it = ch.sendBuffer.erase(it); ch.totalDropped += 1; continue; }
-        if (elapsedMs(msg.sendTime, now) >= rtoMs) {
+        if (msg.forceRetransmit || elapsedMs(msg.sendTime, now) >= rtoMs) {
+            msg.forceRetransmit = false;
             const ChannelMessage resend = msg;
             msg.sendTime = now;
             msg.retryCount += 1;
@@ -141,6 +127,15 @@ inline std::vector<ChannelMessage> getRetransmitMessages(Channel& ch, MonoTime n
         ++it;
     }
     return out;
+}
+
+// Mark a specific in-flight message for immediate retransmit (fast-retransmit on a triple-NACK): the
+// next getRetransmitMessages resends it without waiting out the RTO. Routed through the normal
+// retransmit pass so the congestion budget and retry limit still apply.
+inline void markForRetransmit(Channel& ch, SequenceNum seq) noexcept {
+    auto it = ch.sendBuffer.find(seq);
+    if (it != ch.sendBuffer.end() && !it->second.acked && it->second.retryCount > 0)
+        it->second.forceRetransmit = true;
 }
 
 // --- receiving ---

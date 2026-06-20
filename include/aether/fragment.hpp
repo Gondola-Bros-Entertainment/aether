@@ -1,6 +1,5 @@
-// aether - message fragmentation, reassembly, and path-MTU discovery. Splits messages too big
-// for the MTU into 6-byte-headered fragments, reassembles them, and probes the path MTU via
-// binary search.
+// aether - message fragmentation and reassembly. Splits messages too big for the MTU into
+// 6-byte-headered fragments and reassembles them.
 #pragma once
 
 #include "aether/types.hpp"
@@ -16,11 +15,6 @@ namespace aether {
 
 inline constexpr int    fragmentHeaderSize      = 6;     // messageId(4) + index(1) + count(1)
 inline constexpr int    maxFragmentCount        = 255;
-inline constexpr int    fragMinMtu              = 576;
-inline constexpr int    fragMaxMtu              = 1500;
-inline constexpr int    mtuConvergenceThreshold = 1;
-inline constexpr double defaultProbeTimeoutMs   = 500.0;
-inline constexpr int    defaultMaxProbeAttempts = 10;
 
 // --- fragment header (messageId is MSB-first) ---
 struct FragmentHeader { MessageId messageId{}; std::uint8_t index{}; std::uint8_t count{}; };
@@ -67,10 +61,13 @@ struct FragmentBuffer {
 struct FragmentAssembler {
     std::map<MessageId, FragmentBuffer> buffers;
     double timeoutMs{};
-    int    maxBufferSize{};
+    int    maxBufferSize{};   // cap on total buffered fragment bytes
+    int    maxBuffers{};      // cap on concurrent in-flight messages (distinct message ids)
     int    currentSize{};
 };
-inline FragmentAssembler newFragmentAssembler(double timeoutMs, int maxSize) { return { {}, timeoutMs, maxSize, 0 }; }
+inline FragmentAssembler newFragmentAssembler(double timeoutMs, int maxSize, int maxBuffers) {
+    return { {}, timeoutMs, maxSize, maxBuffers, 0 };
+}
 
 inline void cleanupFragments(FragmentAssembler& a, MonoTime now) {
     for (auto it = a.buffers.begin(); it != a.buffers.end(); ) {
@@ -94,6 +91,7 @@ inline std::optional<Bytes> processFragment(FragmentAssembler& a, const std::uin
     cleanupFragments(a, now);
     const auto hdr = readFragmentHeader(data, len);
     if (!hdr) return std::nullopt;
+    if (hdr->count == 0) return std::nullopt;   // a 0-fragment message can never complete -- never buffer it
     const std::uint8_t* fragData = data + fragmentHeaderSize;
     const int           fragSize = static_cast<int>(len - static_cast<std::size_t>(fragmentHeaderSize));
     const MessageId     msgId    = hdr->messageId;
@@ -105,6 +103,7 @@ inline std::optional<Bytes> processFragment(FragmentAssembler& a, const std::uin
 
     it = a.buffers.find(msgId);
     if (it == a.buffers.end()) {
+        if (a.maxBuffers > 0 && static_cast<int>(a.buffers.size()) >= a.maxBuffers) expireOldestFragment(a);   // bound concurrent messages
         FragmentBuffer nb;
         nb.count = hdr->count;
         nb.createdAt = now;
@@ -128,45 +127,5 @@ inline std::optional<Bytes> processFragment(FragmentAssembler& a, const std::uin
     }
     return std::nullopt;
 }
-
-// --- path-MTU discovery (binary search) ---
-enum class MtuState { Probing, Complete };
-struct MtuDiscovery {
-    int      minMtu        = fragMinMtu;
-    int      maxMtu        = fragMaxMtu;
-    int      currentProbe  = (fragMinMtu + fragMaxMtu) / 2;
-    int      discoveredMtu = fragMinMtu;
-    MtuState state         = MtuState::Probing;
-    double   probeTimeoutMs = defaultProbeTimeoutMs;
-    bool     hasLastProbe  = false;
-    MonoTime lastProbeTime{};
-    int      attempts      = 0;
-    int      maxAttempts   = defaultMaxProbeAttempts;
-};
-inline MtuDiscovery newMtuDiscovery(int lo, int hi) {
-    MtuDiscovery m;
-    m.minMtu = lo; m.maxMtu = hi; m.currentProbe = (lo + hi) / 2; m.discoveredMtu = lo;
-    return m;
-}
-inline MtuDiscovery defaultMtuDiscovery() { return newMtuDiscovery(fragMinMtu, fragMaxMtu); }
-
-inline std::optional<int> nextProbe(MtuDiscovery& m, MonoTime now) {
-    if (m.state == MtuState::Complete || m.attempts >= m.maxAttempts) { m.state = MtuState::Complete; return std::nullopt; }
-    if (m.maxMtu - m.minMtu <= mtuConvergenceThreshold)              { m.state = MtuState::Complete; return std::nullopt; }
-    if (m.hasLastProbe && elapsedMs(m.lastProbeTime, now) < m.probeTimeoutMs) return std::nullopt;
-    const int probe = (m.minMtu + m.maxMtu) / 2;
-    m.currentProbe = probe; m.lastProbeTime = now; m.hasLastProbe = true; m.attempts += 1;
-    return probe;
-}
-inline void onProbeSuccess(MtuDiscovery& m, int size) {
-    if (size >= m.minMtu) { m.discoveredMtu = size; m.minMtu = size; }
-}
-inline void onProbeTimeout(MtuDiscovery& m) { m.maxMtu = m.currentProbe; }
-inline void checkProbeTimeout(MtuDiscovery& m, MonoTime now) {
-    if (m.state == MtuState::Complete) return;
-    if (m.hasLastProbe && elapsedMs(m.lastProbeTime, now) >= m.probeTimeoutMs) onProbeTimeout(m);
-}
-inline int  discoveredMtu(const MtuDiscovery& m) { return m.discoveredMtu; }
-inline bool mtuIsComplete(const MtuDiscovery& m) { return m.state == MtuState::Complete; }
 
 } // namespace aether

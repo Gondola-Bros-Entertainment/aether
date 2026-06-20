@@ -6,6 +6,8 @@
 #include <ws2tcpip.h>
 #include <bcrypt.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #pragma comment(lib, "ws2_32.lib")   // also linked via CMake; harmless to repeat
@@ -63,6 +65,52 @@ bool addrEqual(const Address& a, const Address& b) {
     return a.len == b.len && std::memcmp(a.storage, b.storage, a.len) == 0;
 }
 
+Bytes serializeAddr(const Address& a) {
+    Bytes b;
+    if (sa(a)->sa_family == AF_INET6) {
+        const auto* in   = reinterpret_cast<const sockaddr_in6*>(a.storage);
+        const auto  port = ntohs(in->sin6_port);
+        b.push_back(6);
+        b.push_back(static_cast<std::uint8_t>(port >> 8));
+        b.push_back(static_cast<std::uint8_t>(port & 0xFF));
+        const auto* ip = reinterpret_cast<const std::uint8_t*>(&in->sin6_addr);
+        b.insert(b.end(), ip, ip + 16);
+    } else {
+        const auto* in   = reinterpret_cast<const sockaddr_in*>(a.storage);
+        const auto  port = ntohs(in->sin_port);
+        const auto  ip   = ntohl(in->sin_addr.s_addr);
+        b.push_back(4);
+        b.push_back(static_cast<std::uint8_t>(port >> 8));
+        b.push_back(static_cast<std::uint8_t>(port & 0xFF));
+        b.push_back(static_cast<std::uint8_t>(ip >> 24));
+        b.push_back(static_cast<std::uint8_t>(ip >> 16));
+        b.push_back(static_cast<std::uint8_t>(ip >> 8));
+        b.push_back(static_cast<std::uint8_t>(ip));
+    }
+    return b;
+}
+
+std::optional<Address> deserializeAddr(const std::uint8_t* p, std::size_t n) {
+    if (n < 3) return std::nullopt;
+    const std::uint16_t port = static_cast<std::uint16_t>((std::uint16_t(p[1]) << 8) | p[2]);
+    if (p[0] == 4) {
+        if (n < 7) return std::nullopt;
+        const std::uint32_t ip = (std::uint32_t(p[3]) << 24) | (std::uint32_t(p[4]) << 16) | (std::uint32_t(p[5]) << 8) | p[6];
+        return addrV4(ip, port);
+    }
+    if (p[0] == 6) {
+        if (n < 19) return std::nullopt;
+        Address a{};
+        auto* in        = reinterpret_cast<sockaddr_in6*>(a.storage);
+        in->sin6_family = AF_INET6;
+        in->sin6_port   = htons(port);
+        std::memcpy(&in->sin6_addr, p + 3, 16);
+        a.len           = sizeof(sockaddr_in6);
+        return a;
+    }
+    return std::nullopt;
+}
+
 std::optional<Socket> openUdp(const Address& bindAddr) {
     const int          family = sa(bindAddr)->sa_family;
     const SocketHandle fd     = static_cast<SocketHandle>(::socket(family, SOCK_DGRAM, 0));
@@ -115,7 +163,12 @@ int recvFrom(Socket& s, std::span<std::uint8_t> buf, Address& from) {
 }
 
 void secureRandomBytes(std::uint8_t* out, std::size_t len) {
-    BCryptGenRandom(nullptr, out, static_cast<ULONG>(len), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    const NTSTATUS st = BCryptGenRandom(nullptr, out, static_cast<ULONG>(len), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+    if (st != 0) {   // STATUS_SUCCESS == 0; fail closed rather than proceed with un-random key material
+        std::fprintf(stderr, "aether: BCryptGenRandom failed (0x%lx); aborting to avoid weak keys\n",
+                     static_cast<unsigned long>(st));
+        std::abort();
+    }
 }
 
 } // namespace aether

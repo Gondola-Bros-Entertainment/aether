@@ -69,6 +69,35 @@ inline void chacha20Block(const std::uint8_t key[32], std::uint32_t counter,
     }
 }
 
+// HChaCha20 (draft-irtf-cfrg-xchacha): derive a 32-byte subkey from a 32-byte key and a 16-byte
+// input. The ChaCha20 permutation with NO final add-back; the subkey is the first and last state
+// rows. Used to split one shared secret into independent directional keys (see deriveDirectionalKeys).
+inline void hchacha20(const std::uint8_t key[32], const std::uint8_t in[16], std::uint8_t out[32]) noexcept {
+    std::uint32_t x[16] = {
+        0x61707865u, 0x3320646eu, 0x79622d32u, 0x6b206574u,
+        cryptoLe32(key + 0),  cryptoLe32(key + 4),  cryptoLe32(key + 8),  cryptoLe32(key + 12),
+        cryptoLe32(key + 16), cryptoLe32(key + 20), cryptoLe32(key + 24), cryptoLe32(key + 28),
+        cryptoLe32(in + 0),   cryptoLe32(in + 4),   cryptoLe32(in + 8),   cryptoLe32(in + 12),
+    };
+    for (int i = 0; i < 10; ++i) {
+        quarterRound(x[0], x[4], x[8],  x[12]);
+        quarterRound(x[1], x[5], x[9],  x[13]);
+        quarterRound(x[2], x[6], x[10], x[14]);
+        quarterRound(x[3], x[7], x[11], x[15]);
+        quarterRound(x[0], x[5], x[10], x[15]);
+        quarterRound(x[1], x[6], x[11], x[12]);
+        quarterRound(x[2], x[7], x[8],  x[13]);
+        quarterRound(x[3], x[4], x[9],  x[14]);
+    }
+    const int rows[8] = { 0, 1, 2, 3, 12, 13, 14, 15 };   // first and last rows, little-endian
+    for (int i = 0; i < 8; ++i) {
+        out[i * 4 + 0] = std::uint8_t(x[rows[i]]);
+        out[i * 4 + 1] = std::uint8_t(x[rows[i]] >> 8);
+        out[i * 4 + 2] = std::uint8_t(x[rows[i]] >> 16);
+        out[i * 4 + 3] = std::uint8_t(x[rows[i]] >> 24);
+    }
+}
+
 // XOR a ChaCha20 keystream (starting at the given block counter) over in -> out.
 inline void chacha20Xor(const std::uint8_t key[32], std::uint32_t counter, const std::uint8_t nonce[12],
                         const std::uint8_t* in, std::uint8_t* out, std::size_t len) noexcept {
@@ -201,24 +230,28 @@ inline void buildNonce(std::uint64_t counter, std::uint32_t protocolId, std::uin
     for (int i = 0; i < 4; ++i) nonce[8 + i] = std::uint8_t(protocolId >> (24 - 8 * i));   // protocol, 4 BE
 }
 
-// Encrypt a payload: returns [counter:8 BE][ciphertext][tag:16]. Caller bumps the counter.
+// Encrypt a payload: returns [counter:8 BE][ciphertext][tag:16]. Caller bumps the counter. `aad` is
+// authenticated-but-not-encrypted (the cleartext packet header), so the tag covers it -- tampering
+// with the header makes decryption fail.
 inline Bytes encrypt(const EncryptionKey& key, NonceCounter counter, std::uint32_t protocolId,
+                     const std::uint8_t* aad, std::size_t aadLen,
                      const std::uint8_t* pt, std::size_t ptLen) {
     std::uint8_t nonce[12];
     buildNonce(counter.value, protocolId, nonce);
     Bytes out(static_cast<std::size_t>(nonceSize) + ptLen + authTagSize);
     for (int i = 0; i < nonceSize; ++i) out[i] = nonce[i];
     std::uint8_t tag[16];
-    aeadSeal(key.data(), nonce, nullptr, 0, pt, ptLen, out.data() + nonceSize, tag);
+    aeadSeal(key.data(), nonce, aad, aadLen, pt, ptLen, out.data() + nonceSize, tag);
     for (int i = 0; i < authTagSize; ++i) out[nonceSize + ptLen + i] = tag[i];
     return out;
 }
 
 struct DecryptResult { Bytes plaintext; NonceCounter counter; };
 
-// Decrypt a payload of the form [counter:8 BE][ciphertext][tag:16]; nullopt on failure.
-// The caller enforces anti-replay by checking the returned counter against the last seen.
+// Decrypt a payload of the form [counter:8 BE][ciphertext][tag:16]; nullopt on failure (bad tag,
+// including a tampered `aad` header). The caller enforces anti-replay on the returned counter.
 inline std::optional<DecryptResult> decrypt(const EncryptionKey& key, std::uint32_t protocolId,
+                                            const std::uint8_t* aad, std::size_t aadLen,
                                             const std::uint8_t* data, std::size_t len) {
     if (len < static_cast<std::size_t>(nonceSize) + authTagSize) return std::nullopt;
     std::uint64_t counter = 0;
@@ -228,9 +261,36 @@ inline std::optional<DecryptResult> decrypt(const EncryptionKey& key, std::uint3
     const std::uint8_t*  tag   = data + nonceSize + ctLen;
     std::uint8_t nonce[12];
     buildNonce(counter, protocolId, nonce);
-    auto pt = aeadOpen(key.data(), nonce, nullptr, 0, ct, ctLen, tag);
+    auto pt = aeadOpen(key.data(), nonce, aad, aadLen, ct, ctLen, tag);
     if (!pt) return std::nullopt;
     return DecryptResult{ std::move(*pt), NonceCounter{ counter } };
+}
+
+// Anti-replay sliding window over the AEAD nonce counter. UDP reorders, so a strictly-increasing
+// check would drop legitimately-reordered datagrams as "replays"; this accepts any not-yet-seen
+// counter within `replayWindowBits` of the high-water mark, and rejects replays + too-old counters
+// (DTLS/IPsec style: a high-water mark plus a bitmask of the window below it).
+inline constexpr std::uint64_t replayWindowBits = 64;
+struct ReplayWindow {
+    std::uint64_t max{};    // highest counter accepted
+    std::uint64_t bits{};   // bit i set => counter (max - i) already seen (bit 0 == max)
+    bool          seen{};   // any counter accepted yet
+};
+inline bool replayAccept(ReplayWindow& w, std::uint64_t counter) noexcept {
+    if (!w.seen) { w.seen = true; w.max = counter; w.bits = 1; return true; }
+    if (counter > w.max) {                                  // advances the window
+        const std::uint64_t shift = counter - w.max;
+        w.bits = (shift >= replayWindowBits) ? 0 : (w.bits << shift);
+        w.bits |= 1;                                        // bit 0 marks the new high-water counter
+        w.max  = counter;
+        return true;
+    }
+    const std::uint64_t age = w.max - counter;
+    if (age >= replayWindowBits) return false;              // older than the window -> reject
+    const std::uint64_t bit = std::uint64_t{ 1 } << age;
+    if (w.bits & bit) return false;                         // already seen -> replay
+    w.bits |= bit;
+    return true;
 }
 
 } // namespace aether

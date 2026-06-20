@@ -55,7 +55,8 @@ inline void testNetSend(TestNetState& st, const Address& to, const Bytes& bytes)
     const auto r1 = nextRandom(st.rng); st.rng = r1.state;
     if (randomDouble(r1.output) < cfg.lossRate) return;                       // dropped
     const auto r2 = nextRandom(st.rng); st.rng = r2.state;
-    const std::uint64_t jitter = cfg.jitterNs == 0 ? 0 : (r2.output % (cfg.jitterNs + 1));
+    const std::uint64_t jitterMod = cfg.jitterNs + 1;   // wraps to 0 only when jitterNs == UINT64_MAX
+    const std::uint64_t jitter = cfg.jitterNs == 0 ? 0 : (jitterMod == 0 ? r2.output : r2.output % jitterMod);
     const auto r3 = nextRandom(st.rng); st.rng = r3.state;
     std::uint64_t oooDelay = 0;
     if (randomDouble(r3.output) < cfg.outOfOrderChance) {

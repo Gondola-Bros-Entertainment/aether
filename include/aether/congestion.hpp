@@ -22,7 +22,6 @@ inline constexpr double        congestionRateReduction   = 0.5;   // multiplicat
 inline constexpr double        minSendRate               = 1.0;   // packets/sec floor
 inline constexpr int           batchHeaderSize           = 1;     // u8 message count
 inline constexpr int           batchLengthSize           = 2;     // u16 length prefix
-inline constexpr std::uint8_t  maxBatchMessages          = 255;
 inline constexpr int           initialCwndPackets        = 10;
 inline constexpr int           minCwndBytes              = 1200;
 inline constexpr double        minRecoverySecs           = 1.0;
@@ -147,7 +146,11 @@ inline void cwOnAck(CongestionWindow& cw, int bytes) {
             if (cw.cwnd > 0.0) cw.cwnd += static_cast<double>(cw.mtu) * static_cast<double>(bytes) / cw.cwnd;
             break;
         case CongestionPhase::Recovery:
-            break;                              // conservative in recovery
+            // Recovery lasts about one RTT; the first ack of new data exits to congestion avoidance.
+            // Without this, a single loss freezes the window until an idle slow-start restart.
+            cw.phase = CongestionPhase::Avoidance;
+            if (cw.cwnd > 0.0) cw.cwnd += static_cast<double>(cw.mtu) * static_cast<double>(bytes) / cw.cwnd;
+            break;
     }
 }
 
@@ -229,40 +232,9 @@ inline double btBytesPerSecond(const BandwidthTracker& bt) {
     return elapsedSecs > 0.0 ? static_cast<double>(bt.totalBytes) / elapsedSecs : 0.0;
 }
 
-// --- message batching. Wire format per batch: [u8 count][u16 len BE][data]... ---
-inline std::vector<Bytes> batchMessages(const std::vector<Bytes>& messages, int maxSize) {
-    std::vector<Bytes>             batches;
-    std::vector<const Bytes*>      current;
-    int                            currentSize = batchHeaderSize;
-    int                            msgCount    = 0;
-
-    const auto finalize = [&]() {
-        Bytes b;
-        b.push_back(static_cast<std::uint8_t>(msgCount));
-        for (const Bytes* m : current) {
-            const std::uint16_t len = static_cast<std::uint16_t>(m->size());
-            b.push_back(static_cast<std::uint8_t>(len >> 8));
-            b.push_back(static_cast<std::uint8_t>(len & 0xFF));
-            b.insert(b.end(), m->begin(), m->end());
-        }
-        batches.push_back(std::move(b));
-        current.clear();
-        currentSize = batchHeaderSize;
-        msgCount    = 0;
-    };
-
-    for (const Bytes& msg : messages) {
-        const int  msgWireSize    = batchLengthSize + static_cast<int>(msg.size());
-        const bool shouldFinalize = (currentSize + msgWireSize > maxSize && msgCount > 0) || msgCount >= static_cast<int>(maxBatchMessages);
-        if (shouldFinalize) finalize();
-        current.push_back(&msg);
-        currentSize += msgWireSize;
-        ++msgCount;
-    }
-    if (msgCount > 0) finalize();
-    return batches;
-}
-
+// --- message unbatching. Decode a coalesced [u8 count][u16 len BE][data]... batch. The encoder is
+//     inlined in connection.hpp's flushPendingWires, which interleaves per-message reliability
+//     tracking with the framing, so it owns the encode side. ---
 inline std::optional<std::vector<Bytes>> unbatchMessages(const Bytes& data) {
     if (data.empty()) return std::nullopt;
     const int          msgCount = data[0];

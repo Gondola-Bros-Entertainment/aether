@@ -31,9 +31,12 @@ On top of that delta core, aether is a full reliable-UDP stack:
 - packet coalescing -- many small messages ride a single datagram (one header, one auth tag)
 - fragmentation and reassembly for messages larger than the MTU
 - congestion control: a binary AIMD controller plus a TCP New Reno window
-- encrypted by default -- an X25519 handshake negotiates a per-session key (no pre-shared secret),
-  then ChaCha20-Poly1305; both from scratch, checked against the RFC 7748 / 8439 vectors
-- a connection handshake with connect tokens, per-source rate limiting, and an OS CSPRNG for keys
+- encrypted by default -- an X25519 handshake derives per-direction ChaCha20-Poly1305 keys (no
+  pre-shared secret); the packet header is authenticated and replays are windowed. Both primitives
+  are from scratch, checked against the RFC 7748 / 8439 vectors
+- a challenge/response handshake: per-source rate limiting, an OS CSPRNG for all key material, and a
+  ConnectToken primitive for app-level player authentication (encryption gives you confidentiality
+  and integrity; binding a session to a player identity is the app's call)
 - reconnect -- a dropped session resumes via a token without a full re-handshake (Reconnected event)
 - migration -- a live connection follows a peer across an IP change (NAT rebind)
 - NAT traversal -- a rendezvous pairs two peers behind NATs and they hole-punch a direct path, with

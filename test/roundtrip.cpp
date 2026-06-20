@@ -193,6 +193,99 @@ int main() {
                     res.acked.size(), aether::packetsInFlight(ep), ep.srtt, ep.rto);
     }
 
+    // reliability: a packet NACKed past the fast-retransmit threshold registers as a loss, so the
+    // loss metric actually moves (it used to be hardwired to 0 -- recordLossSample was only ever fed
+    // "not lost", which left congestion control blind to loss).
+    {
+        aether::ReliableEndpoint ep{};
+        const aether::ChannelId ch{ 0 };
+        for (std::uint16_t s = 0; s < 6; ++s)
+            aether::onPacketSent(ep, aether::SequenceNum{ s }, aether::MonoTime{ 0 }, ch, aether::SequenceNum{ s }, 100);
+
+        aether::ReliableEndpoint peer{};   // received all but seq 3 -> seq 3 is NACKed by the bitfield
+        const aether::SequenceNum got[] = { aether::SequenceNum{ 0 }, aether::SequenceNum{ 1 }, aether::SequenceNum{ 2 },
+                                            aether::SequenceNum{ 4 }, aether::SequenceNum{ 5 } };
+        aether::onPacketsReceived(peer, got, 5);
+        const auto [ackSeq, ackBits] = aether::getAckInfo(peer);
+
+        aether::AckResult last;
+        for (int i = 0; i < aether::fastRetransmitThreshold; ++i)
+            last = aether::processAcks(ep, ackSeq, ackBits, aether::MonoTime{ 60ull * 1000000 });
+        assert(!last.fastRetransmit.empty());           // seq 0 declared lost
+        assert(ep.totalLost > 0);                        // the (previously dead) counter moves
+        assert(aether::packetLossPercent(ep) > 0.0);     // ...and the metric is no longer pinned at 0
+        std::printf("aether loss-metric OK: a NACKed packet registers as loss (totalLost=%llu, loss=%.0f%%)\n",
+                    static_cast<unsigned long long>(ep.totalLost), aether::packetLossPercent(ep) * 100.0);
+    }
+
+    // channel: reliable sends pipeline -- several messages go in flight in one drain, not the old
+    // stop-and-wait (one message per RTT per channel). With 4 queued and no acks yet, all 4 must be
+    // emitted; the old peek/commit stopped after the first because the in-flight head blocked it.
+    {
+        aether::Channel ch = aether::newChannel(aether::ChannelId{ 0 }, aether::reliableOrderedChannel());
+        for (std::uint8_t i = 0; i < 4; ++i) {
+            const auto r = aether::channelSend(ch, aether::Bytes{ i }, aether::MonoTime{ 0 });
+            assert(r.error == aether::ChannelError::None);
+        }
+        int emitted = 0;
+        for (;;) {
+            const auto m = aether::peekOutgoingMessage(ch);
+            if (!m) break;
+            aether::commitOutgoingMessage(ch, m->sequence);
+            ++emitted;
+        }
+        assert(emitted == 4);   // all four in flight at once (stop-and-wait would have emitted 1)
+        std::printf("aether channel-pipeline OK: %d reliable messages in flight in one drain (was 1)\n", emitted);
+    }
+
+    // anti-replay: the AEAD nonce-counter window accepts fresh counters -- including reordered-but-
+    // unseen ones (UDP reorders) -- and rejects replays + too-old counters. The old check required
+    // strictly increasing counters, so it dropped every reordered datagram as a "replay".
+    {
+        aether::ReplayWindow w;
+        assert(aether::replayAccept(w, 5));    // first seen
+        assert(aether::replayAccept(w, 7));    // forward
+        assert(aether::replayAccept(w, 6));    // reordered but unseen -> accepted (strict-increasing dropped this)
+        assert(!aether::replayAccept(w, 6));   // replay -> rejected
+        assert(!aether::replayAccept(w, 7));   // replay -> rejected
+        assert(aether::replayAccept(w, 200));  // big forward jump
+        assert(!aether::replayAccept(w, 5));   // now far outside the window -> rejected
+        std::printf("aether replay-window OK: reorder accepted, replays + stale rejected\n");
+    }
+
+    // channel: a reliable channel backpressures (BufferFull) when its send buffer fills, instead of
+    // silently dropping the oldest unacked message -- which would break the delivery guarantee.
+    {
+        aether::ChannelConfig cc = aether::reliableOrderedChannel();
+        cc.messageBufferSize = 3;
+        cc.blockOnFull       = false;   // even so, a RELIABLE channel must not drop
+        aether::Channel ch = aether::newChannel(aether::ChannelId{ 0 }, cc);
+        for (std::uint8_t i = 0; i < 3; ++i)
+            assert(aether::channelSend(ch, aether::Bytes{ i }, aether::MonoTime{ 0 }).error == aether::ChannelError::None);
+        const auto over = aether::channelSend(ch, aether::Bytes{ 99 }, aether::MonoTime{ 0 });
+        assert(over.error == aether::ChannelError::BufferFull);                                    // backpressure...
+        assert(ch.sendBuffer.size() == 3 && ch.sendBuffer.count(aether::SequenceNum{ 0 }) == 1);   // ...oldest still buffered
+        std::printf("aether channel-backpressure OK: full reliable channel returns BufferFull (no silent drop)\n");
+    }
+
+    // fragment: the reassembler bounds concurrent in-flight messages (a peer could otherwise flood
+    // distinct message ids with never-completing fragments), and rejects a malformed count==0.
+    {
+        aether::FragmentAssembler a = aether::newFragmentAssembler(5000.0, 1 << 20, 8);   // cap 8 concurrent buffers
+        const std::uint8_t f0[7] = { 0, 0, 0, 0, 0, 0, 0 };   // msgId 0, index 0, count 0 -> malformed
+        assert(!aether::processFragment(a, f0, sizeof f0, aether::MonoTime{ 0 }));
+        assert(a.buffers.empty());
+        for (std::uint32_t id = 1; id <= 100; ++id) {
+            std::uint8_t f[8];
+            aether::writeFragmentHeader(f, aether::FragmentHeader{ static_cast<aether::MessageId>(id), 0, 2 });   // 1 of 2, never completes
+            f[6] = 0xAB; f[7] = 0xCD;
+            aether::processFragment(a, f, sizeof f, aether::MonoTime{ 0 });
+        }
+        assert(static_cast<int>(a.buffers.size()) <= 8);   // bounded, not 100
+        std::printf("aether fragment-cap OK: concurrent buffers bounded to %d (was unbounded), count==0 rejected\n",
+                    static_cast<int>(a.buffers.size()));
+    }
+
     // fragment: split a 2500-byte message into MTU-sized pieces and reassemble it
     {
         aether::Bytes msg(2500);
@@ -200,7 +293,7 @@ int main() {
         const auto fr = aether::fragmentMessage(aether::MessageId{ 42 }, msg.data(), msg.size(), 1024);
         assert(!fr.tooMany && fr.fragments.size() == 3);
 
-        aether::FragmentAssembler assembler = aether::newFragmentAssembler(5000.0, 1 << 20);
+        aether::FragmentAssembler assembler = aether::newFragmentAssembler(5000.0, 1 << 20, 256);
         std::optional<aether::Bytes> done;
         for (const auto& f : fr.fragments) {
             auto out = aether::processFragment(assembler, f.data(), f.size(), aether::MonoTime{ 0 });
@@ -304,18 +397,48 @@ int main() {
         assert(opened && opened->size() == ptLen && std::memcmp(opened->data(), ptext, ptLen) == 0);
         std::printf("aether crypto OK: RFC 8439 AEAD vector (tag + ciphertext match), %zu-byte msg\n", ptLen);
     }
+    // crypto: HChaCha20 subkey derivation against the draft-irtf-cfrg-xchacha 2.2.1 vector
+    // (the directional-key KDF is built on this).
+    {
+        std::uint8_t hkey[32];
+        for (int i = 0; i < 32; ++i) hkey[i] = std::uint8_t(i);
+        const std::uint8_t hin[16] = { 0x00,0x00,0x00,0x09, 0x00,0x00,0x00,0x4a, 0x00,0x00,0x00,0x00, 0x31,0x41,0x59,0x27 };
+        const std::uint8_t expectSub[32] = {
+            0x82,0x41,0x3b,0x42, 0x27,0xb2,0x7b,0xfe, 0xd3,0x0e,0x42,0x50, 0x8a,0x87,0x7d,0x73,
+            0xa0,0xf9,0xe4,0xd5, 0x8a,0x74,0xa8,0x53, 0xc1,0x2e,0xc4,0x13, 0x26,0xd3,0xec,0xdc };
+        std::uint8_t sub[32];
+        aether::detail::hchacha20(hkey, hin, sub);
+        assert(std::memcmp(sub, expectSub, 32) == 0);
+        std::printf("aether crypto OK: HChaCha20 subkey vector matches\n");
+    }
+    // crypto: the directional-key KDF -- the two directions get different keys (so they never share a
+    // (key, nonce)), and a different salt yields different keys (so a reconnect re-keys, not reuses).
+    {
+        aether::X25519Key shared{};
+        for (int i = 0; i < 32; ++i) shared[static_cast<std::size_t>(i)] = std::uint8_t(i * 5 + 3);
+        const auto k1 = aether::deriveDirectionalKeys(shared, 0x1122334455667788ull);
+        const auto k2 = aether::deriveDirectionalKeys(shared, 0x1122334455667788ull);
+        const auto k3 = aether::deriveDirectionalKeys(shared, 0x99aabbccddeeff00ull);
+        assert(k1.clientToServer != k1.serverToClient);                            // directions differ (C1)
+        assert(k1.clientToServer == k2.clientToServer);                            // deterministic
+        assert(k3.clientToServer != k1.clientToServer && k3.serverToClient != k1.serverToClient);   // salt re-keys (C2)
+        std::printf("aether crypto OK: directional KDF (c2s != s2c, fresh salt re-keys)\n");
+    }
     // crypto: our packet encrypt/decrypt round-trips and rejects tampering.
     {
         aether::EncryptionKey key{};
         for (int i = 0; i < 32; ++i) key[i] = std::uint8_t(i * 7 + 1);
         const std::uint8_t payload[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
-        auto packet = aether::encrypt(key, aether::NonceCounter{ 42 }, 0x12345678u, payload, sizeof payload);
-        auto back = aether::decrypt(key, 0x12345678u, packet.data(), packet.size());
+        const std::uint8_t aad[3] = { 0xAA, 0xBB, 0xCC };   // stands in for the cleartext packet header
+        auto packet = aether::encrypt(key, aether::NonceCounter{ 42 }, 0x12345678u, aad, sizeof aad, payload, sizeof payload);
+        auto back = aether::decrypt(key, 0x12345678u, aad, sizeof aad, packet.data(), packet.size());
         assert(back && back->counter.value == 42 && back->plaintext.size() == sizeof payload);
         assert(std::memcmp(back->plaintext.data(), payload, sizeof payload) == 0);
+        const std::uint8_t aad2[3] = { 0xAA, 0xBB, 0xCD };   // one AAD bit flipped...
+        assert(!aether::decrypt(key, 0x12345678u, aad2, sizeof aad2, packet.data(), packet.size()));   // ...rejected (header authenticated)
         packet[packet.size() - 1] ^= 0x01;   // tamper the tag
-        assert(!aether::decrypt(key, 0x12345678u, packet.data(), packet.size()));
-        std::printf("aether crypto OK: packet encrypt/decrypt round-trip + tamper rejected\n");
+        assert(!aether::decrypt(key, 0x12345678u, aad, sizeof aad, packet.data(), packet.size()));
+        std::printf("aether crypto OK: packet encrypt/decrypt round-trip + AAD header binding + tamper rejected\n");
     }
     // X25519: RFC 7748 section 5.2 vector proves the field arithmetic + Montgomery ladder, then an
     // ECDH round-trip proves both sides derive the same shared secret.
@@ -369,11 +492,16 @@ int main() {
         assert(cw.phase == aether::CongestionPhase::Recovery && cw.cwnd >= aether::minCwndBytes);
 
         const std::vector<aether::Bytes> msgs = { { 1, 2, 3 }, { 4, 5 }, { 6, 7, 8, 9 } };
-        const auto batches = aether::batchMessages(msgs, 1200);
-        assert(batches.size() == 1);
-        const auto un = aether::unbatchMessages(batches[0]);
+        aether::Bytes batch;   // hand-frame a coalesced batch ([u8 count][u16 len BE][data]...) and decode it
+        batch.push_back(static_cast<std::uint8_t>(msgs.size()));
+        for (const auto& m : msgs) {
+            batch.push_back(static_cast<std::uint8_t>(m.size() >> 8));
+            batch.push_back(static_cast<std::uint8_t>(m.size() & 0xFF));
+            batch.insert(batch.end(), m.begin(), m.end());
+        }
+        const auto un = aether::unbatchMessages(batch);
         assert(un && un->size() == 3 && (*un)[0] == aether::Bytes({ 1, 2, 3 }) && (*un)[2] == aether::Bytes({ 6, 7, 8, 9 }));
-        std::printf("aether congestion OK: cwnd ack/loss + batch/unbatch %zu msgs round-trip\n", un->size());
+        std::printf("aether congestion OK: cwnd ack/loss + unbatch %zu msgs round-trip\n", un->size());
     }
     // config + stats: defaults validate, a bad override is caught, quality assessment works.
     {
@@ -381,6 +509,7 @@ int main() {
         aether::NetworkConfig bad;
         bad.fragmentThreshold = bad.mtu + 1;
         assert(aether::validateConfig(bad) == aether::ConfigError::FragmentThresholdExceedsMtu);
+        assert(!aether::openHost(aether::addrLocalhost(0), bad, aether::MonoTime{ 0 }));   // openHost now refuses an invalid config
         assert(aether::assessConnectionQuality(20.0, 0.0)  == aether::ConnectionQuality::Excellent);
         assert(aether::assessConnectionQuality(600.0, 0.0) == aether::ConnectionQuality::Bad);
         std::printf("aether config/stats OK: defaults valid, bad config + quality assessment caught\n");
@@ -667,11 +796,17 @@ int main() {
         }
         assert(aUp && bUp && aether::peerIsConnected(A, idB) && aether::peerIsConnected(B, idA));
 
-        // X25519: the handshake negotiated a session key on both sides, and they agree (ECDH) --
-        // encrypted by default, no pre-shared key.
-        assert(A.connections.at(idB).encryptionKey && B.connections.at(idA).encryptionKey);
-        assert(*A.connections.at(idB).encryptionKey == *B.connections.at(idA).encryptionKey);
-        std::printf("aether x25519-handshake OK: session key negotiated + agrees on both sides\n");
+        // X25519: the handshake derived DIRECTIONAL session keys. Each side's send key equals the
+        // peer's receive key (so they agree), but a side's own send != recv -- so the two directions
+        // never share a (key, nonce). That is the guard against the catastrophic keystream reuse.
+        {
+            const auto& ca = A.connections.at(idB);
+            const auto& cb = B.connections.at(idA);
+            assert(ca.sendKey && ca.recvKey && cb.sendKey && cb.recvKey);
+            assert(*ca.sendKey == *cb.recvKey && *ca.recvKey == *cb.sendKey);
+            assert(*ca.sendKey != *ca.recvKey);
+        }
+        std::printf("aether x25519-handshake OK: directional keys (send != recv, agree across peers)\n");
 
         // clock sync: tick past the TimeSync interval a few times so pings/pongs flow and both
         // sides land an offset sample (same test clock here, so the offset is ~0 -- this proves the
@@ -691,8 +826,8 @@ int main() {
         // token -- a fast token-authenticated reconnect (no challenge); the server fires Reconnected.
         const auto token = aether::peerSessionToken(A, idB);
         assert(token);
-        const auto origKey = B.connections.at(idA).encryptionKey;   // the X25519 session key, pre-drop
-        assert(origKey);                                            // encrypted before the drop
+        const auto origSend = A.connections.at(idB).sendKey;   // the client's pre-drop send key
+        assert(origSend);                                      // encrypted before the drop
         t += 11000ull * 1000000;   // > connectionTimeoutMs: both time out this tick
         aether::peerProcess(A, aether::MonoTime{ t }, {});
         aether::peerProcess(B, aether::MonoTime{ t }, {});
@@ -709,9 +844,16 @@ int main() {
             for (const auto& e : rb2.events) if (e.kind == aether::PeerEvent::Reconnected) reconnected = true;
         }
         assert(reconnected && aether::peerIsConnected(A, idB) && aether::peerIsConnected(B, idA));
-        // 0-RTT: the reconnect restored the negotiated key on both sides -- not a plaintext downgrade.
-        assert(B.connections.at(idA).encryptionKey == origKey && A.connections.at(idB).encryptionKey == origKey);
-        std::printf("aether reconnect OK: timed-out session re-established via token (0-RTT, encryption restored), server fired Reconnected\n");
+        // 0-RTT reconnect stays encrypted AND re-keys: the resumed session derives FRESH directional
+        // keys from the cached shared secret + a fresh salt, so it never replays the original keystream.
+        {
+            const auto& ca = A.connections.at(idB);
+            const auto& cb = B.connections.at(idA);
+            assert(ca.sendKey && ca.recvKey && cb.sendKey && cb.recvKey);
+            assert(*ca.sendKey == *cb.recvKey && *ca.recvKey == *cb.sendKey);   // still agree across peers
+            assert(*ca.sendKey != *origSend);                                    // but fresh -- not the pre-drop key
+        }
+        std::printf("aether reconnect OK: resumed session re-keyed (fresh directional keys, no keystream reuse)\n");
 
         // peerShutdown drains a Disconnect packet per live connection, so a process that exits
         // immediately still notifies its peers instead of leaving them to time out.
@@ -719,6 +861,58 @@ int main() {
         assert(!closeA.empty());
 
         std::printf("aether peer OK: full handshake A<->B + graceful shutdown drains Disconnect\n");
+    }
+
+    // connection migration: a connected peer whose address changes (NAT rebind) keeps its session
+    // when an ENCRYPTED packet arrives from the new address -- migration is gated on that packet
+    // decrypting (path validation), so a spoofed packet from a stranger cannot hijack the connection.
+    {
+        const aether::NetworkConfig cfg;
+        const aether::Address addrA  = aether::addrLocalhost(7001);
+        const aether::Address addrB  = aether::addrLocalhost(7002);
+        const aether::Address addrA2 = aether::addrLocalhost(7003);   // A's address after a NAT rebind
+        const aether::PeerId  idA{ addrA }, idB{ addrB }, idA2{ addrA2 };
+        aether::NetPeer A = aether::newPeerState(addrA, cfg, aether::MonoTime{ 0 });
+        aether::NetPeer B = aether::newPeerState(addrB, cfg, aether::MonoTime{ 1 });
+        aether::peerConnect(A, idB, aether::MonoTime{ 0 });
+
+        std::vector<aether::IncomingPacket> toA, toB;
+        std::uint64_t t = 0;
+        for (int k = 0; k < 12 && !(aether::peerIsConnected(A, idB) && aether::peerIsConnected(B, idA)); ++k) {
+            t += 1000000;
+            const auto ra = aether::peerProcess(A, aether::MonoTime{ t }, toA); toA.clear();
+            const auto rb = aether::peerProcess(B, aether::MonoTime{ t }, toB); toB.clear();
+            for (const auto& p : ra.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toB.push_back(aether::IncomingPacket{ idA, *s });
+            for (const auto& p : rb.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toA.push_back(aether::IncomingPacket{ idB, *s });
+        }
+        assert(aether::peerIsConnected(A, idB) && aether::peerIsConnected(B, idA));
+
+        // A sends an app message; deliver A's encrypted packets to B, but tagged from the NEW address.
+        aether::peerSend(A, idB, aether::ChannelId{ 0 }, aether::Bytes{ 9, 8, 7 }, aether::MonoTime{ t });
+        t += 1000000;
+        const auto ra = aether::peerProcess(A, aether::MonoTime{ t }, {});
+        std::vector<aether::IncomingPacket> fromNew;
+        for (const auto& p : ra.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) fromNew.push_back(aether::IncomingPacket{ idA2, *s });
+
+        const auto rb = aether::peerProcess(B, aether::MonoTime{ t }, fromNew);
+        bool migrated = false, gotMsg = false;
+        for (const auto& e : rb.events) {
+            if (e.kind == aether::PeerEvent::Migrated)                                      migrated = true;
+            if (e.kind == aether::PeerEvent::Message && e.data == aether::Bytes{ 9, 8, 7 }) gotMsg   = true;
+        }
+        assert(migrated && gotMsg);
+        assert(aether::peerIsConnected(B, idA2) && !aether::peerIsConnected(B, idA));   // moved to the new address
+
+        // a spoofed Payload from a stranger (valid header/seq, undecryptable body), past the migration
+        // cooldown so the decrypt is the actual gate -- must NOT migrate the connection.
+        t += 6000ull * 1000000;   // > migrationCooldownMs
+        const aether::PeerId idX{ aether::addrLocalhost(7009) };
+        const aether::PacketHeader sh{ aether::PacketType::Payload, aether::connRemoteSeq(B.connections.at(idA2)), aether::SequenceNum{ 0 }, 0 };
+        const aether::Bytes spoof = aether::serializePacket(aether::Packet{ sh, aether::Bytes(40, 0x5A) });
+        const auto rb2 = aether::peerProcess(B, aether::MonoTime{ t }, { aether::IncomingPacket{ idX, spoof } });
+        for (const auto& e : rb2.events) assert(e.kind != aether::PeerEvent::Migrated);
+        assert(!aether::peerIsConnected(B, idX) && aether::peerIsConnected(B, idA2));
+        std::printf("aether migration OK: encrypted packet from a new address migrates; spoof does not\n");
     }
 
     // replication: interest filtering, priority budgeting, interpolation, and delta snapshots.
@@ -761,8 +955,8 @@ int main() {
     // NAT rendezvous protocol: addresses + Register/Paired messages round-trip on the wire.
     {
         const aether::Address addr = aether::addrV4(0x01020304u, 9999);
-        const aether::Bytes enc = aether::encodeAddr(addr);
-        const auto back = aether::decodeAddr(enc.data(), enc.size());
+        const aether::Bytes enc = aether::serializeAddr(addr);
+        const auto back = aether::deserializeAddr(enc.data(), enc.size());
         assert(back && aether::addrEqual(*back, addr));
 
         const auto room = aether::decodeRegister(aether::encodeRegister(0xABCDEF12u));
@@ -801,7 +995,10 @@ int main() {
         assert(fwd.size() == 1 && aether::addrEqual(fwd[0].first, b) && fwd[0].second == inner);   // A's relay -> B, intact
         const auto back = aether::rendezvousProcess(rv, { { b, aether::encodeRelay(7, inner.data(), inner.size()) } });
         assert(back.size() == 1 && aether::addrEqual(back[0].first, a));                            // B's relay -> A
-        std::printf("aether relay OK: rendezvous forwards a relayed packet to the paired peer\n");
+        const aether::Address c = aether::addrV4(0x0A000099u, 9999);                                 // not a session member
+        const auto none = aether::rendezvousProcess(rv, { { c, aether::encodeRelay(7, inner.data(), inner.size()) } });
+        assert(none.empty());                                                                       // not an open reflector
+        std::printf("aether relay OK: rendezvous forwards a relayed packet to the paired peer; rejects non-members\n");
     }
 
     // net: two real UDP hosts on localhost complete a full handshake over actual sockets.
@@ -865,13 +1062,16 @@ int main() {
         aether::hostJoinRoom(*h, rv2Addr, 7, aether::MonoTime{ 0 });   // Register #1
         std::uint64_t tt = 0;
         for (int k = 0; k < 4; ++k) { tt += 1100ull * 1000000; (void) aether::hostTick(*h, {}, aether::MonoTime{ tt }); std::this_thread::yield(); }  // each > registerRetryMs
+        // Drain the rendezvous socket, polling until the retries are actually delivered over loopback
+        // (a non-blocking recv returns 0 while datagrams are still in flight). Bounded, so a genuinely
+        // broken retry path fails rather than hangs -- this replaces a single drain that raced delivery.
         int registers = 0;
         std::uint8_t rb[600];
-        for (;;) {
+        for (int attempt = 0; attempt < 2000 && registers < 2; ++attempt) {
             aether::Address from{};
             const int n = aether::recvFrom(*rv2, std::span<std::uint8_t>(rb, sizeof rb), from);
-            if (n <= 0) break;
-            if (aether::decodeRegister(aether::Bytes(rb, rb + n))) ++registers;
+            if (n > 0) { if (aether::decodeRegister(aether::Bytes(rb, rb + n))) ++registers; }
+            else       { std::this_thread::yield(); }
         }
         assert(registers >= 2);   // re-sent, not sent once
         aether::closeHost(*h);

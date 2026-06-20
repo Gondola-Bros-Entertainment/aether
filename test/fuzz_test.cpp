@@ -45,11 +45,11 @@ int main() {
         (void) aether::decodeRegister(data);
         (void) aether::decodePaired(data);
         (void) aether::decodeRelay(data);
-        (void) aether::decodeAddr(data.data(), data.size());
+        (void) aether::deserializeAddr(data.data(), data.size());
 
         // fragment header parse + reassembly (fresh assembler per input -- this checks per-call safety)
         (void) aether::readFragmentHeader(data.data(), data.size());
-        auto frag = aether::newFragmentAssembler(5000.0, 65536);
+        auto frag = aether::newFragmentAssembler(5000.0, 65536, 256);
         (void) aether::processFragment(frag, data.data(), data.size(), aether::MonoTime{ 0 });
 
         // the reflective serializer, fed raw bytes through a Reader

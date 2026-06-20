@@ -13,6 +13,7 @@
 #include "aether/reliability.hpp"
 #include "aether/stats.hpp"
 #include "aether/types.hpp"
+#include "aether/x25519.hpp"
 
 #include <algorithm>
 #include <array>
@@ -25,6 +26,10 @@ namespace aether {
 
 inline constexpr double bandwidthWindowMs  = 1000.0;
 inline constexpr double timeSyncIntervalMs = 1000.0;   // cadence of TimeSyncPing while connected
+inline constexpr int          timeSyncPingBytes       = 8;      // TimeSyncPing payload: [u64 sender ns]
+inline constexpr int          timeSyncPongBytes       = 16;     // TimeSyncPong payload: [u64 echoed ns][u64 responder ns]
+inline constexpr std::uint8_t channelWireFragmentFlag = 0x80;   // channel byte high bit: this wire is a fragment
+inline constexpr std::uint8_t channelWireChannelMask  = 0x07;   // channel byte low 3 bits: channel id (<= 8 channels)
 
 enum class ConnectionState { Disconnected, Connecting, Connected, Disconnecting };
 
@@ -87,9 +92,11 @@ struct Connection {
     NetworkStats                 stats{};
     std::optional<MonoTime>      disconnectTime;
     int                          disconnectRetries = 0;
-    std::optional<EncryptionKey> encryptionKey;
+    std::optional<EncryptionKey> sendKey;        // our send direction (c2s for the client, s2c for the server)
+    std::optional<EncryptionKey> recvKey;        // the peer's send direction
+    std::optional<X25519Key>     resumeMaster;   // ECDH shared secret, cached to re-key a fast reconnect
     NonceCounter                 sendNonce{};
-    std::optional<std::uint64_t> recvNonceMax;
+    ReplayWindow                 recvReplay{};
     bool                         pendingAck        = false;
     bool                         dataSentThisTick  = false;
     ClockSync                    clockSync{};                 // estimated offset to the peer's clock
@@ -104,7 +111,7 @@ inline Connection newConnection(const NetworkConfig& config, std::uint64_t clien
     c.lastSendTime = now;
     c.lastRecvTime = now;
 
-    const int numChannels = config.maxChannels;
+    const int numChannels = std::min(config.maxChannels, maxChannelCount);   // the 3-bit channel wire field caps here
     c.channels.reserve(static_cast<std::size_t>(numChannels));
     for (int i = 0; i < numChannels; ++i) {
         const ChannelConfig cfg = (i < static_cast<int>(config.channelConfigs.size()))
@@ -122,7 +129,6 @@ inline Connection newConnection(const NetworkConfig& config, std::uint64_t clien
     if (config.useCwndCongestion) c.cwnd = newCongestionWindow(config.mtu);
     c.bandwidthUp   = newBandwidthTracker(bandwidthWindowMs);
     c.bandwidthDown = newBandwidthTracker(bandwidthWindowMs);
-    c.encryptionKey = config.encryptionKey;
     return c;
 }
 
@@ -165,7 +171,7 @@ inline void sendAckOnly(Connection& conn)   { enqueueEmptyPacket(conn); }
 inline void sendTimeSyncPing(Connection& conn, MonoTime now) {
     PacketHeader header = createHeaderInternal(conn);
     header.type = PacketType::TimeSyncPing;
-    Bytes payload(8);
+    Bytes payload(timeSyncPingBytes);
     putU64(payload.data(), now.ns);
     conn.sendQueue.push_back(OutgoingPacket{ header, PacketType::TimeSyncPing, std::move(payload) });
     conn.localSeq         = next(conn.localSeq);
@@ -174,7 +180,7 @@ inline void sendTimeSyncPing(Connection& conn, MonoTime now) {
 inline void sendTimeSyncPong(Connection& conn, std::uint64_t echoNs, MonoTime now) {
     PacketHeader header = createHeaderInternal(conn);
     header.type = PacketType::TimeSyncPong;
-    Bytes payload(16);
+    Bytes payload(timeSyncPongBytes);
     putU64(payload.data(),     echoNs);   // echo the originator's send time
     putU64(payload.data() + 8, now.ns);   // our timestamp
     conn.sendQueue.push_back(OutgoingPacket{ header, PacketType::TimeSyncPong, std::move(payload) });
@@ -186,7 +192,7 @@ inline Bytes encodeChannelWire(int chIdx, const ChannelMessage& msg) {
     const std::uint16_t seqRaw = msg.sequence.value;
     Bytes wire;
     wire.reserve(3 + msg.data.size());
-    wire.push_back(static_cast<std::uint8_t>(chIdx & 0x07));
+    wire.push_back(static_cast<std::uint8_t>(chIdx & channelWireChannelMask));
     wire.push_back(static_cast<std::uint8_t>(seqRaw >> 8));
     wire.push_back(static_cast<std::uint8_t>(seqRaw & 0xFF));
     wire.insert(wire.end(), msg.data.begin(), msg.data.end());
@@ -315,6 +321,11 @@ inline void processIncomingHeader(Connection& conn, const PacketHeader& header, 
         if (idx >= 0 && idx < static_cast<int>(conn.channels.size()))
             acknowledgeMessage(conn.channels[static_cast<std::size_t>(idx)], m.seq);
     }
+    for (const ChannelMsg& m : res.fastRetransmit) {   // triple-NACKed -> resend without waiting out the RTO
+        const int idx = toInt(m.channel);
+        if (idx >= 0 && idx < static_cast<int>(conn.channels.size()))
+            markForRetransmit(conn.channels[static_cast<std::size_t>(idx)], m.seq);
+    }
 }
 
 // --- per-tick channel output ---
@@ -334,7 +345,7 @@ inline void processChannelMessages(Connection& conn, MonoTime now, int chIdx) {
                               || (cwCanSend(*conn.cwnd, wireSize) && cwCanSendPaced(*conn.cwnd, now));
         if (!cwndAllows) break;
 
-        commitOutgoingMessage(channel);
+        commitOutgoingMessage(channel, peek->sequence);
         ccDeductBudget(conn.congestion, wireSize);
         if (conn.cwnd) cwOnSend(*conn.cwnd, wireSize, now);
         enqueuePayload(conn, isReliable, chIdx, *peek, wireData);
