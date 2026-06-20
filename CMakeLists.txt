@@ -73,10 +73,12 @@ foreach(t ${AETHER_MODULE_TESTS})
     add_test(NAME ${name} COMMAND ${name})
 endforeach()
 
-# Benchmark: built -O3, since unoptimized timings are meaningless.
+# Benchmark: optimized (-O3, or /O2 on MSVC), since unoptimized timings are meaningless. /O2 is
+# skipped in an MSVC Debug config though -- it collides with Debug's /RTC1 (error D8016). CI smoke-
+# runs the bench in Debug (timings do not matter there); a real benchmark run uses a Release config.
 add_executable(aether_bench bench/bench.cpp)
 target_link_libraries(aether_bench PRIVATE aether)
-target_compile_options(aether_bench PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/O2,-O3>)
+target_compile_options(aether_bench PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,$<$<NOT:$<CONFIG:Debug>>:/O2>,-O3>)
 add_test(NAME bench COMMAND aether_bench)   # smoke: the bench must actually run (catches a DCE/UB regression)
 
 # Opt-in comparison benchmark: aether vs zpp::bits. Fetches an external lib, so it is OFF by
@@ -93,5 +95,5 @@ if(AETHER_BENCH_COMPARE)
     add_executable(aether_bench_compare bench/compare.cpp)
     target_link_libraries(aether_bench_compare PRIVATE aether)
     target_include_directories(aether_bench_compare PRIVATE ${zpp_bits_SOURCE_DIR})
-    target_compile_options(aether_bench_compare PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/O2,-O3>)
+    target_compile_options(aether_bench_compare PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,$<$<NOT:$<CONFIG:Debug>>:/O2>,-O3>)
 endif()
