@@ -5,6 +5,7 @@
 #pragma once
 
 #include "aether/channel.hpp"
+#include "aether/clocksync.hpp"
 #include "aether/config.hpp"
 #include "aether/congestion.hpp"
 #include "aether/crypto.hpp"
@@ -22,7 +23,8 @@
 
 namespace aether {
 
-inline constexpr double bandwidthWindowMs = 1000.0;
+inline constexpr double bandwidthWindowMs  = 1000.0;
+inline constexpr double timeSyncIntervalMs = 1000.0;   // cadence of TimeSyncPing while connected
 
 enum class ConnectionState { Disconnected, Connecting, Connected, Disconnecting };
 
@@ -90,6 +92,8 @@ struct Connection {
     std::optional<std::uint64_t> recvNonceMax;
     bool                         pendingAck        = false;
     bool                         dataSentThisTick  = false;
+    ClockSync                    clockSync{};                 // estimated offset to the peer's clock
+    MonoTime                     lastTimeSyncTime{};          // last TimeSyncPing send time
 };
 
 // --- construction ---
@@ -128,6 +132,8 @@ inline bool                isConnected(const Connection& c) noexcept { return c.
 inline const NetworkStats& connectionStats(const Connection& c) noexcept { return c.stats; }
 inline SequenceNum         connRemoteSeq(const Connection& c) noexcept { return c.reliability.remoteSeq; }
 inline std::uint8_t        channelCount(const Connection& c) noexcept { return static_cast<std::uint8_t>(c.channels.size()); }
+inline bool                clockSynced(const Connection& c) noexcept { return c.clockSync.hasSample; }
+inline double              clockOffsetMs(const Connection& c) noexcept { return c.clockSync.offsetMs; }
 
 // --- header creation ---
 inline PacketHeader createHeaderInternal(const Connection& conn) {
@@ -153,6 +159,27 @@ inline void enqueueEmptyPacket(Connection& conn) {   // keepalive / ack-only sha
 }
 inline void sendKeepalive(Connection& conn) { enqueueEmptyPacket(conn); }
 inline void sendAckOnly(Connection& conn)   { enqueueEmptyPacket(conn); }
+
+// clock sync: a TimeSyncPing carries our send time; the peer replies with a TimeSyncPong echoing
+// it plus the peer's own time, which lets us estimate the clock offset (see clocksync.hpp).
+inline void sendTimeSyncPing(Connection& conn, MonoTime now) {
+    PacketHeader header = createHeaderInternal(conn);
+    header.type = PacketType::TimeSyncPing;
+    Bytes payload(8);
+    putU64(payload.data(), now.ns);
+    conn.sendQueue.push_back(OutgoingPacket{ header, PacketType::TimeSyncPing, std::move(payload) });
+    conn.localSeq         = next(conn.localSeq);
+    conn.lastTimeSyncTime = now;
+}
+inline void sendTimeSyncPong(Connection& conn, std::uint64_t echoNs, MonoTime now) {
+    PacketHeader header = createHeaderInternal(conn);
+    header.type = PacketType::TimeSyncPong;
+    Bytes payload(16);
+    putU64(payload.data(),     echoNs);   // echo the originator's send time
+    putU64(payload.data() + 8, now.ns);   // our timestamp
+    conn.sendQueue.push_back(OutgoingPacket{ header, PacketType::TimeSyncPong, std::move(payload) });
+    conn.localSeq = next(conn.localSeq);
+}
 
 // Wire form of a channel message: [channel:3 bits | reserved:5][seqHi][seqLo][payload].
 inline Bytes encodeChannelWire(int chIdx, const ChannelMessage& msg) {
@@ -343,6 +370,8 @@ inline void resetConnection(Connection& conn) {
     conn.localSeq         = SequenceNum{ 0 };
     conn.sendQueue.clear();
     conn.pendingWires.clear();
+    conn.clockSync        = ClockSync{};
+    conn.lastTimeSyncTime = MonoTime{};
     conn.disconnectTime   = std::nullopt;
     conn.disconnectRetries = 0;
     conn.pendingAck       = false;
@@ -369,6 +398,7 @@ inline void updateConnectedPure(Connection& conn, MonoTime now) {
     }
 
     if (elapsedMs(conn.lastSendTime, now) > cfg.keepaliveIntervalMs) sendKeepalive(conn);
+    if (elapsedMs(conn.lastTimeSyncTime, now) > timeSyncIntervalMs)  sendTimeSyncPing(conn, now);
 
     processChannelOutput(conn, now);
     processRetransmissions(conn, now, conn.reliability.rto);

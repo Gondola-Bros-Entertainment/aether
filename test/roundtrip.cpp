@@ -623,6 +623,20 @@ int main() {
         }
         assert(aUp && bUp && aether::peerIsConnected(A, idB) && aether::peerIsConnected(B, idA));
 
+        // clock sync: tick past the TimeSync interval a few times so pings/pongs flow and both
+        // sides land an offset sample (same test clock here, so the offset is ~0 -- this proves the
+        // round-trip exchange + estimator wiring; clocksync.hpp's unit test covers offset recovery).
+        for (int sync = 0; sync < 6; ++sync) {
+            t += 1100ull * 1000000;   // 1.1s steps: one TimeSyncPing per tick
+            const auto rax = aether::peerProcess(A, aether::MonoTime{ t }, toA); toA.clear();
+            const auto rbx = aether::peerProcess(B, aether::MonoTime{ t }, toB); toB.clear();
+            for (const auto& p : rax.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toB.push_back(aether::IncomingPacket{ idA, *s });
+            for (const auto& p : rbx.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toA.push_back(aether::IncomingPacket{ idB, *s });
+        }
+        assert(aether::clockSynced(A.connections.at(idB)) && aether::clockSynced(B.connections.at(idA)));
+        std::printf("aether timesync OK: offset estimated both ways (A<->B %.2fms over a shared clock)\n",
+                    aether::clockOffsetMs(A.connections.at(idB)));
+
         // peerShutdown drains a Disconnect packet per live connection, so a process that exits
         // immediately still notifies its peers instead of leaving them to time out.
         const auto closeA = aether::peerShutdown(A, aether::MonoTime{ t });

@@ -24,8 +24,10 @@ enum class PacketType : std::uint8_t {
     ConnectionChallenge = 6,   // server challenge (+ 64-bit server salt)
     ConnectionResponse  = 7,   // client response (+ 64-bit client salt)
     PayloadBatch        = 8,   // several coalesced channel messages (batchMessages framing)
+    TimeSyncPing        = 9,   // clock sync: [u64 sender ns]
+    TimeSyncPong        = 10,  // clock sync reply: [u64 echoed ns][u64 responder ns]
 };
-inline constexpr std::uint8_t packetTypeMax = 8;
+inline constexpr std::uint8_t packetTypeMax = 10;
 
 // The header fields, unpacked. Just data.
 struct PacketHeader {

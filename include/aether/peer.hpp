@@ -148,7 +148,7 @@ inline NetPeer newPeerState(const Address& localAddr, const NetworkConfig& confi
 // --- internal helpers ---
 inline void cleanupPeer(NetPeer& peer, const PeerId& pid)   { peer.fragmentAssemblers.erase(pid); }
 inline void removePending(NetPeer& peer, const PeerId& pid) { peer.pending.erase(pid); }
-inline bool isPostHandshake(PacketType t) noexcept { return t == PacketType::Payload || t == PacketType::PayloadBatch || t == PacketType::Keepalive || t == PacketType::Disconnect; }
+inline bool isPostHandshake(PacketType t) noexcept { return t == PacketType::Payload || t == PacketType::PayloadBatch || t == PacketType::Keepalive || t == PacketType::Disconnect || t == PacketType::TimeSyncPing || t == PacketType::TimeSyncPong; }
 
 inline void queueControlPacket(NetPeer& peer, PacketType ptype, const Bytes& payload, const PeerId& pid) {
     const PacketHeader header{ ptype, SequenceNum{ 0 }, SequenceNum{ 0 }, 0 };
@@ -310,6 +310,26 @@ inline std::vector<PeerEvent> handleMigration(NetPeer& peer, const PeerId& newPi
     return events;
 }
 
+// clock sync: echo a peer's ping back with our timestamp; feed their pong into our offset estimate.
+inline std::vector<PeerEvent> handleTimeSyncPing(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
+    const auto it = peer.connections.find(pid);
+    if (it == peer.connections.end() || pkt.payload.size() < 8) return {};
+    processIncomingHeader(it->second, pkt.header, now);
+    touchRecvTime(it->second, now);
+    sendTimeSyncPong(it->second, getU64(pkt.payload.data()), now);
+    return {};
+}
+inline std::vector<PeerEvent> handleTimeSyncPong(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
+    const auto it = peer.connections.find(pid);
+    if (it == peer.connections.end() || pkt.payload.size() < 16) return {};
+    processIncomingHeader(it->second, pkt.header, now);
+    touchRecvTime(it->second, now);
+    const double t0ms = static_cast<double>(getU64(pkt.payload.data()))     / 1.0e6;   // our send (echoed)
+    const double t1ms = static_cast<double>(getU64(pkt.payload.data() + 8)) / 1.0e6;   // peer's time
+    const double t2ms = static_cast<double>(now.ns) / 1.0e6;                            // our recv
+    clockSyncObserve(it->second.clockSync, t0ms, t1ms, t2ms);
+    return {};
+}
 inline std::vector<PeerEvent> handlePacketByType(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now, PacketType ptype) {
     switch (ptype) {
         case PacketType::ConnectionRequest:   return handleConnectionRequest(peer, pid, now);
@@ -324,6 +344,8 @@ inline std::vector<PeerEvent> handlePacketByType(NetPeer& peer, const PeerId& pi
             return peer.connections.count(pid) ? handlePayload(peer, pid, pkt, now) : handleMigration(peer, pid, pkt, now);
         case PacketType::PayloadBatch:
             return peer.connections.count(pid) ? handlePayloadBatch(peer, pid, pkt, now) : handleMigration(peer, pid, pkt, now);
+        case PacketType::TimeSyncPing: return handleTimeSyncPing(peer, pid, pkt, now);
+        case PacketType::TimeSyncPong: return handleTimeSyncPong(peer, pid, pkt, now);
         case PacketType::Keepalive:
             if (const auto it = peer.connections.find(pid); it != peer.connections.end()) {
                 processIncomingHeader(it->second, pkt.header, now);
