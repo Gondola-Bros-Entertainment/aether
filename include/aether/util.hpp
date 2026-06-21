@@ -1,5 +1,6 @@
-// aether - small shared utilities. A deterministic
-// SplitMix-style PRNG for salts and cookie secrets. (Sequence comparison lives in types.hpp
+// aether - small shared utilities. A deterministic SplitMix-style PRNG for the network simulator
+// and tests ONLY (jitter / loss / reorder / dup) -- NEVER for security material: every key, salt,
+// token, and nonce comes from the OS CSPRNG in random.hpp. (Sequence comparison lives in types.hpp
 // as newer()/sequenceDiff().) Pure, no IO: nextRandom returns the output and the next state.
 #pragma once
 

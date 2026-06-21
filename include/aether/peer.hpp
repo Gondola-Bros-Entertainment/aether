@@ -123,6 +123,9 @@ inline void genEphemeralKeypair(X25519Key& priv, X25519Key& pub) {
     x25519Base(pub, priv);
 }
 // The raw X25519 shared secret (a curve point); fed to the KDF below, never used as a key directly.
+// We deliberately skip RFC 7748's optional all-zero (low-order point) check: keys are ephemeral and
+// single-use, so the contributory-behaviour check buys nothing here (it matters for static keys),
+// and HChaCha20 mixes the secret before it ever keys a cipher.
 inline X25519Key x25519Shared(const X25519Key& priv, const X25519Key& peerPub) {
     X25519Key shared{};
     x25519(shared, priv, peerPub);
@@ -237,14 +240,15 @@ inline void queueControlPacket(NetPeer& peer, PacketType ptype, const Bytes& pay
 
 // --- handshake handlers ---
 inline std::vector<PeerEvent> handleNewConnectionRequest(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
+    // Cheapest gate first: a per-source rate check, so a flood is shed before paying for the token
+    // decrypt and the X25519 keygen below.
+    if (!rateLimiterAllow(peer.rateLimiter, sockAddrToKey(pid.addr), now)) { peer.rateLimitDrops += 1; return {}; }
     std::uint64_t playerId = 0;
     if (peer.config.tokenKey) {   // auth on: a valid sealed token gates everything below (incl. keygen) -- the DoS shield
         const auto tr = validateConnectToken(*peer.config.tokenKey, peer.tokenValidator, pkt.payload, now);
         if (tr.error) { queueControlPacket(peer, PacketType::ConnectionDenied, encodeDenyReason(DenyReason::InvalidToken), pid); return {}; }
         playerId = tr.playerId;
     }
-    const bool allowed = rateLimiterAllow(peer.rateLimiter, sockAddrToKey(pid.addr), now);
-    if (!allowed)                                                       { peer.rateLimitDrops += 1; return {}; }
     if (static_cast<int>(peer.pending.size()) >= peer.config.maxClients) { peer.rateLimitDrops += 1; return {}; }
     if (static_cast<int>(peer.connections.size()) >= peer.config.maxClients) {
         queueControlPacket(peer, PacketType::ConnectionDenied, encodeDenyReason(DenyReason::ServerFull), pid);
@@ -337,6 +341,14 @@ inline std::vector<PeerEvent> handleConnectionAccepted(NetPeer& peer, const Peer
         applySessionKeys(conn, *rit->second.master, it->second.reconnectSalt, /*isServer=*/false);   // re-key the resume
         peer.resumableTokens.erase(rit);
     }
+    // Fail closed: never bring up an unkeyed connection. This is reachable only when a reconnect
+    // races its own resume-grace eviction (the client dropped its cached master before the accept
+    // arrived); coming up without keys would be a plaintext/broken zombie. Drop it and surface a
+    // disconnect so the caller can re-initiate a fresh (full-handshake) connect.
+    if (!conn.sendKey || !conn.recvKey) {
+        peer.pending.erase(pid);
+        return { evDisconnected(pid, DisconnectReason::Timeout) };
+    }
     touchRecvTime(conn, now);
     markConnected(conn, now);
     peer.connections[pid] = std::move(conn);
@@ -358,13 +370,21 @@ inline std::vector<PeerEvent> handleDisconnect(NetPeer& peer, const PeerId& pid,
 // --- migration ---
 inline std::uint64_t migrationTokenFor(const Connection& conn) noexcept { return conn.clientSalt; }
 struct MigrationCandidate { PeerId oldPeer; std::uint64_t token = 0; };
+// The keyed connection whose remote sequence is CLOSEST to the incoming packet's -- a hint for
+// which connection a packet from a new address might belong to. Picking the closest (not just the
+// first in-range match) avoids handing the packet to a different nearby connection. Only a hint:
+// the caller proves ownership by decrypting under that connection's key.
 inline std::optional<MigrationCandidate> findMigrationCandidate(const NetPeer& peer, const Packet& pkt, MonoTime) {
-    const int incomingSeq = pkt.header.sequence.value;
     const int maxDistance = peer.config.maxSequenceDistance;
-    for (const auto& [pid, conn] : peer.connections)
-        if (std::abs(incomingSeq - static_cast<int>(connRemoteSeq(conn).value)) <= maxDistance)
-            return MigrationCandidate{ pid, migrationTokenFor(conn) };
-    return std::nullopt;
+    std::optional<MigrationCandidate> best;
+    int bestDist = 0;
+    for (const auto& [pid, conn] : peer.connections) {
+        if (!conn.recvKey) continue;
+        const int dist = std::abs(sequenceDiff(pkt.header.sequence, connRemoteSeq(conn)));   // wraparound-aware (RFC 1982), not a linear diff
+        if (dist > maxDistance) continue;
+        if (!best || dist < bestDist) { best = MigrationCandidate{ pid, migrationTokenFor(conn) }; bestDist = dist; }
+    }
+    return best;
 }
 
 // --- payload / fragment / migration dispatch ---
@@ -470,9 +490,12 @@ inline std::vector<PeerEvent> handlePacketByType(NetPeer& peer, const PeerId& pi
         case PacketType::ConnectionChallenge: return handleConnectionChallenge(peer, pid, pkt, now);
         case PacketType::ConnectionResponse:  return handleConnectionResponse(peer, pid, pkt, now);
         case PacketType::ConnectionAccepted:  return handleConnectionAccepted(peer, pid, now);
-        case PacketType::ConnectionDenied:
+        case PacketType::ConnectionDenied: {
+            const auto pend = peer.pending.find(pid);   // only a connect WE initiated can be denied -- ignore a stray/spoofed deny
+            if (pend == peer.pending.end() || pend->second.direction != ConnectionDirection::Outbound) return {};
             removePending(peer, pid);
             return { evDisconnected(pid, denyToDisconnectReason(decodeDenyReason(pkt.payload))) };
+        }
         case PacketType::Disconnect:          return handleDisconnect(peer, pid, pkt);
         case PacketType::Payload:
             return peer.connections.count(pid) ? handlePayload(peer, pid, pkt, now) : handleMigration(peer, pid, pkt, now);

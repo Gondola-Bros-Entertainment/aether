@@ -47,8 +47,11 @@ constexpr int sequenceDiff(SequenceNum a, SequenceNum b) noexcept {
 
 // Monotonic time, nanoseconds.
 struct MonoTime { std::uint64_t ns{}; };
+// Saturates at 0 when now precedes start: callers compare against positive timeouts, and an
+// unsigned wrap (now < start, from a non-monotonic clock or a stale now) would otherwise read as
+// ~1.8e10 ms and fire every deadline at once. Reversed time means "no time passed", not "forever".
 constexpr double elapsedMs(MonoTime start, MonoTime now) noexcept {
-    return static_cast<double>(now.ns - start.ns) / 1.0e6;
+    return now.ns >= start.ns ? static_cast<double>(now.ns - start.ns) / 1.0e6 : 0.0;
 }
 
 } // namespace aether

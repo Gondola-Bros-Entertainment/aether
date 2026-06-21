@@ -19,6 +19,10 @@ namespace aether {
 using BaselineSeq = std::uint16_t;
 inline constexpr BaselineSeq noBaseline      = 0xFFFF;   // sentinel: no baseline, full state follows
 inline constexpr int         maxSnapshotBytes = 65536;   // scratch buffer cap for one snapshot
+// Bare-struct cap defaults, so a default-constructed DeltaTracker/BaselineManager is usable rather
+// than silently one-deep (a cap of 0 keeps a single entry, so deltaOnAck for any but the most recent
+// snapshot fails and the baseline never advances). The new* factories override these.
+inline constexpr int         defaultReplicationCap = 64;
 
 // Pack a full snapshot / a delta. A reused thread-local scratch (sized once per thread) avoids the
 // per-call 64KB allocation; only the right-sized result is copied out.
@@ -45,7 +49,7 @@ template <class T> Bytes packDelta(const T& prev, const T& curr) {
 template <class T> struct DeltaTracker {
     std::deque<std::pair<BaselineSeq, T>>    pending;
     std::optional<std::pair<BaselineSeq, T>> confirmed;
-    int                                      maxPending = 0;
+    int                                      maxPending = defaultReplicationCap;
 };
 template <class T> DeltaTracker<T> newDeltaTracker(int maxPending) {
     DeltaTracker<T> t;
@@ -99,7 +103,7 @@ template <class T> std::optional<BaselineSeq> deltaConfirmedSeq(const DeltaTrack
 // --- receiver side ---
 template <class T> struct BaselineManager {
     std::deque<std::tuple<BaselineSeq, T, MonoTime>> snapshots;
-    int    maxSnapshots = 0;
+    int    maxSnapshots = defaultReplicationCap;
     double timeoutMs    = 0.0;
 };
 template <class T> BaselineManager<T> newBaselineManager(int maxSnapshots, double timeoutMs) {

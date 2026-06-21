@@ -29,6 +29,7 @@
 #include "aether/x25519.hpp"
 
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <thread>
@@ -244,6 +245,35 @@ int main() {
         std::printf("aether channel-pipeline OK: %d reliable messages in flight in one drain (was 1)\n", emitted);
     }
 
+    // channel: a budget-blocked retransmit must not burn a retry or reset its RTO. getRetransmitMessages
+    // returns candidates only; commitRetransmit advances send state, called when the send is admitted.
+    {
+        aether::Channel ch = aether::newChannel(aether::ChannelId{ 0 }, aether::reliableOrderedChannel());
+        const auto sr = aether::channelSend(ch, aether::Bytes{ 1, 2, 3 }, aether::MonoTime{ 0 });
+        aether::commitOutgoingMessage(ch, sr.seq);                 // in flight: retryCount 1, sendTime 0
+        const aether::MonoTime later{ 200ull * 1000000 };          // 200ms > 100ms RTO
+        const auto cands = aether::getRetransmitMessages(ch, later, 100.0);
+        assert(cands.size() == 1);                                                                  // RTO elapsed -> candidate
+        assert(ch.sendBuffer.at(sr.seq).retryCount == 1 && ch.sendBuffer.at(sr.seq).sendTime.ns == 0);   // peek did NOT mutate (was the bug)
+        aether::commitRetransmit(ch, sr.seq, later);
+        assert(ch.sendBuffer.at(sr.seq).retryCount == 2 && ch.sendBuffer.at(sr.seq).sendTime.ns == later.ns);   // state advances only on commit
+        std::printf("aether retransmit-commit OK: candidate peeked without burning a retry; commit advances state\n");
+    }
+
+    // reliability: advancing the remote sequence by exactly 32 keeps the previous packet's ack in the
+    // bitfield (bit 31) instead of dropping it -- the window edge was off by one (d < 32 reset to 0).
+    {
+        aether::ReliableEndpoint ep{};
+        const aether::SequenceNum a{ 100 };
+        aether::onPacketsReceived(ep, &a, 1);                      // remoteSeq = 100
+        const aether::SequenceNum b{ static_cast<std::uint16_t>(132) };
+        aether::onPacketsReceived(ep, &b, 1);                      // advance by exactly 32
+        const auto [ackSeq, ackBits] = aether::getAckInfo(ep);
+        assert(ackSeq.value == 132);
+        assert((ackBits & (std::uint64_t(1) << 31)) != 0);         // seq 100 (now 32 back) still acked at bit 31
+        std::printf("aether ack-bitfield OK: +32 advance keeps the prior ack at bit 31 (was dropped)\n");
+    }
+
     // anti-replay: the AEAD nonce-counter window accepts fresh counters -- including reordered-but-
     // unseen ones (UDP reorders) -- and rejects replays + too-old counters. The old check required
     // strictly increasing counters, so it dropped every reordered datagram as a "replay".
@@ -293,6 +323,45 @@ int main() {
         assert(static_cast<int>(a.buffers.size()) <= 8);   // bounded, not 100
         std::printf("aether fragment-cap OK: concurrent buffers bounded to %d (was unbounded), count==0 rejected\n",
                     static_cast<int>(a.buffers.size()));
+    }
+
+    // fragment: the byte cap is enforced, not advisory -- a single fragment larger than the whole cap
+    // is rejected, and the buffered total never exceeds the cap (evict-until-it-fits).
+    {
+        aether::FragmentAssembler a = aether::newFragmentAssembler(5000.0, 100, 256);   // 100-byte cap
+        std::vector<std::uint8_t> big(static_cast<std::size_t>(aether::fragmentHeaderSize) + 200);   // one fragment > cap
+        aether::writeFragmentHeader(big.data(), aether::FragmentHeader{ aether::MessageId{ 1 }, 0, 2 });
+        const auto rej = aether::processFragment(a, big.data(), big.size(), aether::MonoTime{ 0 });
+        assert(!rej && a.currentSize == 0 && a.buffers.empty());   // oversized fragment rejected, nothing buffered
+        for (std::uint32_t id = 1; id <= 50; ++id) {               // flood smaller never-completing fragments
+            std::uint8_t f[aether::fragmentHeaderSize + 40];
+            aether::writeFragmentHeader(f, aether::FragmentHeader{ static_cast<aether::MessageId>(id), 0, 2 });
+            aether::processFragment(a, f, sizeof f, aether::MonoTime{ 0 });
+        }
+        assert(a.currentSize <= 100);   // buffered total stays within the cap (was overshootable by a whole fragment)
+        std::printf("aether fragment-bytecap OK: oversized rejected, buffered total <= cap (%d bytes)\n", a.currentSize);
+    }
+
+    // time: elapsedMs saturates at 0 when now precedes start -- an unsigned wrap would read as ~1.8e10 ms
+    // and fire every deadline at once.
+    {
+        assert(aether::elapsedMs(aether::MonoTime{ 1000 }, aether::MonoTime{ 500 }) == 0.0);   // reversed -> 0, not huge
+        assert(aether::elapsedMs(aether::MonoTime{ 500 }, aether::MonoTime{ 1000 }) > 0.0);     // forward still works
+        std::printf("aether elapsedMs-saturate OK: reversed time -> 0 (no unsigned-wrap deadline storm)\n");
+    }
+
+    // config: validation rejects the unbounded/broken caps (0 fragments, 0 reassembly bytes, 0
+    // replication caps) that would otherwise allow unbounded buffers or a silently one-deep tracker.
+    {
+        const aether::NetworkConfig c;   // defaults are valid
+        assert(!aether::validateConfig(c));
+        aether::NetworkConfig c1 = c; c1.maxFragments = 0;
+        assert(aether::validateConfig(c1) == aether::ConfigError::InvalidMaxFragments);
+        aether::NetworkConfig c2 = c; c2.maxReassemblyBufferSize = 0;
+        assert(aether::validateConfig(c2) == aether::ConfigError::InvalidReassemblyBufferSize);
+        aether::NetworkConfig c3 = c; c3.maxBaselineSnapshots = 0;
+        assert(aether::validateConfig(c3) == aether::ConfigError::InvalidReplicationCaps);
+        std::printf("aether config-bounds OK: zero fragment/reassembly/replication caps rejected\n");
     }
 
     // fragment: split a 2500-byte message into MTU-sized pieces and reassemble it
@@ -383,6 +452,62 @@ int main() {
 
         std::printf("aether magic OK: plain struct, full snapshot %zu bytes vs delta(1 field) %zu bytes, zero annotations\n",
                     fw.pos, dw.pos);
+    }
+
+    // serializer hardening: vector decode grows incrementally instead of resizing to the wire's
+    // element count up front, so a hostile count cannot force a large allocation. Legit data still
+    // round-trips; a count that exceeds the remaining bytes is rejected before any element parses.
+    {
+        struct Big     { std::uint64_t a, b, c, d, e, f, g, h; };
+        struct WithVec { std::vector<Big> items; };
+        WithVec orig; orig.items = { Big{ 1,2,3,4,5,6,7,8 }, Big{ 9,8,7,6,5,4,3,2 } };
+        std::uint8_t vb[256];
+        aether::Writer vw{ vb, sizeof vb, 0, true };
+        aether::pack(vw, orig);
+        assert(vw.ok);
+        aether::Reader vr{ vb, vw.pos, 0 };
+        const auto rt = aether::unpack<WithVec>(vr);
+        assert(rt && rt->items.size() == 2 && rt->items[1].a == 9 && rt->items[1].h == 2);
+
+        std::uint8_t hostile[8];
+        aether::Writer hw{ hostile, sizeof hostile, 0, true };
+        aether::writeVarU(hw, 5000000ull);       // claim 5M 64-byte elements in a 3-byte buffer
+        aether::Reader hr{ hostile, hw.pos, 0 };
+        assert(!aether::unpack<WithVec>(hr));    // count > remaining bytes -> rejected, no amplified alloc
+        std::printf("aether vector-decode hardening OK: legit roundtrips, hostile count rejected\n");
+    }
+
+    // serializer hardening: a struct containing a bool must NOT take the raw-memcpy wire path --
+    // bool normalizes to a 0/1 byte, but a memcpy would ship the raw byte (and could rebuild a
+    // trap-representation bool from hostile input). A bool-free POD still gets the fast path.
+    {
+        struct Flags  { bool a, b, c, d; };            // 4 bytes, would otherwise be memcpy-eligible
+        struct NoBool { std::uint8_t a, b, c, d; };    // 4 bytes, stays on the fast path
+        static_assert(!aether::canMemcpySerialize<Flags>(), "bool struct must avoid the memcpy path");
+        static_assert(aether::canMemcpySerialize<NoBool>(), "bool-free POD keeps the memcpy fast path");
+        const Flags f{ true, false, true, false };
+        std::uint8_t b[16];
+        aether::Writer w{ b, sizeof b, 0, true };
+        aether::serialize(w, f);
+        aether::Reader r{ b, w.pos, 0 };
+        const auto back = aether::deserialize<Flags>(r);
+        assert(back && back->a && !back->b && back->c && !back->d);
+        std::printf("aether bool-memcpy-exclusion OK: bool struct uses the portable path, round-trips\n");
+    }
+
+    // serializer hardening: the delta changemask compares floats bit-exactly, so a +0.0 -> -0.0
+    // transition is transmitted (value equality would have dropped the sign flip as "unchanged").
+    {
+        struct F { float v; };
+        const F prev{ +0.0f };
+        F curr{ -0.0f };
+        std::uint8_t db[16];
+        aether::Writer dw{ db, sizeof db, 0, true };
+        aether::deltaPack(dw, prev, curr);
+        aether::Reader dr{ db, dw.pos, 0 };
+        const auto back = aether::deltaUnpack(dr, prev);
+        assert(back && std::signbit(back->v));   // -0.0 carried through (mask bit set), not dropped
+        std::printf("aether delta bit-exact OK: +0.0 -> -0.0 sign flip transmitted\n");
     }
 
     // crypto: RFC 8439 section 2.8.2 AEAD vector -- proves ChaCha20 + Poly1305 + construction.
@@ -499,6 +624,9 @@ int main() {
         assert(cw.bytesInFlight == 0 && cw.cwnd > startCwnd);
         aether::cwOnLoss(cw);
         assert(cw.phase == aether::CongestionPhase::Recovery && cw.cwnd >= aether::minCwndBytes);
+        assert(cw.cwnd == cw.ssthresh + 3.0 * 1200);                                       // fast recovery inflates by 3 segments
+        aether::cwOnAck(cw, 1200);                                                          // first ack of new data exits recovery
+        assert(cw.phase == aether::CongestionPhase::Avoidance && cw.cwnd == cw.ssthresh);   // ...deflating to ssthresh
 
         const std::vector<aether::Bytes> msgs = { { 1, 2, 3 }, { 4, 5 }, { 6, 7, 8, 9 } };
         aether::Bytes batch;   // hand-frame a coalesced batch ([u8 count][u16 len BE][data]...) and decode it
@@ -705,6 +833,9 @@ int main() {
         for (int i = 0; i < 32; ++i) tk[static_cast<std::size_t>(i)] = std::uint8_t(i * 3 + 7);
         aether::TokenValidator tv = aether::newTokenValidator(5000.0, 100);
         const aether::Bytes sealed = aether::sealConnectToken(tk, aether::ConnectToken{ 7, aether::MonoTime{ 5ull * 1000000000 }, {} });
+        assert(sealed.size() == aether::connectTokenNonceBytes + 16u + static_cast<std::size_t>(aether::authTagSize));   // [nonce:12][pt:16][tag:16]
+        const aether::Bytes sealedAgain = aether::sealConnectToken(tk, aether::ConnectToken{ 7, aether::MonoTime{ 5ull * 1000000000 }, {} });
+        assert(sealedAgain != sealed);                                       // fresh 96-bit random nonce per seal -> no reuse
         const auto v1 = aether::validateConnectToken(tk, tv, sealed, aether::MonoTime{ 1000000 });
         assert(!v1.error && v1.playerId == 7);                                // opens + authenticates
         const auto v2 = aether::validateConnectToken(tk, tv, sealed, aether::MonoTime{ 2000000 });

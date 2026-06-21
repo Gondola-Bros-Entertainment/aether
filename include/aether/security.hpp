@@ -66,11 +66,13 @@ inline std::optional<Bytes> validateAndStripCrc32(const Bytes& data) {
 }
 
 // --- rate limiter (per-source connection-request throttle, self-cleaning) ---
-inline constexpr double cleanupIntervalMs = 5000.0;
+inline constexpr double cleanupIntervalMs     = 5000.0;
+inline constexpr int    rateLimiterMaxSources = 4096;   // hard cap on tracked sources (spoof-flood memory shield)
 
 struct RateLimiter {
     std::map<std::uint64_t, std::vector<MonoTime>> requests;
     int      maxRequestsPerSecond = 0;
+    int      maxTrackedSources    = rateLimiterMaxSources;
     double   windowMs             = 1000.0;
     MonoTime lastCleanup{};
 };
@@ -82,8 +84,7 @@ inline RateLimiter newRateLimiter(int maxReqs, MonoTime now) {
     return rl;
 }
 
-inline void maybeCleanup(RateLimiter& rl, MonoTime now) {
-    if (elapsedMs(rl.lastCleanup, now) < cleanupIntervalMs) return;
+inline void pruneRateLimiter(RateLimiter& rl, MonoTime now) {
     const double window = rl.windowMs;
     for (auto it = rl.requests.begin(); it != rl.requests.end();) {
         std::vector<MonoTime>& v = it->second;
@@ -93,13 +94,24 @@ inline void maybeCleanup(RateLimiter& rl, MonoTime now) {
     }
     rl.lastCleanup = now;
 }
+inline void maybeCleanup(RateLimiter& rl, MonoTime now) {
+    if (elapsedMs(rl.lastCleanup, now) >= cleanupIntervalMs) pruneRateLimiter(rl, now);
+}
 
-// Allow a request if fewer than the cap occurred within the window; records it either way.
+// Allow a request if fewer than the cap occurred within the window; records it either way. Bounds
+// the table at maxTrackedSources so a spoofed-source flood cannot grow it without limit (a memory
+// shield distinct from the per-source rate check; the return-routability cookie is the full fix).
 inline bool rateLimiterAllow(RateLimiter& rl, std::uint64_t addrKey, MonoTime now) {
     maybeCleanup(rl, now);
+    auto it = rl.requests.find(addrKey);
+    if (it == rl.requests.end() && static_cast<int>(rl.requests.size()) >= rl.maxTrackedSources) {
+        pruneRateLimiter(rl, now);   // at the cap: drop stale sources now, ignoring the 5s interval
+        if (static_cast<int>(rl.requests.size()) >= rl.maxTrackedSources) return false;   // still full -> shed
+        // addrKey is new, so prune did not create it -- it stays end(), and the filter below is skipped
+    }
     const double          window = rl.windowMs;
     std::vector<MonoTime> recent;
-    if (const auto it = rl.requests.find(addrKey); it != rl.requests.end())
+    if (it != rl.requests.end())
         for (const MonoTime t : it->second)
             if (elapsedMs(t, now) < window) recent.push_back(t);
 
@@ -118,7 +130,14 @@ inline bool rateLimiterAllow(RateLimiter& rl, std::uint64_t addrKey, MonoTime no
 // opens it with K (validateConnectToken) to learn the verified player id. Sealing is
 // ChaCha20-Poly1305, so only a key-holder can mint a token and any tampering is detected. aether
 // stays auth-provider-agnostic: the provider only ever touches your backend's seal step.
-inline constexpr std::uint32_t connectTokenDomain = 0x544f4b4eu;   // "TOKN": nonce domain for the seal
+inline constexpr std::uint32_t connectTokenDomain     = 0x544f4b4eu;   // "TOKN": AEAD domain for the seal
+inline constexpr std::size_t   connectTokenNonceBytes = 12;            // 96-bit random nonce (IETF ChaCha20-Poly1305 width)
+// Domain bytes bound as AEAD AAD, so a token sealed for this purpose cannot be confused with other
+// ciphertext minted under the same key.
+inline constexpr std::array<std::uint8_t, 4> connectTokenDomainBytes = {
+    std::uint8_t(connectTokenDomain >> 24), std::uint8_t(connectTokenDomain >> 16),
+    std::uint8_t(connectTokenDomain >> 8),  std::uint8_t(connectTokenDomain) };
+using TokenNonce = std::array<std::uint8_t, connectTokenNonceBytes>;
 
 struct ConnectToken {
     std::uint64_t playerId{};    // your verified player identity (e.g. a Firebase UID)
@@ -127,38 +146,60 @@ struct ConnectToken {
 };
 
 // Seal a token under the server key -- call this in your backend, after the player authenticates.
-// Output is [nonce:8][ciphertext][tag:16]; the fresh random nonce per token keys replay defense.
+// Output is [nonce:12][ciphertext][tag:16]. The nonce is a 96-bit CSPRNG draw (the IETF
+// ChaCha20-Poly1305 width): random-nonce collision stays negligible to ~2^32 tokens per key, and
+// the nonce doubles as the token's identity for replay defense.
 inline Bytes sealConnectToken(const EncryptionKey& key, const ConnectToken& t) {
+    std::uint8_t nonce[connectTokenNonceBytes];
+    secureRandomBytes(nonce, sizeof nonce);
     Bytes pt(16 + t.userData.size());
     putU64(pt.data(),     t.playerId);
     putU64(pt.data() + 8, t.expiresAt.ns);
     if (!t.userData.empty()) std::memcpy(pt.data() + 16, t.userData.data(), t.userData.size());
-    return encrypt(key, NonceCounter{ secureRandom64() }, connectTokenDomain, nullptr, 0, pt.data(), pt.size());
+    Bytes        ct(pt.size());
+    std::uint8_t tag[16];
+    aeadSeal(key.data(), nonce, connectTokenDomainBytes.data(), connectTokenDomainBytes.size(),
+             pt.data(), pt.size(), ct.data(), tag);
+    Bytes out;
+    out.reserve(sizeof nonce + ct.size() + static_cast<std::size_t>(authTagSize));
+    out.insert(out.end(), nonce, nonce + sizeof nonce);
+    out.insert(out.end(), ct.begin(), ct.end());
+    out.insert(out.end(), tag, tag + authTagSize);
+    return out;
 }
 
 // A token whose seal + expiry checked out, plus the nonce that identifies it for replay defense.
-struct OpenedToken { ConnectToken token; std::uint64_t nonce{}; };
+struct OpenedToken { ConnectToken token; TokenNonce nonce{}; };
 
 // Verify a sealed token: seal authentic AND not expired. nullopt = forged, corrupt, or expired.
 // Replay is the caller's job (validateConnectToken does it).
 inline std::optional<OpenedToken> openConnectToken(const EncryptionKey& key, const Bytes& sealed, MonoTime now) {
-    const auto dec = decrypt(key, connectTokenDomain, nullptr, 0, sealed.data(), sealed.size());
-    if (!dec || dec->plaintext.size() < 16) return std::nullopt;
-    const std::uint8_t* p = dec->plaintext.data();
+    if (sealed.size() < connectTokenNonceBytes + static_cast<std::size_t>(authTagSize)) return std::nullopt;
+    TokenNonce nonce{};
+    std::memcpy(nonce.data(), sealed.data(), connectTokenNonceBytes);
+    const std::size_t   ctLen = sealed.size() - connectTokenNonceBytes - authTagSize;
+    const std::uint8_t* ct    = sealed.data() + connectTokenNonceBytes;
+    const std::uint8_t* tag   = sealed.data() + connectTokenNonceBytes + ctLen;
+    const auto pt = aeadOpen(key.data(), nonce.data(), connectTokenDomainBytes.data(),
+                             connectTokenDomainBytes.size(), ct, ctLen, tag);
+    if (!pt || pt->size() < 16) return std::nullopt;
+    const std::uint8_t* p = pt->data();
     ConnectToken t;
     t.playerId  = getU64(p);
     t.expiresAt = MonoTime{ getU64(p + 8) };
-    t.userData.assign(dec->plaintext.begin() + 16, dec->plaintext.end());
+    t.userData.assign(pt->begin() + 16, pt->end());
     if (now.ns >= t.expiresAt.ns) return std::nullopt;   // expired
-    return OpenedToken{ std::move(t), dec->counter.value };
+    return OpenedToken{ std::move(t), nonce };
 }
 
 enum class TokenError { Invalid, Replayed };
 
 // Replay tracker: remembers each accepted token's nonce so a captured token cannot be reused.
-// Bounded + self-cleaning.
+// Bounded + self-cleaning. tokenLifetimeMs should be >= the longest token validity window you mint
+// (expiresAt - issuedAt): a nonce is forgotten this long after first use, so a shorter lifetime
+// would let a still-valid token replay once its nonce ages out.
 struct TokenValidator {
-    std::map<std::uint64_t, MonoTime> usedNonces;   // token nonce -> when first accepted
+    std::map<TokenNonce, MonoTime> usedNonces;   // token nonce -> when first accepted
     double tokenLifetimeMs  = 0.0;
     int    maxTrackedTokens = 0;
 };

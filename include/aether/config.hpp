@@ -113,25 +113,31 @@ enum class ConfigError {
     InvalidFragmentThreshold,
     SendRateExceedsMaxPacketRate,
     InvalidCongestionThreshold,
+    InvalidMaxFragments,
+    InvalidReassemblyBufferSize,
+    InvalidReplicationCaps,
 };
 
 // Validate a config; nullopt means valid.
 inline std::optional<ConfigError> validateConfig(const NetworkConfig& c) {
     const auto validPositive = [](double x) { return x > 0.0 && !std::isnan(x); };
     if (c.fragmentThreshold > c.mtu)                                  return ConfigError::FragmentThresholdExceedsMtu;
-    if (c.maxChannels == 0 || c.maxChannels > maxChannelCount)        return ConfigError::InvalidChannelCount;
-    if (c.packetBufferSize == 0)                                      return ConfigError::InvalidPacketBufferSize;
+    if (c.maxChannels <= 0 || c.maxChannels > maxChannelCount)        return ConfigError::InvalidChannelCount;
+    if (c.packetBufferSize <= 0)                                      return ConfigError::InvalidPacketBufferSize;
     if (c.mtu < minMtu || c.mtu > maxMtu)                             return ConfigError::InvalidMtu;
     if (c.connectionTimeoutMs <= c.keepaliveIntervalMs)              return ConfigError::TimeoutNotGreaterThanKeepalive;
-    if (c.maxClients == 0)                                            return ConfigError::InvalidMaxClients;
+    if (c.maxClients <= 0)                                            return ConfigError::InvalidMaxClients;
     if (static_cast<int>(c.channelConfigs.size()) > c.maxChannels)    return ConfigError::ChannelConfigsExceedMaxChannels;
     if (!validPositive(c.sendRate))                                   return ConfigError::InvalidSendRate;
     if (!validPositive(c.maxPacketRate))                              return ConfigError::InvalidMaxPacketRate;
-    if (c.maxInFlight == 0)                                           return ConfigError::InvalidMaxInFlight;
-    if (c.fragmentThreshold == 0)                                     return ConfigError::InvalidFragmentThreshold;
+    if (c.maxInFlight <= 0)                                           return ConfigError::InvalidMaxInFlight;
+    if (c.fragmentThreshold <= 0)                                     return ConfigError::InvalidFragmentThreshold;
     if (c.sendRate > c.maxPacketRate)                                 return ConfigError::SendRateExceedsMaxPacketRate;
     if (!std::isfinite(c.congestionGoodRttThreshold) || !std::isfinite(c.congestionBadLossThreshold)
         || !std::isfinite(c.congestionThreshold))                    return ConfigError::InvalidCongestionThreshold;
+    if (c.maxFragments <= 0)                                          return ConfigError::InvalidMaxFragments;
+    if (c.maxReassemblyBufferSize <= 0)                              return ConfigError::InvalidReassemblyBufferSize;
+    if (c.maxPending <= 0 || c.maxBaselineSnapshots <= 0)            return ConfigError::InvalidReplicationCaps;
     return std::nullopt;
 }
 

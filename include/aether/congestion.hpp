@@ -146,18 +146,21 @@ inline void cwOnAck(CongestionWindow& cw, int bytes) {
             if (cw.cwnd > 0.0) cw.cwnd += static_cast<double>(cw.mtu) * static_cast<double>(bytes) / cw.cwnd;
             break;
         case CongestionPhase::Recovery:
-            // Recovery lasts about one RTT; the first ack of new data exits to congestion avoidance.
-            // Without this, a single loss freezes the window until an idle slow-start restart.
+            // RFC 5681: the first ack of new data ends fast recovery -- deflate the inflated window
+            // back to ssthresh and resume congestion avoidance. Without an exit, a single loss would
+            // freeze the window until an idle slow-start restart.
+            cw.cwnd  = cw.ssthresh;
             cw.phase = CongestionPhase::Avoidance;
-            if (cw.cwnd > 0.0) cw.cwnd += static_cast<double>(cw.mtu) * static_cast<double>(bytes) / cw.cwnd;
             break;
     }
 }
 
 inline void cwOnLoss(CongestionWindow& cw) {
-    const double newSsthresh = std::max(static_cast<double>(minCwndBytes), cw.cwnd / 2.0);
-    cw.ssthresh = newSsthresh;
-    cw.cwnd     = newSsthresh;
+    // RFC 5681 fast recovery: halve ssthresh, then inflate the window by the 3 segments the
+    // duplicate acks proved had left the network, so the sender keeps emitting during recovery
+    // (cwOnAck deflates back to ssthresh on the first ack of new data).
+    cw.ssthresh = std::max(static_cast<double>(minCwndBytes), cw.cwnd / 2.0);
+    cw.cwnd     = cw.ssthresh + 3.0 * static_cast<double>(cw.mtu);
     cw.phase    = CongestionPhase::Recovery;
 }
 

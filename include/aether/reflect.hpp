@@ -29,12 +29,16 @@ struct Any {
     template <class T> constexpr operator T() const noexcept { return T{}; }
 };
 
+// Cap probing one past the supported field max: a struct that brace-inits beyond this -- a genuine
+// >32-field aggregate, or a raw C-array member that the probe mis-counts element-by-element -- stops
+// here instead of recursing toward constexpr-stack exhaustion. tieFields then static_asserts with a
+// clear message. Must match the AETHER_BIND ladder max in tieFields.
+inline constexpr std::size_t maxReflectFields = 32;
 template <class T, class... Probes>
 constexpr std::size_t countFields() noexcept {
-    if constexpr (requires { T{ Probes{}..., Any{} }; })
-        return countFields<T, Probes..., Any>();
-    else
-        return sizeof...(Probes);
+    if      constexpr (sizeof...(Probes) > maxReflectFields)      return sizeof...(Probes);
+    else if constexpr (requires { T{ Probes{}..., Any{} }; })     return countFields<T, Probes..., Any>();
+    else                                                          return sizeof...(Probes);
 }
 
 // dynamic-field detection (length-prefixed on the wire): string, vector, optional.
@@ -43,6 +47,16 @@ template <class>             inline constexpr bool isStdVector   = false;
 template <class U, class A>  inline constexpr bool isStdVector<std::vector<U, A>> = true;
 template <class>             inline constexpr bool isStdOptional = false;
 template <class U>           inline constexpr bool isStdOptional<std::optional<U>> = true;
+
+// Cap the up-front reserve when decoding a length-prefixed vector from untrusted bytes, so a hostile
+// element COUNT cannot inflate the allocation: reserve at most ~64KB worth of elements (one minimum),
+// then grow as elements actually decode. The caller already bounds the count to the remaining byte
+// budget, so the decode loop stays bounded by the input size even for a zero-width element type.
+inline constexpr std::size_t decodeReserveByteBudget = std::size_t{ 64 } * 1024;
+template <class E> constexpr std::size_t decodeReserveCount(std::uint64_t n) noexcept {
+    constexpr std::size_t cap = sizeof(E) >= decodeReserveByteBudget ? 1 : decodeReserveByteBudget / sizeof(E);
+    return n < cap ? static_cast<std::size_t>(n) : cap;
+}
 
 } // namespace detail
 
@@ -96,7 +110,7 @@ constexpr auto tieFields(T&& t) {
     AETHER_BIND(30, m0,m1,m2,m3,m4,m5,m6,m7,m8,m9,m10,m11,m12,m13,m14,m15,m16,m17,m18,m19,m20,m21,m22,m23,m24,m25,m26,m27,m28,m29)
     AETHER_BIND(31, m0,m1,m2,m3,m4,m5,m6,m7,m8,m9,m10,m11,m12,m13,m14,m15,m16,m17,m18,m19,m20,m21,m22,m23,m24,m25,m26,m27,m28,m29,m30)
     AETHER_BIND(32, m0,m1,m2,m3,m4,m5,m6,m7,m8,m9,m10,m11,m12,m13,m14,m15,m16,m17,m18,m19,m20,m21,m22,m23,m24,m25,m26,m27,m28,m29,m30,m31)
-    else { static_assert(n <= 32, "aether::tieFields: too many fields; add AETHER_BIND lines to raise the cap"); return std::tuple<>{}; }
+    else { static_assert(n <= 32, "aether::tieFields: this aggregate exposes more than 32 fields to reflection. Either it genuinely has >32 members (add AETHER_BIND lines to raise the cap), or it contains a raw C-array member, which the field-count probe mis-counts element-by-element -- use std::array<T,N> instead (the idiomatic fixed array; it reflects as a single field)."); return std::tuple<>{}; }
 }
 #undef AETHER_BIND
 
@@ -123,6 +137,7 @@ template <class T> void writeAny(Writer& w, const T& v) {
         else if constexpr (sizeof(T) == 4) write(w, static_cast<std::uint32_t>(static_cast<U>(v)));
         else                               write(w, static_cast<std::uint64_t>(static_cast<U>(v)));
     } else {
+        static_assert(std::is_floating_point_v<T> && (sizeof(T) == 4 || sizeof(T) == 8), "aether: only 32/64-bit floats are serializable");
         write(w, v);   // float, double
     }
 }
@@ -140,10 +155,10 @@ template <class T> bool readAny(Reader& r, T& v) {
         return true;
     } else if constexpr (detail::isStdVector<T>) {
         const auto n = read<std::uint32_t>(r);
-        if (!n || *n > r.len - r.pos) return false;   // each element is >= 1 byte, so count <= remaining
+        if (!n || *n > r.len - r.pos) return false;   // each element is >= 1 byte, so count <= remaining bytes
         v.clear();
-        v.resize(*n);
-        for (auto& e : v) if (!readAny(r, e)) return false;
+        v.reserve(detail::decodeReserveCount<typename T::value_type>(*n));   // bounded up-front alloc; grow as elements parse
+        for (std::uint32_t k = 0; k < *n; ++k) { typename T::value_type e{}; if (!readAny(r, e)) return false; v.push_back(std::move(e)); }
         return true;
     } else if constexpr (detail::isStdOptional<T>) {
         const auto f = read<std::uint8_t>(r);
@@ -171,6 +186,7 @@ template <class T> bool readAny(Reader& r, T& v) {
         v = static_cast<T>(*x);
         return true;
     } else {
+        static_assert(std::is_floating_point_v<T> && (sizeof(T) == 4 || sizeof(T) == 8), "aether: only 32/64-bit floats are serializable");
         const auto x = read<T>(r);   // float, double
         if (!x) return false;
         v = *x;
@@ -197,14 +213,35 @@ template <class T> constexpr std::size_t serializedSize() noexcept {
     }(std::make_index_sequence<std::tuple_size_v<Tup>>{});
 }
 
+// True if T (recursively) has a field whose byte-wise wire form can differ from its raw memory
+// byte -- today just bool, normalized to 0/1 on the wire but any nonzero in memory. Such a type
+// must take the portable per-field path: a memcpy would ship the raw byte (breaking the
+// byte-identical-wire contract) and, on read, could reconstruct a trap-representation bool from
+// hostile input. Recurses into nested aggregates.
+template <class T> constexpr bool hasNonMemcpyField() noexcept;
+namespace detail {
+template <class F> constexpr bool fieldBlocksMemcpy() noexcept {
+    using U = std::remove_cvref_t<F>;
+    if      constexpr (std::is_same_v<U, bool>) return true;
+    else if constexpr (std::is_aggregate_v<U>)  return aether::hasNonMemcpyField<U>();
+    else                                        return false;
+}
+} // namespace detail
+template <class T> constexpr bool hasNonMemcpyField() noexcept {
+    using Tup = decltype(tieFields(std::declval<std::remove_cvref_t<T>&>()));
+    return []<std::size_t... I>(std::index_sequence<I...>) constexpr noexcept {
+        return (detail::fieldBlocksMemcpy<std::tuple_element_t<I, Tup>>() || ... || false);
+    }(std::make_index_sequence<std::tuple_size_v<Tup>>{});
+}
+
 // True when T's byte-wise wire form is bit-identical to its memory image: a trivially copyable
-// aggregate, no padding, on a little-endian target. Only then is one memcpy a valid (and much
-// faster) substitute for the per-field writes -- and the wire stays identical, so a big-endian
-// peer on the portable path still interoperates.
+// aggregate, no padding, no bool (see hasNonMemcpyField), on a little-endian target. Only then is
+// one memcpy a valid (and much faster) substitute for the per-field writes -- and the wire stays
+// identical, so a big-endian peer on the portable path still interoperates.
 template <class T> constexpr bool canMemcpySerialize() noexcept {
     using U = std::remove_cvref_t<T>;
     if constexpr (std::is_trivially_copyable_v<U> && std::is_aggregate_v<U>
-                  && std::endian::native == std::endian::little)
+                  && std::endian::native == std::endian::little && !hasNonMemcpyField<U>())
         return sizeof(U) == serializedSize<U>();
     else
         return false;

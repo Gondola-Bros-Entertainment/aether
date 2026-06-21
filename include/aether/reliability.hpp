@@ -103,6 +103,7 @@ struct SentPacketRecord {
     MonoTime     sendTime{};
     int          size{};
     std::uint8_t nackCount{};
+    bool         countedLost{};   // already recorded a loss sample (fast-retransmit); don't double-count if it later arrives
 };
 struct SentRing { SequenceNum seq{}; SentPacketRecord rec{}; bool occupied{}; };
 struct SentPacketBuffer {
@@ -138,6 +139,7 @@ inline bool spbFindOldest(const SentPacketBuffer& b, SequenceNum& outSeq) noexce
 struct AckResult {
     std::vector<ChannelMsg> acked;
     std::vector<ChannelMsg> fastRetransmit;
+    int                     ackedBytes = 0;   // actual bytes acked this call (drives the congestion window)
 };
 
 struct ReliableEndpoint {
@@ -213,7 +215,7 @@ inline void onPacketsReceived(ReliableEndpoint& ep, const SequenceNum* seqs, std
         rbInsert(ep.received, sn);
         if (newer(sn, ep.remoteSeq)) {
             const int d = sequenceDiff(sn, ep.remoteSeq);
-            ep.ackBits = (d < ackBitsWindow) ? ((ep.ackBits << d) | (std::uint64_t(1) << (d - 1))) : 0;
+            ep.ackBits = (d <= ackBitsWindow) ? ((ep.ackBits << d) | (std::uint64_t(1) << (d - 1))) : 0;
             ep.remoteSeq = sn;
         } else {
             const int d = sequenceDiff(ep.remoteSeq, sn);
@@ -224,8 +226,6 @@ inline void onPacketsReceived(ReliableEndpoint& ep, const SequenceNum* seqs, std
 
 inline AckResult processAcks(ReliableEndpoint& ep, SequenceNum ackSeq, std::uint64_t ackBitsVal, MonoTime now) {
     AckResult result;
-    double rttSum = 0.0;
-    int    rttCnt = 0;
     std::uint64_t bAcked = 0;
     for (int i = 0; i <= ackBitsWindow; ++i) {
         const SequenceNum seq    = (i == 0) ? ackSeq : SequenceNum{ static_cast<std::uint16_t>(ackSeq.value - i) };
@@ -234,23 +234,23 @@ inline AckResult processAcks(ReliableEndpoint& ep, SequenceNum ackSeq, std::uint
         if (!rec) continue;
         if (bitSet) {
             for (std::uint8_t k = 0; k < rec->msgCount; ++k) result.acked.push_back(rec->msgs[k]);
-            rttSum += elapsedMs(rec->sendTime, now);
-            ++rttCnt;
+            updateRtt(ep, elapsedMs(rec->sendTime, now));         // one RTT sample per acked packet (Jacobson/Karels)
             bAcked += static_cast<std::uint64_t>(rec->size);
-            recordLossSample(ep, false);   // one sample per packet: this one arrived
+            if (!rec->countedLost) recordLossSample(ep, false);   // don't double-count a packet already counted lost
             spbDelete(ep.sent, seq);
         } else {
             rec->nackCount = static_cast<std::uint8_t>(std::min(255, rec->nackCount + 1));
             if (rec->nackCount == fastRetransmitThreshold) {   // crosses the loss threshold exactly once
                 recordLossSample(ep, true);                    // ...so packetLossPercent actually moves off zero
+                rec->countedLost = true;
                 ep.totalLost += 1;
                 for (std::uint8_t k = 0; k < rec->msgCount; ++k) result.fastRetransmit.push_back(rec->msgs[k]);
             }
         }
     }
-    if (rttCnt > 0) updateRtt(ep, rttSum / rttCnt);
-    ep.totalAcked += result.acked.size();
-    ep.bytesAcked += bAcked;
+    ep.totalAcked   += result.acked.size();
+    ep.bytesAcked   += bAcked;
+    result.ackedBytes = static_cast<int>(bAcked);
     return result;
 }
 

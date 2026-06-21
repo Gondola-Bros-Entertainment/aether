@@ -79,11 +79,14 @@ inline void cleanupFragments(FragmentAssembler& a, MonoTime now) {
         }
     }
 }
-inline void expireOldestFragment(FragmentAssembler& a) {
+inline bool expireOldestFragment(FragmentAssembler& a) {
     auto oldest = a.buffers.end();
     for (auto it = a.buffers.begin(); it != a.buffers.end(); ++it)
         if (oldest == a.buffers.end() || it->second.createdAt.ns < oldest->second.createdAt.ns) oldest = it;
-    if (oldest != a.buffers.end()) { a.currentSize -= oldest->second.totalSize; a.buffers.erase(oldest); }
+    if (oldest == a.buffers.end()) return false;
+    a.currentSize -= oldest->second.totalSize;
+    a.buffers.erase(oldest);
+    return true;
 }
 
 // Feed one fragment; returns the reassembled message if this fragment completed it.
@@ -99,7 +102,8 @@ inline std::optional<Bytes> processFragment(FragmentAssembler& a, const std::uin
     auto it = a.buffers.find(msgId);
     if (it != a.buffers.end() && it->second.count != hdr->count) return std::nullopt;   // count disagreement
 
-    if (a.currentSize + fragSize > a.maxBufferSize) expireOldestFragment(a);
+    if (fragSize > a.maxBufferSize) return std::nullopt;                               // one fragment larger than the whole cap -> reject
+    while (a.currentSize + fragSize > a.maxBufferSize && expireOldestFragment(a)) {}   // evict oldest until it fits (the cap is enforced, not advisory)
 
     it = a.buffers.find(msgId);
     if (it == a.buffers.end()) {

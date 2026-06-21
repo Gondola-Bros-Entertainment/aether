@@ -7,7 +7,9 @@
 #include "aether/reflect.hpp"
 #include "aether/varint.hpp"
 
+#include <bit>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <tuple>
 #include <type_traits>
@@ -34,6 +36,13 @@ template <class T> bool fieldEqual(const T& a, const T& b) {
         bool eq = true;
         forEachFieldPair(a, b, [&](const auto& x, const auto& y) { if (eq) eq = fieldEqual(x, y); });
         return eq;
+    } else if constexpr (std::is_floating_point_v<T>) {
+        // Compare floats by bit pattern so the changemask is bit-exact with the full path: value
+        // equality would call +0.0 and -0.0 equal (silently dropping a sign flip the receiver
+        // cannot reconstruct) and NaN never-equal (re-sending it every tick).
+        if      constexpr (sizeof(T) == 4) return std::bit_cast<std::uint32_t>(a) == std::bit_cast<std::uint32_t>(b);
+        else if constexpr (sizeof(T) == 8) return std::bit_cast<std::uint64_t>(a) == std::bit_cast<std::uint64_t>(b);
+        else                               return a == b;
     } else {
         return a == b;
     }
@@ -47,7 +56,7 @@ template <class T> void packValue(Writer& w, const T& v) {
     else if constexpr (detail::isStdOptional<T>)    { write(w, static_cast<std::uint8_t>(v ? 1 : 0)); if (v) packValue(w, *v); }
     else if constexpr (std::is_aggregate_v<T>)      forEachField(v, [&](const auto& f) { packValue(w, f); });
     else if constexpr (std::is_same_v<T, bool>)     write(w, static_cast<std::uint8_t>(v ? 1 : 0));
-    else if constexpr (std::is_floating_point_v<T>) write(w, v);                       // varint can't help a float
+    else if constexpr (std::is_floating_point_v<T>) { static_assert(sizeof(T) == 4 || sizeof(T) == 8, "aether: only 32/64-bit floats are serializable"); write(w, v); }   // varint can't help a float
     else {
         static_assert(std::is_integral_v<T>, "packValue: unsupported type");
         if constexpr (std::is_signed_v<T>) writeVarU(w, zigzag(static_cast<std::int64_t>(v)));
@@ -68,10 +77,10 @@ template <class T> bool unpackValue(Reader& r, T& v) {
         return true;
     } else if constexpr (detail::isStdVector<T>) {
         const auto n = readVarU(r);
-        if (!n || *n > r.len - r.pos) return false;   // each element is >= 1 byte, so count <= remaining
+        if (!n || *n > r.len - r.pos) return false;   // each element is >= 1 byte, so count <= remaining bytes
         v.clear();
-        v.resize(static_cast<std::size_t>(*n));
-        for (auto& f : v) if (!unpackValue(r, f)) return false;
+        v.reserve(detail::decodeReserveCount<typename T::value_type>(*n));   // bounded up-front alloc; grow as elements parse
+        for (std::uint64_t k = 0; k < *n; ++k) { typename T::value_type e{}; if (!unpackValue(r, e)) return false; v.push_back(std::move(e)); }
         return true;
     } else if constexpr (detail::isStdOptional<T>) {
         const auto f = read<std::uint8_t>(r);
@@ -89,6 +98,7 @@ template <class T> bool unpackValue(Reader& r, T& v) {
         v = (*b != 0);
         return true;
     } else if constexpr (std::is_floating_point_v<T>) {
+        static_assert(sizeof(T) == 4 || sizeof(T) == 8, "aether: only 32/64-bit floats are serializable");
         const auto x = read<T>(r);
         if (!x) return false;
         v = *x;

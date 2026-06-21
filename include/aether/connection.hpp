@@ -147,12 +147,6 @@ inline PacketHeader createHeaderInternal(const Connection& conn) {
     const auto [ackSeq, ackBits64] = getAckInfo(conn.reliability);
     return PacketHeader{ PacketType::Payload, conn.localSeq, ackSeq, static_cast<std::uint32_t>(ackBits64) };
 }
-inline PacketHeader createHeader(Connection& conn) {
-    const PacketHeader h = createHeaderInternal(conn);
-    conn.localSeq = next(conn.localSeq);
-    return h;
-}
-
 // --- send-queue helpers ---
 inline void sendConnectionRequest(Connection& conn) {
     const PacketHeader header{ PacketType::ConnectionRequest, SequenceNum{ 0 }, SequenceNum{ 0 }, 0 };
@@ -202,9 +196,9 @@ inline Bytes encodeChannelWire(int chIdx, const ChannelMessage& msg) {
 
 // Accumulate a channel-message wire for this tick; flushPendingWires coalesces them into packets.
 inline void enqueuePayload(Connection& conn, bool trackReliable, int chIdx,
-                           const ChannelMessage& msg, const Bytes& wireData) {
+                           SequenceNum seq, const Bytes& wireData) {
     conn.pendingWires.push_back(
-        PendingWire{ wireData, trackReliable, ChannelMsg{ static_cast<ChannelId>(chIdx), msg.sequence } });
+        PendingWire{ wireData, trackReliable, ChannelMsg{ static_cast<ChannelId>(chIdx), seq } });
 }
 
 // Coalesce this tick's accumulated wires into packets: a lone wire stays a plain Payload; several
@@ -241,12 +235,13 @@ inline void flushPendingWires(Connection& conn, MonoTime now) {
                 if (pw.reliable) relMsgs[relCount++] = pw.msg;
             }
         }
+        const int payloadBytes = static_cast<int>(payload.size());   // actual on-wire payload (groupBytes over-counts the lone-message case by the batch framing)
         PacketHeader header = createHeaderInternal(conn);
         header.type = type;
         conn.sendQueue.push_back(OutgoingPacket{ header, type, std::move(payload) });
         if (relCount > 0)
             onPacketSent(conn.reliability, conn.localSeq, now,
-                         std::span<const ChannelMsg>(relMsgs.data(), relCount), groupBytes);
+                         std::span<const ChannelMsg>(relMsgs.data(), relCount), payloadBytes);
         conn.localSeq         = next(conn.localSeq);
         conn.dataSentThisTick = true;
         i += n;
@@ -312,10 +307,9 @@ inline void processIncomingHeader(Connection& conn, const PacketHeader& header, 
     const AckResult     res       = processAcks(conn.reliability, header.ack, ackBits64, now);
 
     if (conn.cwnd) {
-        const bool hasLoss    = !res.fastRetransmit.empty();
-        const int  ackedBytes = static_cast<int>(res.acked.size()) * conn.config.mtu;
-        if (hasLoss)             cwOnLoss(*conn.cwnd);
-        else if (ackedBytes > 0) cwOnAck(*conn.cwnd, ackedBytes);
+        const bool hasLoss = !res.fastRetransmit.empty();
+        if (hasLoss)                 cwOnLoss(*conn.cwnd);
+        else if (res.ackedBytes > 0) cwOnAck(*conn.cwnd, res.ackedBytes);   // actual acked bytes, not msgCount * MTU
     }
     for (const ChannelMsg& m : res.acked) {
         const int idx = toInt(m.channel);
@@ -333,11 +327,12 @@ inline void processIncomingHeader(Connection& conn, const PacketHeader& header, 
 inline void processChannelMessages(Connection& conn, MonoTime now, int chIdx) {
     Channel& channel = conn.channels[static_cast<std::size_t>(chIdx)];
     for (;;) {
-        const auto peek = peekOutgoingMessage(channel);
+        const ChannelMessage* peek = peekOutgoingMessage(channel);
         if (!peek) break;
-        const Bytes wireData   = encodeChannelWire(chIdx, *peek);
-        const int   wireSize   = static_cast<int>(wireData.size());
-        const bool  isReliable = channelIsReliable(channel);
+        const SequenceNum seq        = peek->sequence;                    // capture before commit (which may erase *peek for an unreliable msg)
+        const Bytes       wireData   = encodeChannelWire(chIdx, *peek);   // the one necessary payload copy -- into the framed wire
+        const int         wireSize   = static_cast<int>(wireData.size());
+        const bool        isReliable = channelIsReliable(channel);
         if (!ccCanSend(conn.congestion, 0, wireSize)) break;       // rate gate, by actual message size
 
         // small reliable messages bypass cwnd; otherwise honor the window if present
@@ -346,10 +341,10 @@ inline void processChannelMessages(Connection& conn, MonoTime now, int chIdx) {
                               || (cwCanSend(*conn.cwnd, wireSize) && cwCanSendPaced(*conn.cwnd, now));
         if (!cwndAllows) break;
 
-        commitOutgoingMessage(channel, peek->sequence);
+        commitOutgoingMessage(channel, seq);
         ccDeductBudget(conn.congestion, wireSize);
         if (conn.cwnd) cwOnSend(*conn.cwnd, wireSize, now);
-        enqueuePayload(conn, isReliable, chIdx, *peek, wireData);
+        enqueuePayload(conn, isReliable, chIdx, seq, wireData);   // seq + wireData only; *peek may dangle past the commit
     }
 }
 
@@ -363,13 +358,15 @@ inline void processChannelOutput(Connection& conn, MonoTime now) {
 // Re-send reliable messages whose RTO has elapsed (congestion budget still applies).
 inline void processRetransmissions(Connection& conn, MonoTime now, double rto) {
     for (int chIdx = 0; chIdx < static_cast<int>(conn.channels.size()); ++chIdx) {
-        const std::vector<ChannelMessage> retransmits = getRetransmitMessages(conn.channels[static_cast<std::size_t>(chIdx)], now, rto);
+        Channel& channel = conn.channels[static_cast<std::size_t>(chIdx)];
+        const std::vector<ChannelMessage> retransmits = getRetransmitMessages(channel, now, rto);
         for (const ChannelMessage& msg : retransmits) {
             const Bytes wireData = encodeChannelWire(chIdx, msg);
             const int   wireSize = static_cast<int>(wireData.size());
-            if (!ccCanSend(conn.congestion, 0, wireSize)) break;
+            if (!ccCanSend(conn.congestion, 0, wireSize)) break;   // budget gone -> leave the rest for next tick, state intact
             ccDeductBudget(conn.congestion, wireSize);
-            enqueuePayload(conn, true, chIdx, msg, wireData);
+            commitRetransmit(channel, msg.sequence, now);          // advance send state only now that it is admitted
+            enqueuePayload(conn, true, chIdx, msg.sequence, wireData);
         }
     }
 }

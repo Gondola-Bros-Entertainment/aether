@@ -6,7 +6,6 @@
 #include "aether/types.hpp"
 
 #include <map>
-#include <optional>
 #include <utility>
 #include <vector>
 
@@ -90,14 +89,15 @@ inline SendResult channelSend(Channel& ch, const Bytes& payload, MonoTime now) {
 
 // Peek the next UNSENT message (lowest sequence first), looking PAST in-flight ones so several
 // messages can be in flight at once -- a sliding window, not stop-and-wait (one per RTT). Cleans
-// acked entries out. Does not consume; commitOutgoingMessage(seq) consumes the peeked message.
-inline std::optional<ChannelMessage> peekOutgoingMessage(Channel& ch) {
+// acked entries out. Returns a pointer INTO the send buffer (no payload copy); it is valid only
+// until the buffer is next mutated, so read it before commitOutgoingMessage(seq), which consumes it.
+inline const ChannelMessage* peekOutgoingMessage(Channel& ch) {
     for (auto it = ch.sendBuffer.begin(); it != ch.sendBuffer.end(); ) {
         if (it->second.acked)           { it = ch.sendBuffer.erase(it); continue; }
-        if (it->second.retryCount == 0) return it->second;   // first not-yet-sent message
-        ++it;                                                // in flight, awaiting ack -> look past it
+        if (it->second.retryCount == 0) return &it->second;   // first not-yet-sent message
+        ++it;                                                 // in flight, awaiting ack -> look past it
     }
-    return std::nullopt;
+    return nullptr;
 }
 // Consume the message peekOutgoingMessage returned (by sequence): reliable -> mark sent (retry 1,
 // kept for retransmit), unreliable -> remove (fire and forget).
@@ -108,7 +108,10 @@ inline void commitOutgoingMessage(Channel& ch, SequenceNum seq) {
     else                     ch.sendBuffer.erase(it);
 }
 
-// Reliable messages whose RTO has elapsed; drops ones past the retry limit.
+// Reliable messages whose RTO has elapsed (or that were flagged for fast-retransmit). Returns
+// CANDIDATES only -- send state advances in commitRetransmit, called once a candidate is actually
+// admitted past the congestion budget, so a budget-blocked retransmit does not burn a retry or
+// reset its RTO. Messages past the retry limit are dropped here (that is not budget-gated).
 inline std::vector<ChannelMessage> getRetransmitMessages(Channel& ch, MonoTime now, double rtoMs) {
     std::vector<ChannelMessage> out;
     if (!isReliable(ch.config.deliveryMode)) return out;
@@ -116,17 +119,20 @@ inline std::vector<ChannelMessage> getRetransmitMessages(Channel& ch, MonoTime n
         ChannelMessage& msg = it->second;
         if (msg.acked || msg.retryCount == 0) { ++it; continue; }
         if (msg.retryCount > ch.config.maxReliableRetries) { it = ch.sendBuffer.erase(it); ch.totalDropped += 1; continue; }
-        if (msg.forceRetransmit || elapsedMs(msg.sendTime, now) >= rtoMs) {
-            msg.forceRetransmit = false;
-            const ChannelMessage resend = msg;
-            msg.sendTime = now;
-            msg.retryCount += 1;
-            ch.totalRetransmits += 1;
-            out.push_back(resend);
-        }
+        if (msg.forceRetransmit || elapsedMs(msg.sendTime, now) >= rtoMs) out.push_back(msg);
         ++it;
     }
     return out;
+}
+// Commit a retransmit that was actually admitted (enqueued past the budget): advance its send time
+// and retry count and clear the fast-retransmit flag. Mirrors the peek/commit split for fresh sends.
+inline void commitRetransmit(Channel& ch, SequenceNum seq, MonoTime now) {
+    auto it = ch.sendBuffer.find(seq);
+    if (it == ch.sendBuffer.end() || it->second.acked || it->second.retryCount == 0) return;
+    it->second.forceRetransmit = false;
+    it->second.sendTime        = now;
+    it->second.retryCount     += 1;
+    ch.totalRetransmits        += 1;
 }
 
 // Mark a specific in-flight message for immediate retransmit (fast-retransmit on a triple-NACK): the
