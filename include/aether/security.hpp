@@ -130,13 +130,10 @@ inline bool rateLimiterAllow(RateLimiter& rl, std::uint64_t addrKey, MonoTime no
 // opens it with K (validateConnectToken) to learn the verified player id. Sealing is
 // ChaCha20-Poly1305, so only a key-holder can mint a token and any tampering is detected. aether
 // stays auth-provider-agnostic: the provider only ever touches your backend's seal step.
-inline constexpr std::uint32_t connectTokenDomain     = 0x544f4b4eu;   // "TOKN": AEAD domain for the seal
-inline constexpr std::size_t   connectTokenNonceBytes = 12;            // 96-bit random nonce (IETF ChaCha20-Poly1305 width)
-// Domain bytes bound as AEAD AAD, so a token sealed for this purpose cannot be confused with other
-// ciphertext minted under the same key.
-inline constexpr std::array<std::uint8_t, 4> connectTokenDomainBytes = {
-    std::uint8_t((connectTokenDomain >> 24) & 0xFFu), std::uint8_t((connectTokenDomain >> 16) & 0xFFu),
-    std::uint8_t((connectTokenDomain >> 8) & 0xFFu),  std::uint8_t(connectTokenDomain & 0xFFu) };
+inline constexpr std::size_t connectTokenNonceBytes = 12;   // 96-bit random nonce (IETF ChaCha20-Poly1305 width)
+// "TOKN" -- the domain separator, bound as AEAD AAD so a token sealed for this purpose cannot be
+// confused with other ciphertext minted under the same key.
+inline constexpr std::array<std::uint8_t, 4> connectTokenDomainBytes = { 'T', 'O', 'K', 'N' };
 using TokenNonce = std::array<std::uint8_t, connectTokenNonceBytes>;
 
 struct ConnectToken {
