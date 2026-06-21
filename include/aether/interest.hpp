@@ -33,13 +33,19 @@ struct GridInterest { float cellSize = 0.0f; float invCellSize = 0.0f; };
 inline GridInterest newGridInterest(float cellSize) { return { cellSize, cellSize > 0.0f ? 1.0f / cellSize : 0.0f }; }
 inline float gridInterestCellSize(const GridInterest& gi) noexcept { return gi.cellSize; }
 
+namespace detail {
+// floor(coord * invCellSize) as an int, total for every float input: a NaN, +/-inf, or out-of-int-
+// range product maps to the origin cell (0) instead of an undefined float->int cast. Game positions
+// can go non-finite after a physics blowup, so this stays defined rather than UB.
+inline int cellIndex(float coord, float invCellSize) noexcept {
+    const float c = std::floor(coord * invCellSize);
+    return (c >= -2.0e9f && c <= 2.0e9f) ? static_cast<int>(c) : 0;   // the comparison is false for NaN/inf -> 0
+}
+} // namespace detail
+
 inline bool relevant(const GridInterest& gi, Position entity, Position observer) noexcept {
-    const int ex = static_cast<int>(std::floor(entity.x * gi.invCellSize));
-    const int ey = static_cast<int>(std::floor(entity.y * gi.invCellSize));
-    const int ez = static_cast<int>(std::floor(entity.z * gi.invCellSize));
-    const int ox = static_cast<int>(std::floor(observer.x * gi.invCellSize));
-    const int oy = static_cast<int>(std::floor(observer.y * gi.invCellSize));
-    const int oz = static_cast<int>(std::floor(observer.z * gi.invCellSize));
+    const int ex = detail::cellIndex(entity.x, gi.invCellSize),   ey = detail::cellIndex(entity.y, gi.invCellSize),   ez = detail::cellIndex(entity.z, gi.invCellSize);
+    const int ox = detail::cellIndex(observer.x, gi.invCellSize), oy = detail::cellIndex(observer.y, gi.invCellSize), oz = detail::cellIndex(observer.z, gi.invCellSize);
     return std::abs(ex - ox) <= 1 && std::abs(ey - oy) <= 1 && std::abs(ez - oz) <= 1;
 }
 inline float priorityMod(const GridInterest&, Position, Position) noexcept { return 1.0f; }

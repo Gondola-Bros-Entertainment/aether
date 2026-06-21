@@ -38,10 +38,12 @@ struct FragmentResult { std::vector<Bytes> fragments; bool tooMany{}; };
 inline FragmentResult fragmentMessage(MessageId id, const std::uint8_t* data, std::size_t len, int maxPayload) {
     FragmentResult r;
     if (len == 0 || maxPayload <= 0) return r;
-    const int count = static_cast<int>((len + static_cast<std::size_t>(maxPayload) - 1) / static_cast<std::size_t>(maxPayload));
-    if (count > maxFragmentCount) { r.tooMany = true; return r; }
-    for (int i = 0; i < count; ++i) {
-        const std::size_t start = static_cast<std::size_t>(i) * static_cast<std::size_t>(maxPayload);
+    // Compute and range-check in size_t BEFORE narrowing: a >2GiB len would otherwise overflow the
+    // int cast (e.g. wrap to 0) and slip past the maxFragmentCount guard, silently dropping the message.
+    const std::size_t count = (len + static_cast<std::size_t>(maxPayload) - 1) / static_cast<std::size_t>(maxPayload);
+    if (count > static_cast<std::size_t>(maxFragmentCount)) { r.tooMany = true; return r; }
+    for (std::size_t i = 0; i < count; ++i) {           // count <= 255 here, so the uint8_t index/count casts below are exact
+        const std::size_t start = i * static_cast<std::size_t>(maxPayload);
         const std::size_t end   = std::min(start + static_cast<std::size_t>(maxPayload), len);
         Bytes frag(static_cast<std::size_t>(fragmentHeaderSize) + (end - start));
         writeFragmentHeader(frag.data(), FragmentHeader{ id, static_cast<std::uint8_t>(i), static_cast<std::uint8_t>(count) });
@@ -56,14 +58,14 @@ struct FragmentBuffer {
     std::map<std::uint8_t, Bytes> fragments;
     std::uint8_t count{};
     MonoTime     createdAt{};
-    int          totalSize{};
+    std::size_t  totalSize{};   // size_t so the running total cannot overflow at a large cap
 };
 struct FragmentAssembler {
     std::map<MessageId, FragmentBuffer> buffers;
-    double timeoutMs{};
-    int    maxBufferSize{};   // cap on total buffered fragment bytes
-    int    maxBuffers{};      // cap on concurrent in-flight messages (distinct message ids)
-    int    currentSize{};
+    double      timeoutMs{};
+    int         maxBufferSize{};   // cap on total buffered fragment bytes
+    int         maxBuffers{};      // cap on concurrent in-flight messages (distinct message ids)
+    std::size_t currentSize{};
 };
 inline FragmentAssembler newFragmentAssembler(double timeoutMs, int maxSize, int maxBuffers) {
     return { {}, timeoutMs, maxSize, maxBuffers, 0 };
@@ -96,14 +98,15 @@ inline std::optional<Bytes> processFragment(FragmentAssembler& a, const std::uin
     if (!hdr) return std::nullopt;
     if (hdr->count == 0) return std::nullopt;   // a 0-fragment message can never complete -- never buffer it
     const std::uint8_t* fragData = data + fragmentHeaderSize;
-    const int           fragSize = static_cast<int>(len - static_cast<std::size_t>(fragmentHeaderSize));
+    const std::size_t   fragSize = len - static_cast<std::size_t>(fragmentHeaderSize);   // len >= fragmentHeaderSize (readFragmentHeader checked)
     const MessageId     msgId    = hdr->messageId;
 
     auto it = a.buffers.find(msgId);
     if (it != a.buffers.end() && it->second.count != hdr->count) return std::nullopt;   // count disagreement
 
-    if (fragSize > a.maxBufferSize) return std::nullopt;                               // one fragment larger than the whole cap -> reject
-    while (a.currentSize + fragSize > a.maxBufferSize && expireOldestFragment(a)) {}   // evict oldest until it fits (the cap is enforced, not advisory)
+    const std::size_t cap = static_cast<std::size_t>(a.maxBufferSize);                 // maxBufferSize > 0 (validateConfig)
+    if (fragSize > cap) return std::nullopt;                                           // one fragment larger than the whole cap -> reject
+    while (a.currentSize + fragSize > cap && expireOldestFragment(a)) {}               // evict oldest until it fits (the cap is enforced, not advisory)
 
     it = a.buffers.find(msgId);
     if (it == a.buffers.end()) {

@@ -15,7 +15,10 @@ namespace aether {
 struct PriorityEntry { float base = 0.0f; float accumulated = 0.0f; };
 
 template <class Id>
-struct PriorityAccumulator { std::map<Id, PriorityEntry> entries; };
+struct PriorityAccumulator {
+    std::map<Id, PriorityEntry>                      entries;
+    std::vector<std::pair<const Id, PriorityEntry>*> scratch;   // reused by priorityDrainTop (rebuilt per call); avoids a per-tick alloc
+};
 
 // Register an entity with a base priority (units/sec accumulated each tick).
 template <class Id> void priorityRegister(PriorityAccumulator<Id>& pa, const Id& id, float basePriority) {
@@ -36,22 +39,20 @@ template <class Id> void priorityApplyModifier(PriorityAccumulator<Id>& pa, cons
 // priority order; resets the selected entities' accumulated priority.
 template <class Id, class SizeFn>
 std::vector<Id> priorityDrainTop(PriorityAccumulator<Id>& pa, int budgetBytes, SizeFn sizeFunc) {
-    std::vector<std::pair<Id, float>> sorted;
-    sorted.reserve(pa.entries.size());
-    for (const auto& [id, e] : pa.entries) sorted.emplace_back(id, e.accumulated);
-    std::stable_sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    pa.scratch.clear();                                        // reused buffer -> no per-call allocation
+    for (auto& kv : pa.entries) pa.scratch.push_back(&kv);     // pointers into entries, no Id copy
+    std::stable_sort(pa.scratch.begin(), pa.scratch.end(),
+                     [](const auto* a, const auto* b) { return a->second.accumulated > b->second.accumulated; });
 
     std::vector<Id> selected;
     int remaining = budgetBytes;
-    for (const auto& [id, prio] : sorted) {
-        (void)prio;
-        const int size = sizeFunc(id);
-        if (size > remaining) continue;     // skip; a smaller later entity may still fit
+    for (auto* kv : pa.scratch) {
+        const int size = sizeFunc(kv->first);
+        if (size > remaining) continue;          // skip; a smaller later entity may still fit
         remaining -= size;
-        selected.push_back(id);
+        selected.push_back(kv->first);
+        kv->second.accumulated = 0.0f;           // reset through the pointer -- no second find
     }
-    for (const Id& id : selected)
-        if (const auto it = pa.entries.find(id); it != pa.entries.end()) it->second.accumulated = 0.0f;
     return selected;
 }
 

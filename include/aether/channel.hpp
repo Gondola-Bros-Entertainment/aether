@@ -5,6 +5,9 @@
 
 #include "aether/types.hpp"
 
+#include <array>
+#include <bit>
+#include <cstdint>
 #include <map>
 #include <utility>
 #include <vector>
@@ -24,12 +27,13 @@ inline bool isOrdered(DeliveryMode m)   { return m == DeliveryMode::ReliableOrde
 
 struct ChannelConfig {
     DeliveryMode deliveryMode         = DeliveryMode::ReliableOrdered;
-    int          maxMessageSize       = 1024;
+    int          maxMessageSize       = 1024;   // a message over the MTU is fragmented; ceiling ~maxFragmentCount*chunk (~295KB at a 1200 MTU)
     int          messageBufferSize    = 256;
     bool         blockOnFull          = false;
     double       orderedBufferTimeout = 5000.0;
     int          maxOrderedBufferSize = 64;
     int          maxReliableRetries   = 10;
+    int          maxReceiveBufferSize = 8192;   // cap on undrained delivered messages (+ pending acks): a memory shield against an app that stops draining
     std::uint8_t priority             = 0;
 };
 inline ChannelConfig unreliableChannel()        { return { .deliveryMode = DeliveryMode::Unreliable        }; }
@@ -44,6 +48,8 @@ struct ChannelMessage {
     int         retryCount      = 0;
     bool        reliable        = false;
     bool        forceRetransmit = false;   // set by a triple-NACK: resend on the next pass, ignoring the RTO
+    std::uint8_t                 fragmentCount = 0;   // 0/1 == sent in one packet; >1 == split into this many fragments
+    std::array<std::uint64_t, 4> fragAckBits{};       // which fragments are acked (256-bit, matches maxFragmentCount 255); message acked when all set
 };
 
 enum class ChannelError { None, BufferFull, MessageTooLarge };
@@ -149,38 +155,52 @@ inline void deliverOrdered(Channel& ch, const Bytes& payload);
 inline void bufferOrdered(Channel& ch, SequenceNum seq, const Bytes& payload, MonoTime now);
 inline void flushOrderedBuffer(Channel& ch);
 
+// Buffer a delivered message, capped at maxReceiveBufferSize so an app that stops draining cannot grow
+// the receive buffer without bound. When full the incoming message is dropped (the already-buffered,
+// in-order-for-ordered-channels backlog is kept) -- a last-resort memory shield, not normal-path loss.
+inline void pushReceived(Channel& ch, const Bytes& payload) {
+    if (static_cast<int>(ch.receiveBuffer.size()) >= ch.config.maxReceiveBufferSize) { ch.totalDropped += 1; return; }
+    ch.receiveBuffer.push_back(payload);
+    ch.totalReceived += 1;
+}
+inline void pushPendingAck(Channel& ch, SequenceNum seq) {
+    if (static_cast<int>(ch.pendingAck.size()) >= ch.config.maxReceiveBufferSize) return;   // same bound; pending acks are drained via takePendingAcks
+    ch.pendingAck.push_back(seq);
+}
+
 inline void onMessageReceived(Channel& ch, SequenceNum seq, const Bytes& payload, MonoTime now) {
+    // Enforce the channel's size contract on RECEIVE too, not just send: a peer (or a reassembled
+    // fragment stream) can present a payload far larger than maxMessageSize, and buffering it would
+    // bypass the cap the channel declared. A legitimately-sent message is always within the bound.
+    if (static_cast<int>(payload.size()) > ch.config.maxMessageSize) { ch.totalDropped += 1; return; }
     switch (ch.config.deliveryMode) {
         case DeliveryMode::Unreliable:
-            ch.receiveBuffer.push_back(payload);
-            ch.totalReceived += 1;
+            pushReceived(ch, payload);
             break;
         case DeliveryMode::UnreliableSequenced:
-            if (newer(seq, ch.remoteSeq)) { ch.receiveBuffer.push_back(payload); ch.remoteSeq = seq; ch.totalReceived += 1; }
+            if (newer(seq, ch.remoteSeq)) { pushReceived(ch, payload); ch.remoteSeq = seq; }
             else                          { ch.totalDropped += 1; }
             break;
         case DeliveryMode::ReliableUnordered:
-            ch.receiveBuffer.push_back(payload);
-            ch.pendingAck.push_back(seq);
-            ch.totalReceived += 1;
+            pushReceived(ch, payload);
+            pushPendingAck(ch, seq);
             break;
         case DeliveryMode::ReliableOrdered:
-            ch.pendingAck.push_back(seq);
+            pushPendingAck(ch, seq);
             if (seq == ch.orderedExpected) deliverOrdered(ch, payload);
             else                           bufferOrdered(ch, seq, payload, now);
             break;
         case DeliveryMode::ReliableSequenced:
-            ch.pendingAck.push_back(seq);
-            if (newer(seq, ch.remoteSeq)) { ch.receiveBuffer.push_back(payload); ch.remoteSeq = seq; ch.totalReceived += 1; }
+            pushPendingAck(ch, seq);
+            if (newer(seq, ch.remoteSeq)) { pushReceived(ch, payload); ch.remoteSeq = seq; }
             else                          { ch.totalDropped += 1; }
             break;
     }
 }
 
 inline void deliverOrdered(Channel& ch, const Bytes& payload) {
-    ch.receiveBuffer.push_back(payload);
+    pushReceived(ch, payload);
     ch.orderedExpected = next(ch.orderedExpected);
-    ch.totalReceived += 1;
     flushOrderedBuffer(ch);
 }
 inline void bufferOrdered(Channel& ch, SequenceNum seq, const Bytes& payload, MonoTime now) {
@@ -191,16 +211,28 @@ inline void flushOrderedBuffer(Channel& ch) {
     for (;;) {
         auto it = ch.orderedBuffer.find(ch.orderedExpected);
         if (it == ch.orderedBuffer.end()) break;
-        ch.receiveBuffer.push_back(it->second.first);
+        pushReceived(ch, it->second.first);
         ch.orderedBuffer.erase(it);
         ch.orderedExpected = next(ch.orderedExpected);
-        ch.totalReceived += 1;
     }
 }
 
-inline void acknowledgeMessage(Channel& ch, SequenceNum seq) {
+// Ack one fragment of a message (fragIndex 0 for an unfragmented message). A fragmented message is
+// only fully acked -- and so stops retransmitting -- once every fragment has been acked.
+inline void acknowledgeMessage(Channel& ch, SequenceNum seq, std::uint8_t fragIndex = 0) {
     auto it = ch.sendBuffer.find(seq);
-    if (it != ch.sendBuffer.end()) it->second.acked = true;
+    if (it == ch.sendBuffer.end()) return;
+    ChannelMessage& m = it->second;
+    if (m.fragmentCount <= 1) { m.acked = true; return; }
+    m.fragAckBits[fragIndex >> 6] |= (std::uint64_t{ 1 } << (fragIndex & 63));   // dedups a retransmitted fragment's repeat ack
+    int seen = 0;
+    for (const std::uint64_t w : m.fragAckBits) seen += std::popcount(w);
+    if (seen >= m.fragmentCount) m.acked = true;
+}
+// Record that a message was split into `count` fragments (set right after it is first committed).
+inline void setMessageFragmentCount(Channel& ch, SequenceNum seq, std::uint8_t count) noexcept {
+    auto it = ch.sendBuffer.find(seq);
+    if (it != ch.sendBuffer.end()) it->second.fragmentCount = count;
 }
 
 inline std::vector<Bytes> channelReceive(Channel& ch) {
@@ -227,9 +259,8 @@ inline void flushTimedOutOrdered(Channel& ch, MonoTime now) {
     bool        anyFlushed = false;
     for (auto it = ch.orderedBuffer.begin(); it != ch.orderedBuffer.end(); ) {
         if (elapsedMs(it->second.second, now) >= timeout) {
-            ch.receiveBuffer.push_back(it->second.first);
-            ch.totalReceived += 1;
-            if (!anyFlushed || maxFlushed < it->first) { maxFlushed = it->first; anyFlushed = true; }
+            pushReceived(ch, it->second.first);
+            if (!anyFlushed || newer(it->first, maxFlushed)) { maxFlushed = it->first; anyFlushed = true; }   // wrap-aware max, not raw <
             it = ch.orderedBuffer.erase(it);
         } else {
             ++it;

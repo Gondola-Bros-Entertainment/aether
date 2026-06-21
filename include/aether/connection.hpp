@@ -9,6 +9,7 @@
 #include "aether/config.hpp"
 #include "aether/congestion.hpp"
 #include "aether/crypto.hpp"
+#include "aether/fragment.hpp"
 #include "aether/packet.hpp"
 #include "aether/reliability.hpp"
 #include "aether/stats.hpp"
@@ -30,6 +31,8 @@ inline constexpr int          timeSyncPingBytes       = 8;      // TimeSyncPing 
 inline constexpr int          timeSyncPongBytes       = 16;     // TimeSyncPong payload: [u64 echoed ns][u64 responder ns]
 inline constexpr std::uint8_t channelWireFragmentFlag = 0x80;   // channel byte high bit: this wire is a fragment
 inline constexpr std::uint8_t channelWireChannelMask  = 0x07;   // channel byte low 3 bits: channel id (<= 8 channels)
+// channelWireSeqBytes / packetWireOverhead / effectivePayloadBudget / maxFragmentChunk are single-sourced
+// in config.hpp (MTU-derived sizing; validateConfig uses them to reject an unfragmentable maxMessageSize).
 
 enum class ConnectionState { Disconnected, Connecting, Connected, Disconnecting };
 
@@ -182,37 +185,76 @@ inline void sendTimeSyncPong(Connection& conn, std::uint64_t echoNs, MonoTime no
     conn.localSeq = next(conn.localSeq);
 }
 
-// Wire form of a channel message: [channel:3 bits | reserved:5][seqHi][seqLo][payload].
-inline Bytes encodeChannelWire(int chIdx, const ChannelMessage& msg) {
+// The inner wire of a channel message: [seqHi][seqLo][payload] -- the exact bytes the receiver
+// reassembles. An unfragmented message carries all of this after its channel byte; a fragment
+// carries a slice, and the peer's reassembler rejoins them back into this before decoding the seq.
+inline Bytes encodeChannelInner(const ChannelMessage& msg) {
     const std::uint16_t seqRaw = msg.sequence.value;
+    Bytes inner;
+    inner.reserve(static_cast<std::size_t>(channelWireSeqBytes) + msg.data.size());
+    inner.push_back(static_cast<std::uint8_t>(seqRaw >> 8));
+    inner.push_back(static_cast<std::uint8_t>(seqRaw & 0xFF));
+    inner.insert(inner.end(), msg.data.begin(), msg.data.end());
+    return inner;
+}
+// Wire form of a whole (unfragmented) channel message: [channel:3 bits | reserved:5][seqHi][seqLo][payload].
+inline Bytes encodeChannelWire(int chIdx, const ChannelMessage& msg) {
     Bytes wire;
-    wire.reserve(3 + msg.data.size());
+    wire.reserve(1 + static_cast<std::size_t>(channelWireSeqBytes) + msg.data.size());
     wire.push_back(static_cast<std::uint8_t>(chIdx & channelWireChannelMask));
-    wire.push_back(static_cast<std::uint8_t>(seqRaw >> 8));
-    wire.push_back(static_cast<std::uint8_t>(seqRaw & 0xFF));
-    wire.insert(wire.end(), msg.data.begin(), msg.data.end());
+    const Bytes inner = encodeChannelInner(msg);
+    wire.insert(wire.end(), inner.begin(), inner.end());
     return wire;
+}
+
+// One channel message rendered to the wire: a single wire if it fits a datagram, else N fragment
+// wires ([channel byte | fragment flag][fragment header][chunk]). ok is false only if the message is
+// too large even to fragment (> maxFragmentCount chunks); fragmentCount > 1 marks a fragmented send.
+struct MessageWires { std::vector<Bytes> wires; std::uint8_t fragmentCount = 0; bool ok = true; };
+inline MessageWires buildMessageWires(const NetworkConfig& cfg, int chIdx, const ChannelMessage& msg) {
+    MessageWires out;
+    const Bytes inner = encodeChannelInner(msg);
+    const int   chunk = maxFragmentChunk(cfg);
+    if (chunk <= 0 || static_cast<int>(inner.size()) <= chunk) {   // fits one datagram -> one plain wire
+        out.wires.push_back(encodeChannelWire(chIdx, msg));
+        return out;
+    }
+    const MessageId      msgId{ (static_cast<std::uint32_t>(chIdx) << 16) | msg.sequence.value };   // unique per (channel, seq) for the peer's assembler
+    const FragmentResult fr = fragmentMessage(msgId, inner.data(), inner.size(), chunk);
+    // ok=false only when a message exceeds the fragmentable ceiling (> maxFragmentCount fragments, i.e.
+    // ~295KB at a 1200 MTU). validateConfig rejects a maxMessageSize past maxFragmentableMessage, so for a
+    // validated config this is unreachable -- it stays a defensive backstop for a NetPeer built bypassing it.
+    if (fr.tooMany || fr.fragments.empty()) { out.ok = false; return out; }
+    out.fragmentCount = static_cast<std::uint8_t>(fr.fragments.size());
+    for (const Bytes& f : fr.fragments) {
+        Bytes wire;
+        wire.reserve(1 + f.size());
+        wire.push_back(static_cast<std::uint8_t>((chIdx & channelWireChannelMask) | channelWireFragmentFlag));
+        wire.insert(wire.end(), f.begin(), f.end());
+        out.wires.push_back(std::move(wire));
+    }
+    return out;
 }
 
 // Accumulate a channel-message wire for this tick; flushPendingWires coalesces them into packets.
 inline void enqueuePayload(Connection& conn, bool trackReliable, int chIdx,
-                           SequenceNum seq, const Bytes& wireData) {
+                           SequenceNum seq, std::uint8_t fragIndex, Bytes wireData) {
     conn.pendingWires.push_back(
-        PendingWire{ wireData, trackReliable, ChannelMsg{ static_cast<ChannelId>(chIdx), seq } });
+        PendingWire{ std::move(wireData), trackReliable, ChannelMsg{ static_cast<ChannelId>(chIdx), seq, fragIndex } });
 }
 
 // Coalesce this tick's accumulated wires into packets: a lone wire stays a plain Payload; several
 // become one PayloadBatch ([u8 count][u16 len][wire]...). Each packet gets one sequence, and every
 // reliable message it carries is registered under that sequence.
 inline void flushPendingWires(Connection& conn, MonoTime now) {
-    const int   mtu = conn.config.mtu;
-    std::size_t i   = 0;
+    const int   budget = effectivePayloadBudget(conn.config);   // payload room left once header+AEAD+CRC are added to the datagram
+    std::size_t i      = 0;
     while (i < conn.pendingWires.size()) {
         std::size_t n          = 0;
         int         groupBytes = batchHeaderSize;
         while (i + n < conn.pendingWires.size() && n < maxMsgsPerPacket) {
             const int add = batchLengthSize + static_cast<int>(conn.pendingWires[i + n].wire.size());
-            if (n > 0 && groupBytes + add > mtu) break;   // keep within the MTU (always take >= 1)
+            if (n > 0 && groupBytes + add > budget) break;   // keep the datagram within the MTU (always take >= 1)
             groupBytes += add;
             ++n;
         }
@@ -222,8 +264,8 @@ inline void flushPendingWires(Connection& conn, MonoTime now) {
         PacketType   type;
         if (n == 1) {
             type    = PacketType::Payload;
-            payload = conn.pendingWires[i].wire;
             if (conn.pendingWires[i].reliable) relMsgs[relCount++] = conn.pendingWires[i].msg;
+            payload = std::move(conn.pendingWires[i].wire);   // pendingWires is cleared at the end; no copy needed
         } else {
             type = PacketType::PayloadBatch;
             payload.push_back(static_cast<std::uint8_t>(n));
@@ -314,7 +356,7 @@ inline void processIncomingHeader(Connection& conn, const PacketHeader& header, 
     for (const ChannelMsg& m : res.acked) {
         const int idx = toInt(m.channel);
         if (idx >= 0 && idx < static_cast<int>(conn.channels.size()))
-            acknowledgeMessage(conn.channels[static_cast<std::size_t>(idx)], m.seq);
+            acknowledgeMessage(conn.channels[static_cast<std::size_t>(idx)], m.seq, m.fragIndex);
     }
     for (const ChannelMsg& m : res.fastRetransmit) {   // triple-NACKed -> resend without waiting out the RTO
         const int idx = toInt(m.channel);
@@ -329,22 +371,26 @@ inline void processChannelMessages(Connection& conn, MonoTime now, int chIdx) {
     for (;;) {
         const ChannelMessage* peek = peekOutgoingMessage(channel);
         if (!peek) break;
-        const SequenceNum seq        = peek->sequence;                    // capture before commit (which may erase *peek for an unreliable msg)
-        const Bytes       wireData   = encodeChannelWire(chIdx, *peek);   // the one necessary payload copy -- into the framed wire
-        const int         wireSize   = static_cast<int>(wireData.size());
+        const SequenceNum seq        = peek->sequence;                                // capture before commit (which may erase *peek for an unreliable msg)
         const bool        isReliable = channelIsReliable(channel);
-        if (!ccCanSend(conn.congestion, 0, wireSize)) break;       // rate gate, by actual message size
+        MessageWires      mw         = buildMessageWires(conn.config, chIdx, *peek);   // render now -- *peek may dangle past the commit below
+        if (!mw.ok) { commitOutgoingMessage(channel, seq); channel.totalDropped += 1; continue; }   // beyond the fragmentable ceiling (see buildMessageWires): consume + count, never stall
+        int totalSize = 0;
+        for (const Bytes& w : mw.wires) totalSize += static_cast<int>(w.size());
+        if (!ccCanSend(conn.congestion, 0, totalSize)) break;       // rate gate, by the message's total on-wire size
 
         // small reliable messages bypass cwnd; otherwise honor the window if present
-        const bool cwndAllows = (isReliable && wireSize <= smallReliableThreshold)
+        const bool cwndAllows = (isReliable && totalSize <= smallReliableThreshold)
                               || !conn.cwnd
-                              || (cwCanSend(*conn.cwnd, wireSize) && cwCanSendPaced(*conn.cwnd, now));
+                              || (cwCanSend(*conn.cwnd, totalSize) && cwCanSendPaced(*conn.cwnd, now));
         if (!cwndAllows) break;
 
         commitOutgoingMessage(channel, seq);
-        ccDeductBudget(conn.congestion, wireSize);
-        if (conn.cwnd) cwOnSend(*conn.cwnd, wireSize, now);
-        enqueuePayload(conn, isReliable, chIdx, seq, wireData);   // seq + wireData only; *peek may dangle past the commit
+        if (mw.fragmentCount > 1) setMessageFragmentCount(channel, seq, mw.fragmentCount);   // reliable: ack only once every fragment lands
+        ccDeductBudget(conn.congestion, totalSize);
+        if (conn.cwnd) cwOnSend(*conn.cwnd, totalSize, now);
+        for (std::size_t k = 0; k < mw.wires.size(); ++k)
+            enqueuePayload(conn, isReliable, chIdx, seq, static_cast<std::uint8_t>(k), std::move(mw.wires[k]));
     }
 }
 
@@ -361,12 +407,15 @@ inline void processRetransmissions(Connection& conn, MonoTime now, double rto) {
         Channel& channel = conn.channels[static_cast<std::size_t>(chIdx)];
         const std::vector<ChannelMessage> retransmits = getRetransmitMessages(channel, now, rto);
         for (const ChannelMessage& msg : retransmits) {
-            const Bytes wireData = encodeChannelWire(chIdx, msg);
-            const int   wireSize = static_cast<int>(wireData.size());
-            if (!ccCanSend(conn.congestion, 0, wireSize)) break;   // budget gone -> leave the rest for next tick, state intact
-            ccDeductBudget(conn.congestion, wireSize);
-            commitRetransmit(channel, msg.sequence, now);          // advance send state only now that it is admitted
-            enqueuePayload(conn, true, chIdx, msg.sequence, wireData);
+            MessageWires mw = buildMessageWires(conn.config, chIdx, msg);   // re-fragment identically; the peer dedups any fragment it already has
+            if (!mw.ok) continue;
+            int totalSize = 0;
+            for (const Bytes& w : mw.wires) totalSize += static_cast<int>(w.size());
+            if (!ccCanSend(conn.congestion, 0, totalSize)) break;   // budget gone -> leave the rest for next tick, state intact
+            ccDeductBudget(conn.congestion, totalSize);
+            commitRetransmit(channel, msg.sequence, now);           // advance send state only now that it is admitted
+            for (std::size_t k = 0; k < mw.wires.size(); ++k)
+                enqueuePayload(conn, true, chIdx, msg.sequence, static_cast<std::uint8_t>(k), std::move(mw.wires[k]));
         }
     }
 }

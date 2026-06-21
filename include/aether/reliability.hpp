@@ -96,7 +96,9 @@ inline void rbInsert(ReceivedBuffer& b, SequenceNum s) noexcept {
 // --- sent-packet ring buffer (ack processing + RTT) ---
 // A reliable channel message (channel + its per-channel sequence). Defined here because the sent
 // record stores a list of them: one packet can carry several once coalesced.
-struct ChannelMsg { ChannelId channel{}; SequenceNum seq{}; };
+// A reliable channel message reference. fragIndex is 0 for an unfragmented message; for a fragmented
+// one it is which fragment this packet carried, so the channel acks each fragment independently.
+struct ChannelMsg { ChannelId channel{}; SequenceNum seq{}; std::uint8_t fragIndex{}; };
 struct SentPacketRecord {
     std::array<ChannelMsg, maxMsgsPerPacket> msgs{};
     std::uint8_t msgCount{};

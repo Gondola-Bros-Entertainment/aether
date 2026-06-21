@@ -57,7 +57,10 @@ struct Reader {
     std::size_t         pos{};
 };
 
-inline bool has(const Reader& r, std::size_t n) noexcept { return r.pos + n <= r.len; }
+// Overflow-proof: r.pos <= r.len is an invariant (every advance is bounds-checked first), so the
+// subtraction never underflows -- and `n <= remaining` cannot wrap the way `r.pos + n <= r.len`
+// would for an attacker-supplied n near SIZE_MAX (which would falsely pass, then over-read).
+inline bool has(const Reader& r, std::size_t n) noexcept { return n <= r.len - r.pos; }
 
 template <class T>
 std::optional<T> read(Reader& r) noexcept {

@@ -30,6 +30,10 @@ inline void clockSyncObserve(ClockSync& cs, double localSendMs, double remoteMs,
         cs.hasSample = true;
     } else {
         cs.offsetMs = (1.0 - clockSyncEmaAlpha) * cs.offsetMs + clockSyncEmaAlpha * offset;
+        // A new low is taken directly (above); otherwise relax the best UP toward the current RTT, so a
+        // stale or fluke-low best is forgotten over time -- a decaying recent best, not a lifetime
+        // minimum, so the offset keeps tracking real clock drift instead of anchoring to one old sample.
+        cs.bestRttMs += clockSyncEmaAlpha * (rtt - cs.bestRttMs);
     }
 }
 

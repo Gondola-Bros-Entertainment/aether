@@ -51,7 +51,7 @@ inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<Chan
     for (;;) {
         Address   from{};
         const int n = recvFrom(h.socket, std::span<std::uint8_t>(scratch.data(), scratch.size()), from);
-        if (n <= 0) break;
+        if (n < 0) break;   // -1 == no more data; a 0-byte datagram returns 0 and is drained (CRC-rejected) so it cannot stall the queue
         Bytes raw(scratch.begin(), scratch.begin() + n);
         if (h.rendezvousAddr && addrEqual(from, *h.rendezvousAddr)) {
             if (const auto paired = decodePaired(raw)) {   // a pairing reply from the rendezvous
@@ -78,6 +78,10 @@ inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<Chan
     auto result = peerProcess(h.peer, now, incoming);
     for (const RawPacket& rp : result.outgoing) {
         if (h.relaying && h.partnerAddr && h.rendezvousAddr && addrEqual(rp.to.addr, *h.partnerAddr)) {
+            // Relaying wraps each packet with a 9-byte [tag][roomId] header, so the effective MTU on the
+            // relay (fallback) path is path_mtu - 9. With the default config.mtu (1200) a wrapped packet
+            // (<= 1209) still fits any real path; if you raise mtu toward the true path MTU and rely on the
+            // relay, leave 9 bytes of headroom (set mtu <= path_mtu - 9) so the wrapped datagram is not dropped.
             const Bytes wrapped = encodeRelay(h.roomId, rp.data.data(), rp.data.size());   // forward via the rendezvous
             sendTo(h.socket, std::span<const std::uint8_t>(wrapped.data(), wrapped.size()), *h.rendezvousAddr);
         } else {

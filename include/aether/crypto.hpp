@@ -112,53 +112,100 @@ inline void chacha20Xor(const std::uint8_t key[32], std::uint32_t counter, const
     }
 }
 
-// Poly1305 one-time MAC (RFC 8439 section 2.5), radix 2^26 over five limbs.
-inline void poly1305(const std::uint8_t key[32], const std::uint8_t* msg, std::size_t len, std::uint8_t tag[16]) noexcept {
-    std::uint32_t t0 = cryptoLe32(key + 0) & 0x0fffffffu;
-    std::uint32_t t1 = cryptoLe32(key + 4) & 0x0ffffffcu;
-    std::uint32_t t2 = cryptoLe32(key + 8) & 0x0ffffffcu;
-    std::uint32_t t3 = cryptoLe32(key + 12) & 0x0ffffffcu;
-    const std::uint64_t r[5] = {
-        std::uint64_t(t0) & 0x3ffffff,
-        (std::uint64_t(t0) >> 26 | std::uint64_t(t1) << 6) & 0x3ffffff,
-        (std::uint64_t(t1) >> 20 | std::uint64_t(t2) << 12) & 0x3ffffff,
-        (std::uint64_t(t2) >> 14 | std::uint64_t(t3) << 18) & 0x3ffffff,
-        (std::uint64_t(t3) >> 8) & 0x3ffffff,
+// Poly1305 one-time MAC (RFC 8439 section 2.5), radix 2^26 over five limbs, as an INCREMENTAL state
+// (init / update / pad / finish) so the AEAD tag is absorbed streaming over aad + ciphertext + lengths
+// with NO assembly buffer (poly1305Tag below, and the one-shot poly1305() here, are thin wrappers).
+// 26-bit limbs keep every product under 2^58, so the multiply-reduce fits in uint64 -- no 128-bit type
+// needed (the poly1305-donna 32-bit approach; portable to MSVC).
+struct Poly1305State {
+    std::uint64_t r[5];
+    std::uint64_t h[5];
+    std::uint8_t  s[16];       // key's second half, folded in at finish
+    std::uint8_t  block[16];   // partial block carried across update() calls
+    std::size_t   blockLen;
+};
+
+inline void poly1305Init(Poly1305State& st, const std::uint8_t key[32]) noexcept {
+    const std::uint32_t t0 = cryptoLe32(key + 0)  & 0x0fffffffu;
+    const std::uint32_t t1 = cryptoLe32(key + 4)  & 0x0ffffffcu;
+    const std::uint32_t t2 = cryptoLe32(key + 8)  & 0x0ffffffcu;
+    const std::uint32_t t3 = cryptoLe32(key + 12) & 0x0ffffffcu;
+    st.r[0] =  std::uint64_t(t0)                                  & 0x3ffffff;
+    st.r[1] = (std::uint64_t(t0) >> 26 | std::uint64_t(t1) << 6)  & 0x3ffffff;
+    st.r[2] = (std::uint64_t(t1) >> 20 | std::uint64_t(t2) << 12) & 0x3ffffff;
+    st.r[3] = (std::uint64_t(t2) >> 14 | std::uint64_t(t3) << 18) & 0x3ffffff;
+    st.r[4] = (std::uint64_t(t3) >> 8)                            & 0x3ffffff;
+    for (int i = 0; i < 5; ++i)  st.h[i] = 0;
+    for (int i = 0; i < 16; ++i) st.s[i] = key[16 + i];
+    st.blockLen = 0;
+}
+
+// Absorb one block. buf carries the block's bytes with the high "1" bit already placed (buf[16]=1 for
+// a full block, buf[partialLen]=1 for the final short block), read as a little-endian 130-bit number.
+inline void poly1305Absorb(Poly1305State& st, const std::uint8_t buf[17]) noexcept {
+    auto ext26 = [&](int bitlo) -> std::uint64_t {
+        std::uint64_t v = 0;
+        for (int b = 0; b < 26; ++b) { const int bit = bitlo + b; if (buf[bit >> 3] & (1u << (bit & 7))) v |= (std::uint64_t(1) << b); }
+        return v;
     };
-    std::uint64_t h[5] = { 0, 0, 0, 0, 0 };
-
-    std::size_t off = 0;
-    while (off < len) {
-        const std::size_t blk = (len - off < 16) ? (len - off) : 16;
-        std::uint8_t buf[17] = { 0 };
-        for (std::size_t i = 0; i < blk; ++i) buf[i] = msg[off + i];
-        buf[blk] = 1;
-        auto ext26 = [&](int bitlo) -> std::uint64_t {
-            std::uint64_t v = 0;
-            for (int b = 0; b < 26; ++b) { const int bit = bitlo + b; if (buf[bit >> 3] & (1u << (bit & 7))) v |= (std::uint64_t(1) << b); }
-            return v;
-        };
-        h[0] += ext26(0); h[1] += ext26(26); h[2] += ext26(52); h[3] += ext26(78); h[4] += ext26(104);
-
-        // 26-bit limbs keep every product under 2^58, so the multiply-reduce fits in uint64 --
-        // no 128-bit type needed (the poly1305-donna 32-bit approach; portable to MSVC).
-        std::uint64_t d[5];
-        for (int m = 0; m < 5; ++m) {
-            std::uint64_t acc = 0;
-            for (int i = 0; i < 5; ++i) {
-                const int j = m - i;
-                if (j >= 0 && j < 5) acc += h[i] * r[j];
-                const int j2 = m + 5 - i;
-                if (j2 >= 0 && j2 < 5) acc += (5 * h[i]) * r[j2];
-            }
-            d[m] = acc;
+    st.h[0] += ext26(0); st.h[1] += ext26(26); st.h[2] += ext26(52); st.h[3] += ext26(78); st.h[4] += ext26(104);
+    std::uint64_t d[5];
+    for (int m = 0; m < 5; ++m) {
+        std::uint64_t acc = 0;
+        for (int i = 0; i < 5; ++i) {
+            const int j = m - i;
+            if (j >= 0 && j < 5) acc += st.h[i] * st.r[j];
+            const int j2 = m + 5 - i;
+            if (j2 >= 0 && j2 < 5) acc += (5 * st.h[i]) * st.r[j2];
         }
-        std::uint64_t c = 0;
-        for (int m = 0; m < 5; ++m) { const std::uint64_t v = d[m] + c; h[m] = v & 0x3ffffff; c = v >> 26; }
-        h[0] += c * 5; c = h[0] >> 26; h[0] &= 0x3ffffff; h[1] += c;
-        off += blk;
+        d[m] = acc;
     }
+    std::uint64_t c = 0;
+    for (int m = 0; m < 5; ++m) { const std::uint64_t v = d[m] + c; st.h[m] = v & 0x3ffffff; c = v >> 26; }
+    st.h[0] += c * 5; c = st.h[0] >> 26; st.h[0] &= 0x3ffffff; st.h[1] += c;
+}
 
+inline void poly1305Update(Poly1305State& st, const std::uint8_t* msg, std::size_t len) noexcept {
+    std::size_t  off = 0;
+    std::uint8_t buf[17];
+    if (st.blockLen > 0) {                                       // top up a carried partial block first
+        while (st.blockLen < 16 && off < len) st.block[st.blockLen++] = msg[off++];
+        if (st.blockLen == 16) {
+            for (int i = 0; i < 16; ++i) buf[i] = st.block[i];
+            buf[16] = 1;
+            poly1305Absorb(st, buf);
+            st.blockLen = 0;
+        }
+    }
+    while (len - off >= 16) {                                    // whole blocks straight from msg
+        for (int i = 0; i < 16; ++i) buf[i] = msg[off + i];
+        buf[16] = 1;
+        poly1305Absorb(st, buf);
+        off += 16;
+    }
+    while (off < len) st.block[st.blockLen++] = msg[off++];      // stash the remainder
+}
+
+// Zero-pad the carried partial block up to 16 (RFC pad1/pad2); a no-op when already aligned.
+inline void poly1305Pad(Poly1305State& st) noexcept {
+    if (st.blockLen == 0) return;
+    std::uint8_t buf[17];
+    for (std::size_t i = 0; i < st.blockLen; ++i) buf[i] = st.block[i];
+    for (std::size_t i = st.blockLen; i < 16; ++i) buf[i] = 0;
+    buf[16] = 1;
+    poly1305Absorb(st, buf);
+    st.blockLen = 0;
+}
+
+inline void poly1305Finish(Poly1305State& st, std::uint8_t tag[16]) noexcept {
+    if (st.blockLen > 0) {                                       // final short block: the "1" sits at its length
+        std::uint8_t buf[17] = { 0 };
+        for (std::size_t i = 0; i < st.blockLen; ++i) buf[i] = st.block[i];
+        buf[st.blockLen] = 1;
+        poly1305Absorb(st, buf);
+        st.blockLen = 0;
+    }
+    std::uint64_t* h = st.h;
     // full carry, then a conditional subtract of p = 2^130 - 5
     std::uint64_t c;
     c = h[1] >> 26; h[1] &= 0x3ffffff; h[2] += c;
@@ -174,12 +221,20 @@ inline void poly1305(const std::uint8_t key[32], const std::uint8_t* msg, std::s
     // 128-bit s key with a manual carry, then serialize little-endian. Portable, no __int128.
     const std::uint64_t lo  = h[0] | (h[1] << 26) | (h[2] << 52);
     const std::uint64_t hi  = (h[2] >> 12) | (h[3] << 14) | (h[4] << 40);
-    const std::uint64_t sLo = std::uint64_t(cryptoLe32(key + 16)) | (std::uint64_t(cryptoLe32(key + 20)) << 32);
-    const std::uint64_t sHi = std::uint64_t(cryptoLe32(key + 24)) | (std::uint64_t(cryptoLe32(key + 28)) << 32);
+    const std::uint64_t sLo = std::uint64_t(cryptoLe32(st.s + 0)) | (std::uint64_t(cryptoLe32(st.s + 4))  << 32);
+    const std::uint64_t sHi = std::uint64_t(cryptoLe32(st.s + 8)) | (std::uint64_t(cryptoLe32(st.s + 12)) << 32);
     const std::uint64_t rLo = lo + sLo;
     const std::uint64_t rHi = hi + sHi + (rLo < lo ? 1 : 0);   // carry out of the low half
     for (int i = 0; i < 8; ++i) tag[i]     = std::uint8_t(rLo >> (8 * i));
     for (int i = 0; i < 8; ++i) tag[8 + i] = std::uint8_t(rHi >> (8 * i));
+}
+
+// One-shot over a contiguous message (a thin wrapper over the incremental state above).
+inline void poly1305(const std::uint8_t key[32], const std::uint8_t* msg, std::size_t len, std::uint8_t tag[16]) noexcept {
+    Poly1305State st;
+    poly1305Init(st, key);
+    poly1305Update(st, msg, len);
+    poly1305Finish(st, tag);
 }
 
 inline bool constTimeEq(const std::uint8_t* a, const std::uint8_t* b, std::size_t n) noexcept {
@@ -188,15 +243,21 @@ inline bool constTimeEq(const std::uint8_t* a, const std::uint8_t* b, std::size_
     return diff == 0;
 }
 
-// Build the Poly1305 MAC input: aad || pad16 || ct || pad16 || le64(aadLen) || le64(ctLen).
+// Absorb the RFC 8439 AEAD MAC input streaming: aad || pad16 || ct || pad16 || le64(aadLen) ||
+// le64(ctLen). No assembly buffer -- the incremental state absorbs each piece (and its pad) directly.
 inline void poly1305Tag(const std::uint8_t polyKey[32], const std::uint8_t* aad, std::size_t aadLen,
-                        const std::uint8_t* ct, std::size_t ctLen, std::uint8_t tag[16]) {
-    Bytes mac;
-    mac.insert(mac.end(), aad, aad + aadLen);  while (mac.size() % 16) mac.push_back(0);
-    mac.insert(mac.end(), ct, ct + ctLen);     while (mac.size() % 16) mac.push_back(0);
-    for (int i = 0; i < 8; ++i) mac.push_back(std::uint8_t(aadLen >> (8 * i)));
-    for (int i = 0; i < 8; ++i) mac.push_back(std::uint8_t(ctLen  >> (8 * i)));
-    poly1305(polyKey, mac.data(), mac.size(), tag);
+                        const std::uint8_t* ct, std::size_t ctLen, std::uint8_t tag[16]) noexcept {
+    Poly1305State st;
+    poly1305Init(st, polyKey);
+    poly1305Update(st, aad, aadLen);
+    poly1305Pad(st);
+    poly1305Update(st, ct, ctLen);
+    poly1305Pad(st);
+    std::uint8_t lenBlock[16];
+    for (int i = 0; i < 8; ++i) lenBlock[i]     = std::uint8_t(aadLen >> (8 * i));
+    for (int i = 0; i < 8; ++i) lenBlock[8 + i] = std::uint8_t(ctLen  >> (8 * i));
+    poly1305Update(st, lenBlock, sizeof lenBlock);
+    poly1305Finish(st, tag);
 }
 
 } // namespace detail

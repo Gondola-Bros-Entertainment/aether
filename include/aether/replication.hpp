@@ -26,21 +26,35 @@ inline constexpr int         defaultReplicationCap = 64;
 
 // Pack a full snapshot / a delta. A reused thread-local scratch (sized once per thread) avoids the
 // per-call 64KB allocation; only the right-sized result is copied out.
-template <class T> Bytes packFull(const T& v) {
+// `prefix` reserves that many leading bytes for the caller to fill (e.g. deltaEncode's baseline-seq
+// header), so the payload is copied out of the scratch exactly once -- no separate header buffer + copy.
+template <class T> Bytes packFull(const T& v, std::size_t prefix = 0) {
     static thread_local Bytes scratch(maxSnapshotBytes);
     for (;;) {
         Writer w{ scratch.data(), scratch.size(), 0, true };
         pack(w, v);
-        if (w.ok) return Bytes(scratch.data(), scratch.data() + w.pos);
+        if (w.ok) {
+            Bytes out;
+            out.reserve(prefix + w.pos);
+            out.resize(prefix);                                          // leading bytes, for the caller
+            out.insert(out.end(), scratch.data(), scratch.data() + w.pos);
+            return out;
+        }
         scratch.resize(scratch.size() * 2);   // snapshot outgrew the scratch -> grow + retry, never truncate
     }
 }
-template <class T> Bytes packDelta(const T& prev, const T& curr) {
+template <class T> Bytes packDelta(const T& prev, const T& curr, std::size_t prefix = 0) {
     static thread_local Bytes scratch(maxSnapshotBytes);
     for (;;) {
         Writer w{ scratch.data(), scratch.size(), 0, true };
         deltaPack(w, prev, curr);
-        if (w.ok) return Bytes(scratch.data(), scratch.data() + w.pos);
+        if (w.ok) {
+            Bytes out;
+            out.reserve(prefix + w.pos);
+            out.resize(prefix);
+            out.insert(out.end(), scratch.data(), scratch.data() + w.pos);
+            return out;
+        }
         scratch.resize(scratch.size() * 2);   // grow + retry rather than silently truncate the delta
     }
 }
@@ -59,18 +73,16 @@ template <class T> DeltaTracker<T> newDeltaTracker(int maxPending) {
 
 // Encode current state as [baselineSeq:u16 LE][delta or full payload]; stores it as pending.
 template <class T> Bytes deltaEncode(DeltaTracker<T>& tracker, BaselineSeq seqNum, const T& current) {
-    Bytes out(2);
+    Bytes out;
     if (tracker.confirmed) {
         const BaselineSeq baseSeq = tracker.confirmed->first;
+        out = packDelta(tracker.confirmed->second, current, 2);   // 2 leading header bytes, payload copied once
         out[0] = static_cast<std::uint8_t>(baseSeq);
         out[1] = static_cast<std::uint8_t>(baseSeq >> 8);
-        const Bytes payload = packDelta(tracker.confirmed->second, current);
-        out.insert(out.end(), payload.begin(), payload.end());
     } else {
+        out = packFull(current, 2);
         out[0] = static_cast<std::uint8_t>(noBaseline);
         out[1] = static_cast<std::uint8_t>(noBaseline >> 8);
-        const Bytes payload = packFull(current);
-        out.insert(out.end(), payload.begin(), payload.end());
     }
     if (static_cast<int>(tracker.pending.size()) >= tracker.maxPending && !tracker.pending.empty()) tracker.pending.pop_front();
     tracker.pending.push_back({ seqNum, current });
@@ -113,9 +125,9 @@ template <class T> BaselineManager<T> newBaselineManager(int maxSnapshots, doubl
     return m;
 }
 template <class T> void pushBaseline(BaselineManager<T>& m, BaselineSeq seqNum, const T& state, MonoTime now) {
-    std::deque<std::tuple<BaselineSeq, T, MonoTime>> kept;
-    for (auto& s : m.snapshots) if (elapsedMs(std::get<2>(s), now) < m.timeoutMs) kept.push_back(s);
-    m.snapshots = std::move(kept);
+    // now is monotonic across pushes, so expired snapshots are always a front prefix -- pop them in
+    // place rather than rebuilding (and copying every surviving T into) a fresh deque each push.
+    while (!m.snapshots.empty() && elapsedMs(std::get<2>(m.snapshots.front()), now) >= m.timeoutMs) m.snapshots.pop_front();
     if (static_cast<int>(m.snapshots.size()) >= m.maxSnapshots && !m.snapshots.empty()) m.snapshots.pop_front();
     m.snapshots.push_back(std::make_tuple(seqNum, state, now));
 }

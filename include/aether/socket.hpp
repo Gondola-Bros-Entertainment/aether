@@ -60,6 +60,6 @@ bool                  isOpen(const Socket& s);
 Address               localAddr(const Socket& s);         // getsockname
 
 int sendTo(Socket& s, std::span<const std::uint8_t> data, const Address& to);   // bytes, or -1
-int recvFrom(Socket& s, std::span<std::uint8_t> buf, Address& from);            // bytes (>0), 0 if none, -1 on error
+int recvFrom(Socket& s, std::span<std::uint8_t> buf, Address& from);            // datagram bytes (>=0; 0 is a real 0-byte datagram), -1 if no data (would-block) or error
 
 } // namespace aether

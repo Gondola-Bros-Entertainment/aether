@@ -94,12 +94,12 @@ std::optional<Address> deserializeAddr(const std::uint8_t* p, std::size_t n) {
     if (n < 3) return std::nullopt;
     const std::uint16_t port = static_cast<std::uint16_t>((std::uint16_t(p[1]) << 8) | p[2]);
     if (p[0] == 4) {
-        if (n < 7) return std::nullopt;
+        if (n != 7) return std::nullopt;   // exact length: the wire form is canonical, no trailing bytes accepted
         const std::uint32_t ip = (std::uint32_t(p[3]) << 24) | (std::uint32_t(p[4]) << 16) | (std::uint32_t(p[5]) << 8) | p[6];
         return addrV4(ip, port);
     }
     if (p[0] == 6) {
-        if (n < 19) return std::nullopt;
+        if (n != 19) return std::nullopt;   // exact length, as above
         Address a{};
         auto* in        = reinterpret_cast<sockaddr_in6*>(a.storage);
         in->sin6_family = AF_INET6;
@@ -122,8 +122,10 @@ std::optional<Socket> openUdp(const Address& bindAddr) {
         ::closesocket(h);
         return std::nullopt;
     }
+    // Non-blocking is load-bearing for the per-tick drain; fail closed if it cannot be set rather
+    // than return a blocking socket that hangs the loop.
     u_long nonblocking = 1;
-    ::ioctlsocket(h, FIONBIO, &nonblocking);
+    if (::ioctlsocket(h, FIONBIO, &nonblocking) != 0) { ::closesocket(h); return std::nullopt; }
     Socket s{};
     s.fd = fd;
     return s;
@@ -150,12 +152,15 @@ int sendTo(Socket& s, std::span<const std::uint8_t> data, const Address& to) {
     return n;
 }
 
+// Returns the datagram length (>= 0; a real 0-byte datagram returns 0), or -1 for "no more data"
+// (WSAEWOULDBLOCK) or a hard error. The drain loops on n >= 0, so a 0-byte datagram no longer reads
+// as "queue empty" and stalls the rest of the queue for the tick.
 int recvFrom(Socket& s, std::span<std::uint8_t> buf, Address& from) {
     from = Address{};
     int       len = sizeof(from.storage);
     const int n   = ::recvfrom(static_cast<SOCKET>(s.fd), reinterpret_cast<char*>(buf.data()),
                                static_cast<int>(buf.size()), 0, sa(from), &len);
-    if (n < 0) return (WSAGetLastError() == WSAEWOULDBLOCK) ? 0 : -1;
+    if (n < 0) return -1;
     from.len      = static_cast<std::uint32_t>(len);
     s.bytesRecv   += static_cast<std::uint64_t>(n);
     s.packetsRecv += 1;

@@ -11,6 +11,7 @@
 #include "aether/socket.hpp"
 #include "aether/x25519.hpp"
 
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -65,6 +66,7 @@ struct PendingConnection {
     X25519Key                    ephemeralPub{};          // our ephemeral X25519 public key
     std::optional<X25519Key>     sessionShared;           // ECDH shared secret (client side; keyed at Accepted)
     std::uint64_t                reconnectSalt = 0;       // fresh per-reconnect salt, mixed into the resumed keys
+    std::array<std::uint8_t, 16> resumeMac{};             // proof-of-master MAC on the resume request (retransmit-stable)
     bool                         isReconnect   = false;   // this pending is a token reconnect, not a fresh handshake
     bool                         ephemeralReady = false;  // generate the keypair once (retransmit-stable)
     Bytes                        connectToken;            // client: the sealed token to present (and retransmit)
@@ -88,19 +90,23 @@ inline std::optional<std::uint64_t> decodeSalt(const Bytes& b) {
 }
 
 // reconnect request payload: the resume token (the original clientSalt) + a fresh salt that re-keys
-// the resumed session, so a resume never reuses the original session's keystream.
-inline Bytes encodeResume(std::uint64_t token, std::uint64_t freshSalt) {
+// the resumed session (so a resume never reuses the original keystream) + a MAC proving possession of
+// the session master (so a passive observer of the plaintext token cannot forge a resume; see resumeMac).
+inline Bytes encodeResume(std::uint64_t token, std::uint64_t freshSalt, const std::array<std::uint8_t, 16>& mac) {
     Bytes b = encodeSalt(token);
     const Bytes s = encodeSalt(freshSalt);
     b.insert(b.end(), s.begin(), s.end());
+    b.insert(b.end(), mac.begin(), mac.end());
     return b;
 }
-inline std::optional<std::pair<std::uint64_t, std::uint64_t>> decodeResume(const Bytes& b) {
-    if (b.size() < 2 * saltBytes) return std::nullopt;
-    std::uint64_t token = 0, salt = 0;
-    for (std::size_t i = 0; i < saltBytes; ++i) token |= static_cast<std::uint64_t>(b[i])             << (8 * i);
-    for (std::size_t i = 0; i < saltBytes; ++i) salt  |= static_cast<std::uint64_t>(b[saltBytes + i]) << (8 * i);
-    return std::pair<std::uint64_t, std::uint64_t>{ token, salt };
+struct ResumeRequest { std::uint64_t token{}; std::uint64_t freshSalt{}; std::array<std::uint8_t, 16> mac{}; };
+inline std::optional<ResumeRequest> decodeResume(const Bytes& b) {
+    if (b.size() < 2 * saltBytes + 16) return std::nullopt;
+    ResumeRequest r;
+    for (std::size_t i = 0; i < saltBytes; ++i) r.token     |= static_cast<std::uint64_t>(b[i])             << (8 * i);
+    for (std::size_t i = 0; i < saltBytes; ++i) r.freshSalt |= static_cast<std::uint64_t>(b[saltBytes + i]) << (8 * i);
+    for (std::size_t i = 0; i < 16; ++i)        r.mac[i]     = b[2 * saltBytes + i];
+    return r;
 }
 
 // salt + ephemeral public key -- the handshake key-exchange payload (8-byte salt + 32-byte key).
@@ -154,6 +160,31 @@ inline void applySessionKeys(Connection& conn, const X25519Key& shared, std::uin
     conn.sendKey      = isServer ? k.serverToClient : k.clientToServer;
     conn.recvKey      = isServer ? k.clientToServer : k.serverToClient;
     conn.resumeMaster = shared;
+}
+// Resume authenticator. The fast-reconnect token (clientSalt) travels in cleartext during the original
+// handshake, so on its own it is a bearer credential a passive observer could replay to burn a victim's
+// resume. The MAC binds the request to the ECDH master (which never touches the wire): only a holder of
+// the master can mint a valid resume, so a token-only observer cannot. (It does NOT stop replay of a
+// captured live resume request -- that needs a challenge round-trip, which would defeat 0-RTT resume;
+// the residual lands in the documented unauthenticated-handshake trade-off.) The MAC key is HChaCha20
+// over the master with a domain byte distinct from the directional KDF.
+inline EncryptionKey deriveResumeKey(const X25519Key& master) {
+    std::uint8_t in[16] = {};
+    in[8] = 2;   // deriveDirectionalKeys puts the direction (0/1) here; 2 keeps this subkey independent
+    EncryptionKey k{};
+    detail::hchacha20(master.data(), in, k.data());
+    return k;
+}
+inline std::array<std::uint8_t, 16> resumeMac(const X25519Key& master, std::uint64_t token, std::uint64_t freshSalt) {
+    const EncryptionKey k = deriveResumeKey(master);
+    std::uint8_t nonce[12] = {};
+    for (int i = 0; i < 8; ++i) nonce[i] = static_cast<std::uint8_t>(freshSalt >> (8 * i));   // fresh per resume -> unique (key, nonce)
+    std::uint8_t aad[16];
+    for (int i = 0; i < 8; ++i) aad[i]     = static_cast<std::uint8_t>(token     >> (8 * i));
+    for (int i = 0; i < 8; ++i) aad[8 + i] = static_cast<std::uint8_t>(freshSalt >> (8 * i));
+    std::array<std::uint8_t, 16> tag{};
+    aeadSeal(k.data(), nonce, aad, sizeof aad, nullptr, 0, nullptr, tag.data());   // empty plaintext: the tag is a MAC over (token, freshSalt)
+    return tag;
 }
 
 enum class DenyReason : std::uint8_t { ServerFull = 1, InvalidChallenge = 2, InvalidToken = 3 };
@@ -273,19 +304,22 @@ inline std::vector<PeerEvent> handleConnectionRequest(NetPeer& peer, const PeerI
     // token is a resumption ticket: it also restores the key the session negotiated, so a resume
     // stays encrypted and skips the key exchange too -- true QUIC-style 0-RTT resume.
     if (const auto resume = decodeResume(pkt.payload)) {
-        const auto rit = peer.resumableTokens.find(resume->first);
-        if (rit != peer.resumableTokens.end() && rit->second.master && elapsedMs(rit->second.at, now) < resumeGraceMs) {
+        const auto rit = peer.resumableTokens.find(resume->token);
+        if (rit != peer.resumableTokens.end() && rit->second.master && elapsedMs(rit->second.at, now) < resumeGraceMs
+            && detail::constTimeEq(resumeMac(*rit->second.master, resume->token, resume->freshSalt).data(), resume->mac.data(), 16)) {
             const X25519Key master = *rit->second.master;
-            peer.resumableTokens.erase(rit);
+            peer.resumableTokens.erase(rit);   // burn only on a MAC-authenticated resume (proof of master possession)
             peer.pending.erase(pid);
-            Connection conn = newConnection(peer.config, resume->first, now);
-            applySessionKeys(conn, master, resume->second, /*isServer=*/true);   // re-key from the client's fresh salt
+            Connection conn = newConnection(peer.config, resume->token, now);
+            applySessionKeys(conn, master, resume->freshSalt, /*isServer=*/true);   // re-key from the client's fresh salt
             touchRecvTime(conn, now);
             markConnected(conn, now);
             peer.connections[pid] = std::move(conn);
             queueControlPacket(peer, PacketType::ConnectionAccepted, {}, pid);
             return { evReconnected(pid) };
         }
+        // No entry / expired / bad MAC falls through to a normal handshake. A bad MAC does NOT burn the
+        // resumable, so a token-only observer cannot deny the real client its fast reconnect.
     }
     if (const auto it = peer.pending.find(pid); it != peer.pending.end()) {
         queueControlPacket(peer, PacketType::ConnectionChallenge, encodeSaltAndKey(it->second.serverSalt, it->second.ephemeralPub), pid);
@@ -609,7 +643,7 @@ inline void retryPendingConnections(NetPeer& peer, MonoTime now) {
         if (elapsedMs(pending.lastRetry, now) > retryInterval && pending.retryCount < cfg.connectionRequestMaxRetries) {
             pending.retryCount += 1;
             pending.lastRetry   = now;
-            const Bytes payload = pending.isReconnect ? encodeResume(pending.clientSalt, pending.reconnectSalt) : pending.connectToken;
+            const Bytes payload = pending.isReconnect ? encodeResume(pending.clientSalt, pending.reconnectSalt, pending.resumeMac) : pending.connectToken;
             queueControlPacket(peer, PacketType::ConnectionRequest, payload, pid);
         }
     }
@@ -673,16 +707,20 @@ inline void peerConnectWithToken(NetPeer& peer, const PeerId& pid, const Bytes& 
 // The server fast-paths it if still within the resume grace window; otherwise it is a normal connect.
 inline void peerReconnect(NetPeer& peer, const PeerId& pid, std::uint64_t token, MonoTime now) {
     if (peer.connections.count(pid) || peer.pending.count(pid)) return;
+    const auto rit = peer.resumableTokens.find(token);
+    if (rit == peer.resumableTokens.end() || !rit->second.master) { peerConnect(peer, pid, now); return; }   // session secret gone -> full handshake
     const std::uint64_t freshSalt = secureRandom64();   // a fresh salt to re-key the resume (unique, not secret)
+    const std::array<std::uint8_t, 16> mac = resumeMac(*rit->second.master, token, freshSalt);   // prove we hold the master
     PendingConnection pend;
     pend.direction     = ConnectionDirection::Outbound;
     pend.clientSalt    = token;
     pend.reconnectSalt = freshSalt;
+    pend.resumeMac     = mac;
     pend.isReconnect   = true;
     pend.createdAt     = now;
     pend.lastRetry     = now;
     peer.pending[pid] = pend;
-    queueControlPacket(peer, PacketType::ConnectionRequest, encodeResume(token, freshSalt), pid);
+    queueControlPacket(peer, PacketType::ConnectionRequest, encodeResume(token, freshSalt, mac), pid);
 }
 inline void peerDisconnect(NetPeer& peer, const PeerId& pid, MonoTime now) {
     if (const auto it = peer.connections.find(pid); it != peer.connections.end()) disconnect(it->second, DisconnectReason::Requested, now);

@@ -28,6 +28,7 @@
 #include "aether/util.hpp"
 #include "aether/x25519.hpp"
 
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -168,8 +169,8 @@ int main() {
 
         std::uint8_t rbuf[16];
         aether::Address from{};
-        int got = 0;
-        for (int i = 0; i < 10000 && got == 0; ++i) got = aether::recvFrom(*sock, rbuf, from);
+        int got = -1;   // -1 == no data yet (poll again); >= 0 == a datagram of that many bytes
+        for (int i = 0; i < 10000 && got < 0; ++i) got = aether::recvFrom(*sock, rbuf, from);
         assert(got == 3 && rbuf[0] == 0xAB && rbuf[1] == 0xCD && rbuf[2] == 0xEF);
         std::printf("aether socket loopback OK: sent %d, recv %d on 127.0.0.1:%u\n",
                     sent, got, aether::addrPort(self));
@@ -339,7 +340,7 @@ int main() {
             aether::processFragment(a, f, sizeof f, aether::MonoTime{ 0 });
         }
         assert(a.currentSize <= 100);   // buffered total stays within the cap (was overshootable by a whole fragment)
-        std::printf("aether fragment-bytecap OK: oversized rejected, buffered total <= cap (%d bytes)\n", a.currentSize);
+        std::printf("aether fragment-bytecap OK: oversized rejected, buffered total <= cap (%zu bytes)\n", a.currentSize);
     }
 
     // time: elapsedMs saturates at 0 when now precedes start -- an unsigned wrap would read as ~1.8e10 ms
@@ -1287,7 +1288,7 @@ int main() {
         std::uint64_t tt = 0;
         for (int k = 0; k < 4; ++k) { tt += 1100ull * 1000000; (void) aether::hostTick(*h, {}, aether::MonoTime{ tt }); std::this_thread::yield(); }  // each > registerRetryMs
         // Drain the rendezvous socket, polling until the retries are actually delivered over loopback
-        // (a non-blocking recv returns 0 while datagrams are still in flight). Bounded, so a genuinely
+        // (a non-blocking recv returns -1 while datagrams are still in flight). Bounded, so a genuinely
         // broken retry path fails rather than hangs -- this replaces a single drain that raced delivery.
         int registers = 0;
         std::uint8_t rb[600];
@@ -1330,6 +1331,180 @@ int main() {
         assert(aUp && bUp && hA->relaying && hB->relaying);   // connected, and over the relay path
         aether::closeHost(*hA); aether::closeHost(*hB); aether::closeSocket(*rv);
         std::printf("aether relay-e2e OK: two hosts handshook through the rendezvous relay (punch skipped)\n");
+    }
+
+    // security: a hostile varint string length must not overflow the bounds check into an over-read /
+    // throw. The magic-path string decoder caps the length against the remaining bytes; this pins the
+    // has() size_t-overflow fix (r.pos + n wrapping). A 10-byte LEB128 of SIZE_MAX as a string length
+    // must reject cleanly, not crash.
+    {
+        struct StrBox { std::string s; };
+        const aether::Bytes evil = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01 };   // LEB128 for 0xFFFFFFFFFFFFFFFF
+        aether::Reader r{ evil.data(), evil.size(), 0 };
+        const auto out = aether::unpack<StrBox>(r);
+        assert(!out);   // nullopt, and -- the point -- no length_error / over-read
+        std::printf("aether hostile-string-length OK: oversized varint length rejected, no crash\n");
+    }
+
+    // channel: the receive path enforces maxMessageSize too (not just send) -- an oversized payload is
+    // dropped, matching the send-side cap.
+    {
+        aether::ChannelConfig cfg;
+        cfg.deliveryMode   = aether::DeliveryMode::Unreliable;
+        cfg.maxMessageSize = 16;
+        aether::Channel ch = aether::newChannel(aether::ChannelId{ 0 }, cfg);
+        aether::onMessageReceived(ch, aether::SequenceNum{ 0 }, aether::Bytes(64, 0xAB), aether::MonoTime{ 0 });   // 64 > 16
+        assert(aether::channelReceive(ch).empty() && ch.totalDropped == 1);
+        aether::onMessageReceived(ch, aether::SequenceNum{ 1 }, aether::Bytes(8, 0xCD), aether::MonoTime{ 0 });    // 8 <= 16
+        assert(aether::channelReceive(ch).size() == 1);
+        std::printf("aether channel-recv-cap OK: oversized message dropped, in-bound delivered\n");
+    }
+
+    // config: a non-positive channel cap is rejected at validateConfig, not silently dead-ending the channel.
+    {
+        aether::NetworkConfig c;
+        c.defaultChannelConfig.messageBufferSize = 0;   // would make every reliable send BufferFull forever
+        assert(validateConfig(c) == aether::ConfigError::InvalidChannelConfig);
+        aether::NetworkConfig c2;
+        c2.channelConfigs.push_back(aether::ChannelConfig{ .maxMessageSize = 0 });   // dead channel
+        assert(validateConfig(c2) == aether::ConfigError::InvalidChannelConfig);
+        aether::NetworkConfig c3;
+        c3.defaultChannelConfig.maxMessageSize = 400000;   // beyond maxFragmentCount fragments at the default MTU -> rejected at setup, not dropped at send
+        assert(validateConfig(c3) == aether::ConfigError::MessageTooLargeToFragment);
+        assert(!validateConfig(aether::NetworkConfig{}));   // defaults remain valid
+        std::printf("aether channel-config-validation OK: non-positive caps + unfragmentable maxMessageSize rejected\n");
+    }
+
+    // channel: the ordered-buffer timeout flush advances past the WRAP-AWARE max sequence. Buffer two
+    // messages straddling 0xFFFF->0 (raw < and newer() disagree on which is the max); a raw-< pick would
+    // mis-advance orderedExpected to 0xFFFF instead of 0x0002.
+    {
+        aether::ChannelConfig cfg;
+        cfg.deliveryMode         = aether::DeliveryMode::ReliableOrdered;
+        cfg.orderedBufferTimeout = 100.0;
+        aether::Channel ch = aether::newChannel(aether::ChannelId{ 0 }, cfg);
+        ch.orderedExpected = aether::SequenceNum{ 0xFFFD };
+        aether::onMessageReceived(ch, aether::SequenceNum{ 0xFFFE }, aether::Bytes{ 1 }, aether::MonoTime{ 0 });   // before the wrap
+        aether::onMessageReceived(ch, aether::SequenceNum{ 0x0001 }, aether::Bytes{ 2 }, aether::MonoTime{ 0 });   // after the wrap (logically newest)
+        aether::channelUpdate(ch, aether::MonoTime{ 200'000'000 });   // 200ms > 100ms timeout -> flush
+        assert(ch.orderedExpected.value == 0x0002);   // next(0x0001), the wrap-aware max -- not next(0xFFFE)
+        std::printf("aether ordered-flush-wrap OK: timeout flush advances past the wrap-aware max\n");
+    }
+
+    // fragmentation e2e: a reliable message larger than the MTU is split on send, reassembled on the
+    // peer, and survives ~1/3 fragment loss via retransmit -- proving send-side fragmentation + the
+    // all-fragments-acked reliability tracking are wired end to end (the reassembler was already live).
+    {
+        aether::NetworkConfig cfg;
+        cfg.defaultChannelConfig.maxMessageSize = 16384;   // allow (and force fragmentation of) a >MTU message
+        const aether::Address addrA = aether::addrLocalhost(3333), addrB = aether::addrLocalhost(4444);
+        const aether::PeerId  idA{ addrA }, idB{ addrB };
+        aether::NetPeer A = aether::newPeerState(addrA, cfg, aether::MonoTime{ 0 });
+        aether::NetPeer B = aether::newPeerState(addrB, cfg, aether::MonoTime{ 7 });
+
+        std::vector<aether::IncomingPacket> toA, toB;
+        std::uint64_t t = 0;
+        aether::peerConnect(A, idB, aether::MonoTime{ t });
+        bool aUp = false, bUp = false;
+        for (int tick = 0; tick < 16 && !(aUp && bUp); ++tick) {   // clean handshake first
+            t += 1000000;
+            const auto ra = aether::peerProcess(A, aether::MonoTime{ t }, toA); toA.clear();
+            const auto rb = aether::peerProcess(B, aether::MonoTime{ t }, toB); toB.clear();
+            for (const auto& p : ra.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toB.push_back(aether::IncomingPacket{ idA, *s });
+            for (const auto& p : rb.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toA.push_back(aether::IncomingPacket{ idB, *s });
+            for (const auto& e : ra.events) if (e.kind == aether::PeerEvent::Connected) aUp = true;
+            for (const auto& e : rb.events) if (e.kind == aether::PeerEvent::Connected) bUp = true;
+        }
+        assert(aUp && bUp);
+
+        aether::Bytes big(5000);   // ~5 fragments at a 1200 MTU
+        for (std::size_t k = 0; k < big.size(); ++k) big[k] = static_cast<std::uint8_t>((k * 31 + 7) & 0xFF);
+        assert(!aether::peerSend(A, idB, aether::ChannelId{ 0 }, big, aether::MonoTime{ t }));   // accepted; will fragment
+
+        aether::Bytes received;
+        int drop = 0;
+        for (int tick = 0; tick < 400 && received.empty(); ++tick) {
+            t += 1000000;
+            const auto ra = aether::peerProcess(A, aether::MonoTime{ t }, toA); toA.clear();
+            auto       rb = aether::peerProcess(B, aether::MonoTime{ t }, toB); toB.clear();   // non-const: we move the received message out of its event
+            for (const auto& p : ra.outgoing) {
+                assert(static_cast<int>(p.data.size()) <= cfg.mtu);   // no oversized datagram -> it really fragmented
+                if (auto s = aether::validateAndStripCrc32(p.data)) if (drop++ % 3 != 0) toB.push_back(aether::IncomingPacket{ idA, *s });   // drop ~1/3 of A->B
+            }
+            for (const auto& p : rb.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toA.push_back(aether::IncomingPacket{ idB, *s });
+            for (auto& e : rb.events) if (e.kind == aether::PeerEvent::Message) received = std::move(e.data);
+        }
+        assert(received == big);   // exact reassembly under loss
+        std::printf("aether fragmentation-e2e OK: %zu-byte reliable message fragmented + reassembled under ~33%% loss\n", big.size());
+    }
+
+    // channel: the receive buffer is capped, so an app that stops draining cannot grow it without bound.
+    {
+        aether::ChannelConfig cfg;
+        cfg.deliveryMode         = aether::DeliveryMode::Unreliable;
+        cfg.maxReceiveBufferSize = 4;
+        aether::Channel ch = aether::newChannel(aether::ChannelId{ 0 }, cfg);
+        for (int i = 0; i < 10; ++i)
+            aether::onMessageReceived(ch, aether::SequenceNum{ static_cast<std::uint16_t>(i) }, aether::Bytes{ 0x01 }, aether::MonoTime{ 0 });
+        assert(static_cast<int>(ch.receiveBuffer.size()) == 4 && ch.totalDropped == 6);   // bounded at the cap; the excess 6 shed + counted
+        std::printf("aether receive-cap OK: undrained buffer bounded at the cap, excess counted as dropped\n");
+    }
+
+    // security: a forged fast-reconnect (right token, but no proof-of-master MAC) is rejected and does
+    // NOT burn the resumable -- so a passive observer of the cleartext token cannot deny the real client
+    // its reconnect. The legit client (which holds the master) still resumes.
+    {
+        const aether::NetworkConfig cfg;
+        const aether::Address addrA = aether::addrLocalhost(5555), addrB = aether::addrLocalhost(6666), addrF = aether::addrLocalhost(7777);
+        const aether::PeerId  idA{ addrA }, idB{ addrB }, idF{ addrF };
+        aether::NetPeer A = aether::newPeerState(addrA, cfg, aether::MonoTime{ 0 });
+        aether::NetPeer B = aether::newPeerState(addrB, cfg, aether::MonoTime{ 3 });
+
+        std::vector<aether::IncomingPacket> toA, toB;
+        std::uint64_t t = 0;
+        aether::peerConnect(A, idB, aether::MonoTime{ t });
+        bool aUp = false, bUp = false;
+        for (int tick = 0; tick < 16 && !(aUp && bUp); ++tick) {
+            t += 1000000;
+            const auto ra = aether::peerProcess(A, aether::MonoTime{ t }, toA); toA.clear();
+            const auto rb = aether::peerProcess(B, aether::MonoTime{ t }, toB); toB.clear();
+            for (const auto& p : ra.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toB.push_back(aether::IncomingPacket{ idA, *s });
+            for (const auto& p : rb.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toA.push_back(aether::IncomingPacket{ idB, *s });
+            for (const auto& e : ra.events) if (e.kind == aether::PeerEvent::Connected) aUp = true;
+            for (const auto& e : rb.events) if (e.kind == aether::PeerEvent::Connected) bUp = true;
+        }
+        assert(aUp && bUp);
+        const auto token = aether::peerSessionToken(A, idB);
+        assert(token);
+
+        t += 11000ull * 1000000;   // both time out -> server caches the resumable (token -> master)
+        aether::peerProcess(A, aether::MonoTime{ t }, {});
+        aether::peerProcess(B, aether::MonoTime{ t }, {});
+        assert(B.resumableTokens.count(*token) == 1);
+
+        // forger replays the (observed) token with a bogus MAC -- it never held the master
+        std::array<std::uint8_t, 16> badMac{};   // all-zero: not a valid tag
+        const aether::Bytes forged = aether::serializePacket(aether::Packet{
+            aether::PacketHeader{ aether::PacketType::ConnectionRequest, aether::SequenceNum{ 0 }, aether::SequenceNum{ 0 }, 0 },
+            aether::encodeResume(*token, 0x1234u, badMac) });
+        t += 1000000;
+        const auto rf = aether::peerProcess(B, aether::MonoTime{ t }, { aether::IncomingPacket{ idF, forged } });
+        for (const auto& e : rf.events) assert(e.kind != aether::PeerEvent::Reconnected);
+        assert(!aether::peerIsConnected(B, idF));          // forger got a fresh-handshake pending at most, never the session
+        assert(B.resumableTokens.count(*token) == 1);      // NOT burned -> the real client can still resume
+
+        aether::peerReconnect(A, idB, *token, aether::MonoTime{ t });   // legit client holds the master
+        bool reconnected = false;
+        for (int rc = 0; rc < 16 && !(reconnected && aether::peerIsConnected(A, idB)); ++rc) {
+            t += 1000000;
+            const auto ra = aether::peerProcess(A, aether::MonoTime{ t }, toA); toA.clear();
+            const auto rb = aether::peerProcess(B, aether::MonoTime{ t }, toB); toB.clear();
+            for (const auto& p : ra.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toB.push_back(aether::IncomingPacket{ idA, *s });
+            for (const auto& p : rb.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toA.push_back(aether::IncomingPacket{ idB, *s });
+            for (const auto& e : rb.events) if (e.kind == aether::PeerEvent::Reconnected) reconnected = true;
+        }
+        assert(reconnected && aether::peerIsConnected(A, idB));
+        std::printf("aether resume-mac OK: forged reconnect rejected (token not burned), real client still resumes\n");
     }
 
     return 0;

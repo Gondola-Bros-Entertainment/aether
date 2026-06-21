@@ -52,6 +52,7 @@ inline Bytes encodePaired(PunchRole role, const Address& peerAddr) {
 }
 inline std::optional<std::pair<PunchRole, Address>> decodePaired(const Bytes& b) {
     if (b.size() < 2 || b[0] != static_cast<std::uint8_t>(RendezvousMsg::Paired)) return std::nullopt;
+    if (b[1] > static_cast<std::uint8_t>(PunchRole::Accept)) return std::nullopt;   // reject an undefined role byte rather than treat it as Accept
     const auto role = static_cast<PunchRole>(b[1]);
     const auto addr = deserializeAddr(b.data() + 2, b.size() - 2);
     if (!addr) return std::nullopt;
@@ -127,7 +128,7 @@ inline void rendezvousTick(RendezvousServer& rv, Socket& sock, MonoTime now) {
     for (;;) {
         Address from{};
         const int n = recvFrom(sock, std::span<std::uint8_t>(scratch.data(), scratch.size()), from);
-        if (n <= 0) break;
+        if (n < 0) break;   // -1 == no more data; a 0-byte datagram returns 0 and is drained so it cannot stall the queue
         incoming.emplace_back(from, Bytes(scratch.begin(), scratch.begin() + static_cast<std::ptrdiff_t>(n)));
     }
     for (const auto& [addr, data] : rendezvousProcess(rv, incoming, now))

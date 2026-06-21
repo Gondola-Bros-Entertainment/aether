@@ -94,12 +94,12 @@ std::optional<Address> deserializeAddr(const std::uint8_t* p, std::size_t n) {
     if (n < 3) return std::nullopt;
     const std::uint16_t port = static_cast<std::uint16_t>((std::uint16_t(p[1]) << 8) | p[2]);
     if (p[0] == 4) {
-        if (n < 7) return std::nullopt;
+        if (n != 7) return std::nullopt;   // exact length: the wire form is canonical, no trailing bytes accepted
         const std::uint32_t ip = (std::uint32_t(p[3]) << 24) | (std::uint32_t(p[4]) << 16) | (std::uint32_t(p[5]) << 8) | p[6];
         return addrV4(ip, port);
     }
     if (p[0] == 6) {
-        if (n < 19) return std::nullopt;
+        if (n != 19) return std::nullopt;   // exact length, as above
         Address a{};
         auto* in        = reinterpret_cast<sockaddr_in6*>(a.storage);
         in->sin6_family = AF_INET6;
@@ -121,8 +121,10 @@ std::optional<Socket> openUdp(const Address& bindAddr) {
     const int yes = 1;
     ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
     if (::bind(fd, sa(bindAddr), bindAddr.len) < 0) { ::close(fd); return std::nullopt; }
+    // The non-blocking mode is load-bearing -- the whole per-tick drain assumes recv never blocks.
+    // If it cannot be set, fail closed rather than hand back a blocking socket that hangs the loop.
     const int flags = ::fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) { ::close(fd); return std::nullopt; }
     Socket s{};
     s.fd = fd;
     return s;
@@ -139,18 +141,24 @@ Address localAddr(const Socket& s) {
 }
 
 int sendTo(Socket& s, std::span<const std::uint8_t> data, const Address& to) {
-    const ssize_t n = ::sendto(s.fd, data.data(), data.size(), 0, sa(to), to.len);
+    ssize_t n;
+    do { n = ::sendto(s.fd, data.data(), data.size(), 0, sa(to), to.len); } while (n < 0 && errno == EINTR);
     if (n < 0) return -1;
     s.bytesSent   += static_cast<std::uint64_t>(n);
     s.packetsSent += 1;
     return static_cast<int>(n);
 }
 
+// Returns the datagram length (>= 0; a real 0-byte datagram returns 0), or -1 for "no more data"
+// (EAGAIN/EWOULDBLOCK) or a hard error. The drain loops on n >= 0, so a 0-byte datagram no longer
+// reads as "queue empty" and stalls the rest of the queue for the tick.
 int recvFrom(Socket& s, std::span<std::uint8_t> buf, Address& from) {
     from = Address{};
-    socklen_t     len = sizeof(from.storage);
-    const ssize_t n   = ::recvfrom(s.fd, buf.data(), buf.size(), 0, sa(from), &len);
-    if (n < 0) return (errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1;
+    socklen_t len = sizeof(from.storage);
+    ssize_t   n;
+    do { len = sizeof(from.storage); n = ::recvfrom(s.fd, buf.data(), buf.size(), 0, sa(from), &len); }
+    while (n < 0 && errno == EINTR);                          // a signal is not "no data" -- retry
+    if (n < 0) return -1;
     from.len      = len;
     s.bytesRecv   += static_cast<std::uint64_t>(n);
     s.packetsRecv += 1;
