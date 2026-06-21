@@ -135,8 +135,8 @@ inline constexpr std::size_t   connectTokenNonceBytes = 12;            // 96-bit
 // Domain bytes bound as AEAD AAD, so a token sealed for this purpose cannot be confused with other
 // ciphertext minted under the same key.
 inline constexpr std::array<std::uint8_t, 4> connectTokenDomainBytes = {
-    std::uint8_t(connectTokenDomain >> 24), std::uint8_t(connectTokenDomain >> 16),
-    std::uint8_t(connectTokenDomain >> 8),  std::uint8_t(connectTokenDomain) };
+    std::uint8_t((connectTokenDomain >> 24) & 0xFFu), std::uint8_t((connectTokenDomain >> 16) & 0xFFu),
+    std::uint8_t((connectTokenDomain >> 8) & 0xFFu),  std::uint8_t(connectTokenDomain & 0xFFu) };
 using TokenNonce = std::array<std::uint8_t, connectTokenNonceBytes>;
 
 struct ConnectToken {
