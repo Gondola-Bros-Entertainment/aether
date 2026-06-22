@@ -3,6 +3,8 @@
 // message batching. Data-first: structs mutated by free functions in place.
 #pragma once
 
+#include "aether/reliability.hpp"
+#include "aether/serialize.hpp"
 #include "aether/stats.hpp"
 #include "aether/types.hpp"
 
@@ -12,6 +14,7 @@
 #include <deque>
 #include <limits>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -238,20 +241,36 @@ inline double btBytesPerSecond(const BandwidthTracker& bt) {
 // --- message unbatching. Decode a coalesced [u8 count][u16 len BE][data]... batch. The encoder is
 //     inlined in connection.hpp's flushPendingWires, which interleaves per-message reliability
 //     tracking with the framing, so it owns the encode side. ---
-inline std::optional<std::vector<Bytes>> unbatchMessages(const Bytes& data) {
-    if (data.empty()) return std::nullopt;
-    const int          msgCount = data[0];
-    std::vector<Bytes> out;
-    std::size_t        offset = 1;
-    for (int n = 0; n < msgCount; ++n) {
-        if (offset + 2 > data.size()) return std::nullopt;
-        const std::size_t len      = static_cast<std::size_t>(data[offset]) * 256 + data[offset + 1];
-        const std::size_t msgStart = offset + 2;
-        if (msgStart + len > data.size()) return std::nullopt;
-        out.emplace_back(data.begin() + static_cast<std::ptrdiff_t>(msgStart),
-                         data.begin() + static_cast<std::ptrdiff_t>(msgStart + len));
-        offset = msgStart + len;
+// Walk a coalesced batch, invoking f(wireSpan) for each message wire with no copy. Returns false on a
+// malformed batch (f may already have run for earlier wires). The single framing parser, shared by the
+// zero-copy receive path (span) and unbatchMessages (which materializes owned Bytes).
+template <class F>
+inline bool forEachBatchWire(ByteSpan data, F&& f) {
+    if (data.empty()) return false;
+    const int msgCount = data[0];
+    if (msgCount > maxMsgsPerPacket) return false;   // the encoder never coalesces more than this; reject a malformed/oversized batch
+    std::size_t offset = 1;
+    for (int n = 0; n < msgCount; ++n) {             // validate the whole framing first -- all-or-nothing: a malformed batch dispatches nothing
+        if (offset + 2 > data.size()) return false;
+        const std::size_t len = getU16BE(data.data() + offset);
+        offset += 2 + len;
+        if (offset > data.size()) return false;
     }
+    offset = 1;
+    for (int n = 0; n < msgCount; ++n) {             // framing valid -> dispatch each wire span
+        const std::size_t len = getU16BE(data.data() + offset);
+        f(data.subspan(offset + 2, len));
+        offset += 2 + len;
+    }
+    return true;
+}
+
+// Owning form: materialize each wire as a Bytes; nullopt on a malformed batch.
+inline std::optional<std::vector<Bytes>> unbatchMessages(const Bytes& data) {
+    std::vector<Bytes> out;
+    if (!forEachBatchWire(ByteSpan(data.data(), data.size()),
+                          [&](ByteSpan w) { out.emplace_back(w.begin(), w.end()); }))
+        return std::nullopt;
     return out;
 }
 

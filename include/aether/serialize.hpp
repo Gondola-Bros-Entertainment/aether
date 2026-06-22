@@ -19,6 +19,7 @@ inline void putU64(std::uint8_t* p, std::uint64_t v) noexcept { for (int i = 0; 
 
 inline std::uint8_t  getU8 (const std::uint8_t* p) noexcept { return p[0]; }
 inline std::uint16_t getU16(const std::uint8_t* p) noexcept { return std::uint16_t(p[0]) | std::uint16_t(p[1] << 8); }
+inline std::uint16_t getU16BE(const std::uint8_t* p) noexcept { return static_cast<std::uint16_t>((static_cast<std::uint16_t>(p[0]) << 8) | p[1]); }   // big-endian: the hand-packed wire fields (channel seq, batch length)
 inline std::uint32_t getU32(const std::uint8_t* p) noexcept { std::uint32_t v = 0; for (int i = 0; i < 4; ++i) v |= std::uint32_t(p[i]) << (8 * i); return v; }
 inline std::uint64_t getU64(const std::uint8_t* p) noexcept { std::uint64_t v = 0; for (int i = 0; i < 8; ++i) v |= std::uint64_t(p[i]) << (8 * i); return v; }
 

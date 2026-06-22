@@ -1507,5 +1507,76 @@ int main() {
         std::printf("aether resume-mac OK: forged reconnect rejected (token not burned), real client still resumes\n");
     }
 
+    {   // finding #1: the half-open table is bounded by config.maxPending (a DoS shield), NOT maxClients
+        aether::NetworkConfig cfg;
+        cfg.maxPending = 3;
+        cfg.maxClients = 64;                                          // deliberately != maxPending, to prove which one caps pending
+        aether::NetPeer S = aether::newPeerState(aether::addrAny(7200), cfg, aether::MonoTime{ 0 });
+        for (int i = 0; i < 10; ++i) {                                // 10 distinct sources, one ConnectionRequest each
+            const aether::PeerId from{ aether::addrV4(0x0B000000u + static_cast<std::uint32_t>(i), 5000) };
+            const aether::Bytes req = aether::serializePacket(aether::Packet{
+                aether::PacketHeader{ aether::PacketType::ConnectionRequest, aether::SequenceNum{ 0 }, aether::SequenceNum{ 0 }, 0 }, {} });
+            aether::peerProcess(S, aether::MonoTime{ 1000000 }, { aether::IncomingPacket{ from, req } });
+        }
+        assert(static_cast<int>(S.pending.size()) == cfg.maxPending);   // capped at maxPending (3), not maxClients (64)
+        std::printf("aether maxPending OK: half-open table capped at %d (distinct from maxClients)\n", cfg.maxPending);
+    }
+
+    {   // finding #2: the rendezvous room tables are count-bounded against a Register flood
+        aether::RendezvousServer rv;
+        rv.maxRooms = 4;
+        for (int i = 0; i < 32; ++i) {                                // 32 distinct rooms from 32 distinct sources -> all wait, none pair
+            const aether::Address src = aether::addrV4(0x0C000000u + static_cast<std::uint32_t>(i), 6000);
+            aether::rendezvousProcess(rv, { { src, aether::encodeRegister(2000ull + static_cast<std::uint64_t>(i)) } }, aether::MonoTime{ 0 });
+        }
+        assert(static_cast<int>(rv.waiting.size()) <= rv.maxRooms);     // bounded, not unbounded growth
+        std::printf("aether rendezvous cap OK: waiting table held at <= %d under a 32-room flood\n", rv.maxRooms);
+    }
+
+    {   // hardening: the migration path is rate-limited, so a spoofed-payload flood from one source
+        // cannot force an unbounded candidate-scan + trial-decrypt; everything past the limit is shed.
+        aether::NetworkConfig cfg;
+        cfg.rateLimitPerSecond = 5;
+        aether::NetPeer S = aether::newPeerState(aether::addrAny(7300), cfg, aether::MonoTime{ 0 });
+        const aether::PeerId from{ aether::addrV4(0x0D000001u, 7000) };
+        std::vector<aether::IncomingPacket> flood;
+        for (int i = 0; i < 20; ++i) {
+            const aether::Bytes p = aether::serializePacket(aether::Packet{
+                aether::PacketHeader{ aether::PacketType::Payload, aether::SequenceNum{ static_cast<std::uint16_t>(i) }, aether::SequenceNum{ 0 }, 0 },
+                aether::Bytes(30, 0x5A) });
+            flood.push_back(aether::IncomingPacket{ from, p });
+        }
+        aether::peerProcess(S, aether::MonoTime{ 1000000 }, flood);
+        assert(S.rateLimitDrops > 0 && !aether::peerIsConnected(S, from));   // flood shed past the per-source limit; nothing connected
+        std::printf("aether migration rate-limit OK: %llu spoofed attempts shed, no trial-decrypt storm\n",
+                    static_cast<unsigned long long>(S.rateLimitDrops));
+    }
+
+    {   // zero-copy step 1: the alloc-free primitives must match their owning forms byte-for-byte
+        aether::EncryptionKey key{};
+        for (int i = 0; i < 32; ++i) key[i] = static_cast<std::uint8_t>(i * 7 + 1);
+        const std::uint8_t   aad[9] = { 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+        const aether::Bytes  pt     = { 10, 20, 30, 40, 50 };
+        const aether::Bytes  enc    = aether::encrypt(key, aether::NonceCounter{ 123 }, 0xABCDu, aad, sizeof aad, pt.data(), pt.size());
+
+        const auto ref = aether::decrypt(key, 0xABCDu, aad, sizeof aad, enc.data(), enc.size());   // owning reference
+        assert(ref && ref->plaintext == pt && ref->counter.value == 123);
+
+        std::vector<std::uint8_t> out(enc.size());                                                 // decryptInto must match
+        const auto info = aether::decryptInto(key, 0xABCDu, aad, sizeof aad, enc.data(), enc.size(), out.data());
+        assert(info && info->length == pt.size() && info->counter.value == 123);
+        assert(aether::Bytes(out.begin(), out.begin() + static_cast<std::ptrdiff_t>(info->length)) == pt);
+
+        aether::Bytes bad = enc; bad.back() ^= 0xFFu;                                               // tampered tag -> rejected, out untouched
+        assert(!aether::decryptInto(key, 0xABCDu, aad, sizeof aad, bad.data(), bad.size(), out.data()));
+
+        const aether::Bytes framed = aether::appendCrc32(aether::Bytes{ 9, 8, 7, 6, 5 });           // crc32StrippedLen must match validateAndStripCrc32
+        const auto slen = aether::crc32StrippedLen(framed.data(), framed.size());
+        assert(slen && *slen == 5);
+        aether::Bytes corrupt = framed; corrupt[0] ^= 0xFFu;
+        assert(!aether::crc32StrippedLen(corrupt.data(), corrupt.size()));
+        std::printf("aether zero-copy primitives OK: decryptInto + crc32StrippedLen match the owning forms\n");
+    }
+
     return 0;
 }

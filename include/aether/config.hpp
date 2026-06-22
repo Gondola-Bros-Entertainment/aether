@@ -96,7 +96,7 @@ struct NetworkConfig {
     double        congestionRecoveryTimeMs    = defaultCongestionRecoveryTimeMs;
     int           disconnectRetries           = defaultDisconnectRetries;
     double        disconnectRetryTimeoutMs    = defaultDisconnectRetryTimeoutMs;
-    int           maxPending                  = defaultMaxPending;
+    int           maxPending                  = defaultMaxPending;   // cap on concurrent half-open (in-handshake) connections; distinct from maxClients (established)
     int           rateLimitPerSecond          = defaultRateLimitPerSecond;
     bool          useCwndCongestion           = false;
     std::optional<SimulationConfig> simulation;

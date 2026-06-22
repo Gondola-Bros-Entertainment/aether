@@ -17,6 +17,7 @@
 #include <cstring>
 #include <map>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -79,14 +80,12 @@ inline constexpr double      nsPerMs   = 1.0e6;  // nanoseconds per millisecond 
 
 inline Bytes encodeSalt(std::uint64_t salt) {
     Bytes b(saltBytes);
-    for (std::size_t i = 0; i < saltBytes; ++i) b[i] = static_cast<std::uint8_t>(salt >> (8 * i));   // little-endian
+    putU64(b.data(), salt);   // little-endian (saltBytes == 8)
     return b;
 }
 inline std::optional<std::uint64_t> decodeSalt(const Bytes& b) {
     if (b.size() < saltBytes) return std::nullopt;
-    std::uint64_t v = 0;
-    for (std::size_t i = 0; i < saltBytes; ++i) v |= static_cast<std::uint64_t>(b[i]) << (8 * i);
-    return v;
+    return getU64(b.data());
 }
 
 // reconnect request payload: the resume token (the original clientSalt) + a fresh salt that re-keys
@@ -103,9 +102,9 @@ struct ResumeRequest { std::uint64_t token{}; std::uint64_t freshSalt{}; std::ar
 inline std::optional<ResumeRequest> decodeResume(const Bytes& b) {
     if (b.size() < 2 * saltBytes + 16) return std::nullopt;
     ResumeRequest r;
-    for (std::size_t i = 0; i < saltBytes; ++i) r.token     |= static_cast<std::uint64_t>(b[i])             << (8 * i);
-    for (std::size_t i = 0; i < saltBytes; ++i) r.freshSalt |= static_cast<std::uint64_t>(b[saltBytes + i]) << (8 * i);
-    for (std::size_t i = 0; i < 16; ++i)        r.mac[i]     = b[2 * saltBytes + i];
+    r.token     = getU64(b.data());
+    r.freshSalt = getU64(b.data() + saltBytes);
+    std::memcpy(r.mac.data(), b.data() + 2 * saltBytes, r.mac.size());
     return r;
 }
 
@@ -145,7 +144,7 @@ struct DirectionalKeys { EncryptionKey clientToServer{}; EncryptionKey serverToC
 inline DirectionalKeys deriveDirectionalKeys(const X25519Key& shared, std::uint64_t salt) {
     const auto sub = [&](std::uint8_t dir) {
         std::uint8_t in[16] = {};
-        for (int i = 0; i < 8; ++i) in[i] = static_cast<std::uint8_t>(salt >> (8 * i));
+        putU64(in, salt);
         in[8] = dir;
         EncryptionKey k{};
         detail::hchacha20(shared.data(), in, k.data());
@@ -178,10 +177,10 @@ inline EncryptionKey deriveResumeKey(const X25519Key& master) {
 inline std::array<std::uint8_t, 16> resumeMac(const X25519Key& master, std::uint64_t token, std::uint64_t freshSalt) {
     const EncryptionKey k = deriveResumeKey(master);
     std::uint8_t nonce[12] = {};
-    for (int i = 0; i < 8; ++i) nonce[i] = static_cast<std::uint8_t>(freshSalt >> (8 * i));   // fresh per resume -> unique (key, nonce)
+    putU64(nonce, freshSalt);   // fresh per resume -> unique (key, nonce)
     std::uint8_t aad[16];
-    for (int i = 0; i < 8; ++i) aad[i]     = static_cast<std::uint8_t>(token     >> (8 * i));
-    for (int i = 0; i < 8; ++i) aad[8 + i] = static_cast<std::uint8_t>(freshSalt >> (8 * i));
+    putU64(aad,     token);
+    putU64(aad + 8, freshSalt);
     std::array<std::uint8_t, 16> tag{};
     aeadSeal(k.data(), nonce, aad, sizeof aad, nullptr, 0, nullptr, tag.data());   // empty plaintext: the tag is a MAC over (token, freshSalt)
     return tag;
@@ -204,10 +203,10 @@ inline constexpr int minPayloadSize = 3;
 inline std::pair<ChannelId, bool> decodePayloadHeader(std::uint8_t b) {   // channelWire* constants live in connection.hpp
     return { static_cast<ChannelId>(b & channelWireChannelMask), (b & channelWireFragmentFlag) != 0 };
 }
-inline std::optional<std::pair<SequenceNum, Bytes>> decodeChannelSeq(const Bytes& b) {
+inline std::optional<std::pair<SequenceNum, ByteSpan>> decodeChannelSeq(ByteSpan b) {
     if (b.size() < 2) return std::nullopt;
-    const SequenceNum chSeq{ static_cast<std::uint16_t>((static_cast<std::uint16_t>(b[0]) << 8) | b[1]) };
-    return std::pair<SequenceNum, Bytes>{ chSeq, Bytes(b.begin() + 2, b.end()) };
+    const SequenceNum chSeq{ getU16BE(b.data()) };
+    return std::pair<SequenceNum, ByteSpan>{ chSeq, b.subspan(2) };
 }
 
 inline constexpr std::uint64_t fnvOffsetBasis = 14695981039346656037ull;
@@ -280,7 +279,7 @@ inline std::vector<PeerEvent> handleNewConnectionRequest(NetPeer& peer, const Pe
         if (tr.error) { queueControlPacket(peer, PacketType::ConnectionDenied, encodeDenyReason(DenyReason::InvalidToken), pid); return {}; }
         playerId = tr.playerId;
     }
-    if (static_cast<int>(peer.pending.size()) >= peer.config.maxClients) { peer.rateLimitDrops += 1; return {}; }
+    if (static_cast<int>(peer.pending.size()) >= peer.config.maxPending) { peer.rateLimitDrops += 1; return {}; }   // half-open cap (DoS shield), distinct from the established-connection cap below
     if (static_cast<int>(peer.connections.size()) >= peer.config.maxClients) {
         queueControlPacket(peer, PacketType::ConnectionDenied, encodeDenyReason(DenyReason::ServerFull), pid);
         return {};
@@ -389,14 +388,10 @@ inline std::vector<PeerEvent> handleConnectionAccepted(NetPeer& peer, const Peer
     peer.pending.erase(pid);
     return { evConnected(pid, ConnectionDirection::Outbound) };
 }
-inline std::vector<PeerEvent> handleDisconnect(NetPeer& peer, const PeerId& pid, const Packet& pkt) {
-    if (peer.connections.count(pid)) {
-        peer.connections.erase(pid);
-        cleanupPeer(peer, pid);
-        const DisconnectReason reason = pkt.payload.empty() ? DisconnectReason::Requested
-                                                            : parseDisconnectReason(pkt.payload[0]);
-        return { evDisconnected(pid, reason) };
-    }
+// A keyed connection's Disconnect is authenticated + handled inline in handlePacket; by the time a
+// Disconnect reaches the cold path the peer is only ever a pending/unknown one (an unauthenticated
+// cleartext Disconnect cannot take a real connection down).
+inline std::vector<PeerEvent> handleDisconnect(NetPeer& peer, const PeerId& pid) {
     removePending(peer, pid);
     return {};
 }
@@ -422,47 +417,36 @@ inline std::optional<MigrationCandidate> findMigrationCandidate(const NetPeer& p
 }
 
 // --- payload / fragment / migration dispatch ---
-inline std::vector<PeerEvent> handleFragment(NetPeer& peer, const PeerId& pid, ChannelId channel, const Bytes& fragData, MonoTime now) {
+inline std::vector<PeerEvent> handleFragment(NetPeer& peer, const PeerId& pid, ChannelId channel, ByteSpan fragData, MonoTime now) {
     FragmentAssembler& assembler =
         peer.fragmentAssemblers.try_emplace(pid, newFragmentAssembler(peerFragmentTimeoutMs, peerFragmentMaxBufferSize, peer.config.maxFragments)).first->second;
     const auto complete = processFragment(assembler, fragData.data(), fragData.size(), now);
     if (!complete) return {};
-    const auto cs = decodeChannelSeq(*complete);
+    const auto cs = decodeChannelSeq(ByteSpan(complete->data(), complete->size()));
     if (!cs) return {};
     if (const auto it = peer.connections.find(pid); it != peer.connections.end())
-        receiveIncomingPayload(it->second, channel, cs->first, cs->second, now);
+        receiveIncomingPayload(it->second, channel, cs->first, Bytes(cs->second.begin(), cs->second.end()), now);
     return {};
 }
-// Route one channel-wire ([channel/fragment byte][seq][data]) into the connection's channels.
-inline void receiveChannelWire(NetPeer& peer, const PeerId& pid, Connection& conn, const Bytes& wire, MonoTime now) {
+// Route one channel-wire ([channel/fragment byte][seq][data]) into the connection's channels. Takes a
+// span into the decrypted scratch; the single owned copy is materialized here, where a message is handed
+// off to persist in the channel buffer -- everything upstream of this point is alloc-free.
+inline void receiveChannelWire(NetPeer& peer, const PeerId& pid, Connection& conn, ByteSpan wire, MonoTime now) {
     if (wire.empty()) return;
     const auto [channel, isFragment] = decodePayloadHeader(wire[0]);
-    const Bytes rest(wire.begin() + 1, wire.end());
+    const ByteSpan rest = wire.subspan(1);
     if (isFragment) { handleFragment(peer, pid, channel, rest, now); return; }
-    if (static_cast<int>(wire.size()) < minPayloadSize) return;
+    if (wire.size() < static_cast<std::size_t>(minPayloadSize)) return;
     if (const auto cs = decodeChannelSeq(rest))
-        receiveIncomingPayload(conn, channel, cs->first, cs->second, now);
-}
-inline std::vector<PeerEvent> handlePayload(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
-    const auto it = peer.connections.find(pid);
-    if (it == peer.connections.end()) return {};
-    processIncomingHeader(it->second, pkt.header, now);
-    touchRecvTime(it->second, now);
-    receiveChannelWire(peer, pid, it->second, pkt.payload, now);
-    return {};
-}
-// A coalesced payload: one packet (one sequence) carrying several channel-wires.
-inline std::vector<PeerEvent> handlePayloadBatch(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
-    const auto it = peer.connections.find(pid);
-    if (it == peer.connections.end()) return {};
-    processIncomingHeader(it->second, pkt.header, now);
-    touchRecvTime(it->second, now);
-    if (const auto wires = unbatchMessages(pkt.payload))
-        for (const Bytes& wire : *wires) receiveChannelWire(peer, pid, it->second, wire, now);
-    return {};
+        receiveIncomingPayload(conn, channel, cs->first, Bytes(cs->second.begin(), cs->second.end()), now);
 }
 inline std::vector<PeerEvent> handleMigration(NetPeer& peer, const PeerId& newPid, const Packet& pkt, MonoTime now) {
     if (!peer.config.enableConnectionMigration) return {};
+    // Gate the candidate scan + trial-decrypt behind the per-source rate limiter: an off-path attacker
+    // must not be able to force an O(connections) scan + an AEAD-open per spoofed payload, and the
+    // maxTrackedSources cap bounds the total even under a spoofed-source flood. A real migrating client
+    // needs exactly one accepted attempt (it is keyed by the new address the moment it migrates).
+    if (!rateLimiterAllow(peer.rateLimiter, sockAddrToKey(newPid.addr), now)) { peer.rateLimitDrops += 1; return {}; }
     const auto cand = findMigrationCandidate(peer, pkt, now);
     if (!cand) return {};
     if (const auto it = peer.migrationCooldowns.find(cand->token);
@@ -488,36 +472,22 @@ inline std::vector<PeerEvent> handleMigration(NetPeer& peer, const PeerId& newPi
         peer.fragmentAssemblers[newPid] = std::move(fa->second);
         peer.fragmentAssemblers.erase(fa);
     }
-    // Process the now-decrypted payload on the migrated connection (handlePayload* expect plaintext).
-    const Packet plain{ pkt.header, dec->plaintext };
-    std::vector<PeerEvent> events{ evMigrated(cand->oldPeer, newPid) };
-    auto more = (pkt.header.type == PacketType::PayloadBatch)
-                  ? handlePayloadBatch(peer, newPid, plain, now)
-                  : handlePayload(peer, newPid, plain, now);
-    for (auto& e : more) events.push_back(std::move(e));
-    return events;
+    // Route the now-decrypted payload on the migrated connection -- same span path as the keyed receive.
+    Connection& mconn = peer.connections[newPid];
+    processIncomingHeader(mconn, pkt.header, now);
+    touchRecvTime(mconn, now);
+    const ByteSpan mpayload(dec->plaintext.data(), dec->plaintext.size());
+    if (pkt.header.type == PacketType::PayloadBatch)
+        forEachBatchWire(mpayload, [&](ByteSpan w) { receiveChannelWire(peer, newPid, mconn, w, now); });
+    else
+        receiveChannelWire(peer, newPid, mconn, mpayload, now);
+    return { evMigrated(cand->oldPeer, newPid) };
 }
 
-// clock sync: echo a peer's ping back with our timestamp; feed their pong into our offset estimate.
-inline std::vector<PeerEvent> handleTimeSyncPing(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
-    const auto it = peer.connections.find(pid);
-    if (it == peer.connections.end() || pkt.payload.size() < 8) return {};
-    processIncomingHeader(it->second, pkt.header, now);
-    touchRecvTime(it->second, now);
-    sendTimeSyncPong(it->second, getU64(pkt.payload.data()), now);
-    return {};
-}
-inline std::vector<PeerEvent> handleTimeSyncPong(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
-    const auto it = peer.connections.find(pid);
-    if (it == peer.connections.end() || pkt.payload.size() < 16) return {};
-    processIncomingHeader(it->second, pkt.header, now);
-    touchRecvTime(it->second, now);
-    const double t0ms = static_cast<double>(getU64(pkt.payload.data()))     / nsPerMs;   // our send (echoed)
-    const double t1ms = static_cast<double>(getU64(pkt.payload.data() + 8)) / nsPerMs;   // peer's time
-    const double t2ms = static_cast<double>(now.ns) / nsPerMs;                           // our recv
-    clockSyncObserve(it->second.clockSync, t0ms, t1ms, t2ms);
-    return {};
-}
+// Cold-path dispatch: control/handshake packets (cleartext) plus post-handshake packets from a peer we
+// have no keyed connection for. A keyed connection's post-handshake traffic is decrypted and routed in
+// handlePacket and never reaches here -- so Payload/PayloadBatch here is always a migration probe (path-
+// validated by decryption inside handleMigration), and TimeSync/Keepalive without a connection are noise.
 inline std::vector<PeerEvent> handlePacketByType(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now, PacketType ptype) {
     switch (ptype) {
         case PacketType::ConnectionRequest:   return handleConnectionRequest(peer, pid, pkt, now);
@@ -530,45 +500,76 @@ inline std::vector<PeerEvent> handlePacketByType(NetPeer& peer, const PeerId& pi
             removePending(peer, pid);
             return { evDisconnected(pid, denyToDisconnectReason(decodeDenyReason(pkt.payload))) };
         }
-        case PacketType::Disconnect:          return handleDisconnect(peer, pid, pkt);
+        case PacketType::Disconnect:    return handleDisconnect(peer, pid);
         case PacketType::Payload:
-            return peer.connections.count(pid) ? handlePayload(peer, pid, pkt, now) : handleMigration(peer, pid, pkt, now);
-        case PacketType::PayloadBatch:
-            return peer.connections.count(pid) ? handlePayloadBatch(peer, pid, pkt, now) : handleMigration(peer, pid, pkt, now);
-        case PacketType::TimeSyncPing: return handleTimeSyncPing(peer, pid, pkt, now);
-        case PacketType::TimeSyncPong: return handleTimeSyncPong(peer, pid, pkt, now);
-        case PacketType::Keepalive:
-            if (const auto it = peer.connections.find(pid); it != peer.connections.end()) {
-                processIncomingHeader(it->second, pkt.header, now);
-                touchRecvTime(it->second, now);
-            }
-            return {};
+        case PacketType::PayloadBatch:  return handleMigration(peer, pid, pkt, now);
+        case PacketType::TimeSyncPing:
+        case PacketType::TimeSyncPong:
+        case PacketType::Keepalive:     return {};   // only meaningful on a keyed connection -> handled in handlePacket
     }
     return {};
 }
 
-// --- incoming packet handling (decrypt + anti-replay for post-handshake) ---
+// --- incoming packet handling: decrypt + anti-replay + route ---
+// The keyed post-handshake path copies nothing: it reads the header in place, decrypts the ciphertext
+// into a reused thread-local scratch, and routes the plaintext by span -- the single owned copy is
+// materialized only where a message must outlive the packet (the channel buffer). Control/handshake
+// packets and migration probes take the owned cold path below.
 inline std::vector<PeerEvent> handlePacket(NetPeer& peer, const PeerId& pid, const Bytes& dat, MonoTime now) {
-    const auto parsed = deserializePacket(dat);
-    if (!parsed) return {};
-    Packet           pkt   = *parsed;
-    const PacketType ptype = pkt.header.type;
+    Reader     r{ dat.data(), dat.size(), 0 };
+    const auto header = readHeader(r);   // header only -- no payload copy
+    if (!header) return {};
+    const PacketType ptype = header->type;
     const int        bytes = static_cast<int>(dat.size());
 
     const auto connIt = peer.connections.find(pid);
     const bool keyed  = connIt != peer.connections.end() && connIt->second.recvKey.has_value();
 
     if (isPostHandshake(ptype) && keyed) {
-        Connection& conn = connIt->second;
+        Connection&         conn   = connIt->second;
+        const std::uint8_t* enc    = dat.data() + packetHeaderBytes;   // [counter:8][ciphertext][tag:16]
+        const std::size_t   encLen = dat.size() - packetHeaderBytes;   // dat.size() >= packetHeaderBytes (readHeader checked)
         recordBytesReceived(conn, bytes, now);
-        const auto dec = decrypt(*conn.recvKey, peer.config.protocolId,
-                                 dat.data(), packetHeaderBytes,   // the cleartext header, authenticated as AAD
-                                 pkt.payload.data(), pkt.payload.size());
-        if (!dec) { conn.stats.decryptionFailures += 1; return {}; }
-        if (!replayAccept(conn.recvReplay, dec->counter.value)) return {};   // replayed or outside the window
-        pkt.payload = dec->plaintext;
-        return handlePacketByType(peer, pid, pkt, now, ptype);
+
+        static thread_local Bytes scratch;                             // reused -> no per-packet plaintext alloc
+        if (scratch.size() < encLen) scratch.resize(encLen);           // grows once; the span below is valid only for this packet
+        const auto info = decryptInto(*conn.recvKey, peer.config.protocolId,
+                                      dat.data(), packetHeaderBytes,   // the cleartext header, authenticated as AAD
+                                      enc, encLen, scratch.data());
+        if (!info) { conn.stats.decryptionFailures += 1; return {}; }
+        if (!replayAccept(conn.recvReplay, info->counter.value)) return {};   // replayed or outside the window
+        const ByteSpan payload(scratch.data(), info->length);
+
+        if (ptype == PacketType::Disconnect) {   // erases conn -- read the reason, then stop touching it
+            const DisconnectReason reason = info->length == 0 ? DisconnectReason::Requested : parseDisconnectReason(scratch[0]);
+            peer.connections.erase(pid);
+            cleanupPeer(peer, pid);
+            return { evDisconnected(pid, reason) };
+        }
+        processIncomingHeader(conn, *header, now);
+        touchRecvTime(conn, now);
+        switch (ptype) {
+            case PacketType::Payload:
+                receiveChannelWire(peer, pid, conn, payload, now);
+                break;
+            case PacketType::PayloadBatch:
+                forEachBatchWire(payload, [&](ByteSpan w) { receiveChannelWire(peer, pid, conn, w, now); });
+                break;
+            case PacketType::TimeSyncPing:
+                if (payload.size() >= 8) sendTimeSyncPong(conn, getU64(payload.data()), now);   // echo our reply stamped with our clock
+                break;
+            case PacketType::TimeSyncPong:
+                if (payload.size() >= 16)                                                       // fold the round-trip into the offset estimate
+                    clockSyncObserve(conn.clockSync, static_cast<double>(getU64(payload.data())) / nsPerMs,
+                                     static_cast<double>(getU64(payload.data() + 8)) / nsPerMs, static_cast<double>(now.ns) / nsPerMs);
+                break;
+            default: break;   // Keepalive: the header processing above is all it needs
+        }
+        return {};
     }
+
+    // cold path: control/handshake (cleartext) + a payload from an unknown source (a migration probe)
+    Packet pkt{ *header, Bytes(dat.begin() + static_cast<std::ptrdiff_t>(packetHeaderBytes), dat.end()) };
     if (connIt != peer.connections.end()) recordBytesReceived(connIt->second, bytes, now);
     return handlePacketByType(peer, pid, pkt, now, ptype);
 }
@@ -741,12 +742,13 @@ inline std::optional<ConnectionError> peerSend(NetPeer& peer, const PeerId& pid,
     if (it == peer.connections.end()) return ConnectionError{ ConnectionError::NotConnected };
     return sendMessage(it->second, channel, dat, now);
 }
+// Queue a message to every connected peer (except `except`). Like sendMessage this enqueues into each
+// peer's channels; the next peerProcess coalesces + encrypts + sends. Best-effort: per-peer failures ignored.
 inline void peerBroadcast(NetPeer& peer, ChannelId channel, const Bytes& dat, const std::optional<PeerId>& except, MonoTime now) {
     for (auto& [pid, conn] : peer.connections) {
         if (except && *except == pid) continue;
-        sendMessage(conn, channel, dat, now);   // best-effort: ignore per-peer failures
+        sendMessage(conn, channel, dat, now);
     }
-    drainAllConnectionQueues(peer, now);
 }
 
 // --- queries ---

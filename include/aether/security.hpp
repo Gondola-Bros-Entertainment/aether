@@ -53,16 +53,24 @@ inline Bytes appendCrc32(const Bytes& data) {
     return out;
 }
 
-// Verify and strip a trailing CRC32C; nullopt if too short or corrupt.
-inline std::optional<Bytes> validateAndStripCrc32(const Bytes& data) {
-    if (data.size() < static_cast<std::size_t>(crc32Size)) return std::nullopt;
-    const std::size_t   payloadLen = data.size() - crc32Size;
+// Verify a trailing CRC32C over data[0,len); return the payload length (len - crc32Size) on success,
+// nullopt if too short or corrupt. Alloc-free: the caller keeps its buffer and treats [0, returned)
+// as the payload -- the recv-path form of validateAndStripCrc32.
+inline std::optional<std::size_t> crc32StrippedLen(const std::uint8_t* data, std::size_t len) noexcept {
+    if (len < static_cast<std::size_t>(crc32Size)) return std::nullopt;
+    const std::size_t   payloadLen = len - crc32Size;
     const std::uint32_t expected   = static_cast<std::uint32_t>(data[payloadLen]) |
                                      (static_cast<std::uint32_t>(data[payloadLen + 1]) << 8) |
                                      (static_cast<std::uint32_t>(data[payloadLen + 2]) << 16) |
                                      (static_cast<std::uint32_t>(data[payloadLen + 3]) << 24);
-    if (crc32c(data.data(), payloadLen) != expected) return std::nullopt;
-    return Bytes(data.begin(), data.begin() + static_cast<std::ptrdiff_t>(payloadLen));
+    return crc32c(data, payloadLen) == expected ? std::optional<std::size_t>(payloadLen) : std::nullopt;
+}
+
+// Verify and strip a trailing CRC32C; nullopt if too short or corrupt. The owning form of crc32StrippedLen.
+inline std::optional<Bytes> validateAndStripCrc32(const Bytes& data) {
+    const auto payloadLen = crc32StrippedLen(data.data(), data.size());
+    if (!payloadLen) return std::nullopt;
+    return Bytes(data.begin(), data.begin() + static_cast<std::ptrdiff_t>(*payloadLen));
 }
 
 // --- rate limiter (per-source connection-request throttle, self-cleaning) ---

@@ -272,17 +272,28 @@ inline void aeadSeal(const std::uint8_t key[32], const std::uint8_t nonce[12],
     detail::poly1305Tag(polyKey, aad, aadLen, ct, ptLen, tag);
 }
 
-// AEAD open: verify the tag and decrypt; nullopt on authentication failure.
-inline std::optional<Bytes> aeadOpen(const std::uint8_t key[32], const std::uint8_t nonce[12],
-                                     const std::uint8_t* aad, std::size_t aadLen,
-                                     const std::uint8_t* ct, std::size_t ctLen, const std::uint8_t tag[16]) {
+// Verify the tag and decrypt ct -> out (out holds ctLen bytes; out may alias ct for true in-place).
+// Returns false on authentication failure, leaving out untouched. The alloc-free core of aeadOpen,
+// for the per-packet receive path; the tag is checked before any plaintext is written.
+inline bool aeadOpenInto(const std::uint8_t key[32], const std::uint8_t nonce[12],
+                         const std::uint8_t* aad, std::size_t aadLen,
+                         const std::uint8_t* ct, std::size_t ctLen, const std::uint8_t tag[16],
+                         std::uint8_t* out) {
     std::uint8_t polyKey[64];
     detail::chacha20Block(key, 0, nonce, polyKey);
     std::uint8_t computed[16];
     detail::poly1305Tag(polyKey, aad, aadLen, ct, ctLen, computed);
-    if (!detail::constTimeEq(computed, tag, 16)) return std::nullopt;
+    if (!detail::constTimeEq(computed, tag, 16)) return false;
+    detail::chacha20Xor(key, 1, nonce, ct, out, ctLen);
+    return true;
+}
+
+// AEAD open: verify the tag and decrypt; nullopt on authentication failure.
+inline std::optional<Bytes> aeadOpen(const std::uint8_t key[32], const std::uint8_t nonce[12],
+                                     const std::uint8_t* aad, std::size_t aadLen,
+                                     const std::uint8_t* ct, std::size_t ctLen, const std::uint8_t tag[16]) {
     Bytes pt(ctLen);
-    detail::chacha20Xor(key, 1, nonce, ct, pt.data(), ctLen);
+    if (!aeadOpenInto(key, nonce, aad, aadLen, ct, ctLen, tag, pt.data())) return std::nullopt;
     return pt;
 }
 
@@ -309,22 +320,36 @@ inline Bytes encrypt(const EncryptionKey& key, NonceCounter counter, std::uint32
 
 struct DecryptResult { Bytes plaintext; NonceCounter counter; };
 
+// Alloc-free decrypt for the per-packet path: write the plaintext into `out` (caller-sized to at
+// least len - encryptionOverhead) and return its length + counter; nullopt on failure (bad tag,
+// including a tampered `aad` header). decrypt() below is the owning convenience form. The caller
+// enforces anti-replay on the returned counter.
+struct DecryptInfo { std::size_t length{}; NonceCounter counter{}; };
+inline std::optional<DecryptInfo> decryptInto(const EncryptionKey& key, std::uint32_t protocolId,
+                                              const std::uint8_t* aad, std::size_t aadLen,
+                                              const std::uint8_t* data, std::size_t len, std::uint8_t* out) {
+    if (len < static_cast<std::size_t>(nonceSize) + authTagSize) return std::nullopt;
+    std::uint64_t counter = 0;
+    for (int i = 0; i < nonceSize; ++i) counter = (counter << 8) | data[i];
+    const std::size_t   ctLen = len - nonceSize - authTagSize;
+    const std::uint8_t* ct    = data + nonceSize;
+    const std::uint8_t* tag   = data + nonceSize + ctLen;
+    std::uint8_t nonce[12];
+    buildNonce(counter, protocolId, nonce);
+    if (!aeadOpenInto(key.data(), nonce, aad, aadLen, ct, ctLen, tag, out)) return std::nullopt;
+    return DecryptInfo{ ctLen, NonceCounter{ counter } };
+}
+
 // Decrypt a payload of the form [counter:8 BE][ciphertext][tag:16]; nullopt on failure (bad tag,
-// including a tampered `aad` header). The caller enforces anti-replay on the returned counter.
+// including a tampered `aad` header). The owning form of decryptInto.
 inline std::optional<DecryptResult> decrypt(const EncryptionKey& key, std::uint32_t protocolId,
                                             const std::uint8_t* aad, std::size_t aadLen,
                                             const std::uint8_t* data, std::size_t len) {
     if (len < static_cast<std::size_t>(nonceSize) + authTagSize) return std::nullopt;
-    std::uint64_t counter = 0;
-    for (int i = 0; i < nonceSize; ++i) counter = (counter << 8) | data[i];
-    const std::size_t    ctLen = len - nonceSize - authTagSize;
-    const std::uint8_t*  ct    = data + nonceSize;
-    const std::uint8_t*  tag   = data + nonceSize + ctLen;
-    std::uint8_t nonce[12];
-    buildNonce(counter, protocolId, nonce);
-    auto pt = aeadOpen(key.data(), nonce, aad, aadLen, ct, ctLen, tag);
-    if (!pt) return std::nullopt;
-    return DecryptResult{ std::move(*pt), NonceCounter{ counter } };
+    Bytes pt(len - static_cast<std::size_t>(nonceSize) - static_cast<std::size_t>(authTagSize));
+    const auto info = decryptInto(key, protocolId, aad, aadLen, data, len, pt.data());
+    if (!info) return std::nullopt;
+    return DecryptResult{ std::move(pt), info->counter };
 }
 
 // Anti-replay sliding window over the AEAD nonce counter. UDP reorders, so a strictly-increasing

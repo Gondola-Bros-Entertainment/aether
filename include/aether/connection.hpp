@@ -332,10 +332,10 @@ inline std::vector<Bytes> receiveMessage(Connection& conn, ChannelId channelId) 
     return channelReceive(conn.channels[static_cast<std::size_t>(idx)]);
 }
 
-inline void receiveIncomingPayload(Connection& conn, ChannelId channelId, SequenceNum chSeq, const Bytes& payload, MonoTime now) {
+inline void receiveIncomingPayload(Connection& conn, ChannelId channelId, SequenceNum chSeq, Bytes payload, MonoTime now) {
     const int idx = toInt(channelId);
     if (idx < 0 || idx >= static_cast<int>(conn.channels.size())) return;
-    onMessageReceived(conn.channels[static_cast<std::size_t>(idx)], chSeq, payload, now);
+    onMessageReceived(conn.channels[static_cast<std::size_t>(idx)], chSeq, std::move(payload), now);
 }
 
 // Feed an incoming header into reliability: record it for acking, process the peer's acks,

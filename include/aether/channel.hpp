@@ -151,16 +151,16 @@ inline void markForRetransmit(Channel& ch, SequenceNum seq) noexcept {
 }
 
 // --- receiving ---
-inline void deliverOrdered(Channel& ch, const Bytes& payload);
-inline void bufferOrdered(Channel& ch, SequenceNum seq, const Bytes& payload, MonoTime now);
+inline void deliverOrdered(Channel& ch, Bytes payload);
+inline void bufferOrdered(Channel& ch, SequenceNum seq, Bytes payload, MonoTime now);
 inline void flushOrderedBuffer(Channel& ch);
 
 // Buffer a delivered message, capped at maxReceiveBufferSize so an app that stops draining cannot grow
 // the receive buffer without bound. When full the incoming message is dropped (the already-buffered,
 // in-order-for-ordered-channels backlog is kept) -- a last-resort memory shield, not normal-path loss.
-inline void pushReceived(Channel& ch, const Bytes& payload) {
+inline void pushReceived(Channel& ch, Bytes payload) {
     if (static_cast<int>(ch.receiveBuffer.size()) >= ch.config.maxReceiveBufferSize) { ch.totalDropped += 1; return; }
-    ch.receiveBuffer.push_back(payload);
+    ch.receiveBuffer.push_back(std::move(payload));
     ch.totalReceived += 1;
 }
 inline void pushPendingAck(Channel& ch, SequenceNum seq) {
@@ -168,50 +168,50 @@ inline void pushPendingAck(Channel& ch, SequenceNum seq) {
     ch.pendingAck.push_back(seq);
 }
 
-inline void onMessageReceived(Channel& ch, SequenceNum seq, const Bytes& payload, MonoTime now) {
+inline void onMessageReceived(Channel& ch, SequenceNum seq, Bytes payload, MonoTime now) {
     // Enforce the channel's size contract on RECEIVE too, not just send: a peer (or a reassembled
     // fragment stream) can present a payload far larger than maxMessageSize, and buffering it would
     // bypass the cap the channel declared. A legitimately-sent message is always within the bound.
     if (static_cast<int>(payload.size()) > ch.config.maxMessageSize) { ch.totalDropped += 1; return; }
     switch (ch.config.deliveryMode) {
         case DeliveryMode::Unreliable:
-            pushReceived(ch, payload);
+            pushReceived(ch, std::move(payload));
             break;
         case DeliveryMode::UnreliableSequenced:
-            if (newer(seq, ch.remoteSeq)) { pushReceived(ch, payload); ch.remoteSeq = seq; }
+            if (newer(seq, ch.remoteSeq)) { pushReceived(ch, std::move(payload)); ch.remoteSeq = seq; }
             else                          { ch.totalDropped += 1; }
             break;
         case DeliveryMode::ReliableUnordered:
-            pushReceived(ch, payload);
+            pushReceived(ch, std::move(payload));
             pushPendingAck(ch, seq);
             break;
         case DeliveryMode::ReliableOrdered:
             pushPendingAck(ch, seq);
-            if (seq == ch.orderedExpected) deliverOrdered(ch, payload);
-            else                           bufferOrdered(ch, seq, payload, now);
+            if (seq == ch.orderedExpected) deliverOrdered(ch, std::move(payload));
+            else                           bufferOrdered(ch, seq, std::move(payload), now);
             break;
         case DeliveryMode::ReliableSequenced:
             pushPendingAck(ch, seq);
-            if (newer(seq, ch.remoteSeq)) { pushReceived(ch, payload); ch.remoteSeq = seq; }
+            if (newer(seq, ch.remoteSeq)) { pushReceived(ch, std::move(payload)); ch.remoteSeq = seq; }
             else                          { ch.totalDropped += 1; }
             break;
     }
 }
 
-inline void deliverOrdered(Channel& ch, const Bytes& payload) {
-    pushReceived(ch, payload);
+inline void deliverOrdered(Channel& ch, Bytes payload) {
+    pushReceived(ch, std::move(payload));
     ch.orderedExpected = next(ch.orderedExpected);
     flushOrderedBuffer(ch);
 }
-inline void bufferOrdered(Channel& ch, SequenceNum seq, const Bytes& payload, MonoTime now) {
+inline void bufferOrdered(Channel& ch, SequenceNum seq, Bytes payload, MonoTime now) {
     if (static_cast<int>(ch.orderedBuffer.size()) >= ch.config.maxOrderedBufferSize) { ch.totalDropped += 1; return; }
-    ch.orderedBuffer[seq] = { payload, now };
+    ch.orderedBuffer[seq] = { std::move(payload), now };
 }
 inline void flushOrderedBuffer(Channel& ch) {
     for (;;) {
         auto it = ch.orderedBuffer.find(ch.orderedExpected);
         if (it == ch.orderedBuffer.end()) break;
-        pushReceived(ch, it->second.first);
+        pushReceived(ch, std::move(it->second.first));
         ch.orderedBuffer.erase(it);
         ch.orderedExpected = next(ch.orderedExpected);
     }
@@ -259,7 +259,7 @@ inline void flushTimedOutOrdered(Channel& ch, MonoTime now) {
     bool        anyFlushed = false;
     for (auto it = ch.orderedBuffer.begin(); it != ch.orderedBuffer.end(); ) {
         if (elapsedMs(it->second.second, now) >= timeout) {
-            pushReceived(ch, it->second.first);
+            pushReceived(ch, std::move(it->second.first));
             if (!anyFlushed || newer(it->first, maxFlushed)) { maxFlushed = it->first; anyFlushed = true; }   // wrap-aware max, not raw <
             it = ch.orderedBuffer.erase(it);
         } else {

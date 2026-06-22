@@ -24,6 +24,7 @@ inline std::optional<std::uint64_t> readVarU(Reader& r) noexcept {
     for (int i = 0; i < 10; ++i) {                 // 10 * 7 = 70 bits covers a full u64
         const auto b = read<std::uint8_t>(r);
         if (!b) return std::nullopt;
+        if (i == 9 && (*b & 0x7Eu)) return std::nullopt;   // 10th byte: only bit 63 fits, so bits 1..6 would overflow u64 -- reject the non-canonical encoding, never silently truncate
         v |= static_cast<std::uint64_t>(*b & 0x7Fu) << shift;
         if ((*b & 0x80u) == 0) return v;
         shift += 7;

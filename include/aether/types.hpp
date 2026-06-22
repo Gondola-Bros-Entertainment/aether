@@ -4,12 +4,15 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace aether {
 
 // A byte buffer (payloads, packets, fragments).
 using Bytes = std::vector<std::uint8_t>;
+// A read-only view of bytes (a payload, wire, or fragment) -- non-owning, no copy.
+using ByteSpan = std::span<const std::uint8_t>;
 
 // A channel identifier - one logical stream of messages. Not a quantity.
 enum class ChannelId : std::uint8_t {};
