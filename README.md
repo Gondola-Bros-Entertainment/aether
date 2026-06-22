@@ -155,21 +155,17 @@ cmake -B build -DAETHER_BENCH_COMPARE=ON
 cmake --build build --target aether_bench_compare && ./build/aether_bench_compare
 ```
 
-## Status
+## Testing
 
-The netcode stack is complete and hardened. Reliable delivery is exercised under heavy simulated
-packet loss -- a message that must arrive does, by retransmit; a message larger than the MTU splits
-into fragments and reassembles under that same loss, delivering only once every fragment arrives.
-Connections are encrypted by
-default: the X25519 key exchange is checked against RFC 7748, the ChaCha20-Poly1305 against RFC
-8439. Every decoder is fuzzed against random and truncated input and the serializer is property-tested
-over arbitrary values, both under ASan/UBSan. CI is a staged pipeline -- static analysis, then
+Reliable delivery and large-message fragmentation are exercised under heavy simulated packet loss --
+a message that must arrive does, by retransmit, and a fragmented one reassembles only once every
+fragment lands. Every decoder is fuzzed against random and truncated input, and the serializer is
+property-tested over arbitrary values, both under ASan/UBSan. CI is staged -- static analysis, then
 ASan/UBSan, then a build-and-test matrix across gcc, clang, and MSVC on Linux, macOS, and Windows,
-all warning-clean under -Werror. NAT traversal pairs peers behind NATs and hole-punches, with a relay
-fallback through the rendezvous when the punch fails.
+warning-clean under -Werror.
 
 ## License
 
-MIT, (c) 2026 Novavero AI Inc. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
 
 Built by Devon Tomlin (Novavero AI Inc.).
