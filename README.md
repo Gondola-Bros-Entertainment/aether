@@ -168,4 +168,6 @@ fallback through the rendezvous when the punch fails.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT, (c) 2026 Novavero AI Inc. See [LICENSE](LICENSE).
+
+Built by Devon Tomlin (Novavero AI Inc.).
