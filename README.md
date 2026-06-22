@@ -158,7 +158,9 @@ cmake --build build --target aether_bench_compare && ./build/aether_bench_compar
 ## Status
 
 The netcode stack is complete and hardened. Reliable delivery is exercised under heavy simulated
-packet loss -- a message that must arrive does, by retransmit. Connections are encrypted by
+packet loss -- a message that must arrive does, by retransmit; a message larger than the MTU splits
+into fragments and reassembles under that same loss, delivering only once every fragment arrives.
+Connections are encrypted by
 default: the X25519 key exchange is checked against RFC 7748, the ChaCha20-Poly1305 against RFC
 8439. Every decoder is fuzzed against random and truncated input and the serializer is property-tested
 over arbitrary values, both under ASan/UBSan. CI is a staged pipeline -- static analysis, then
