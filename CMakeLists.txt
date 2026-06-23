@@ -1,5 +1,7 @@
-cmake_minimum_required(VERSION 3.20)
-project(aether CXX)
+cmake_minimum_required(VERSION 3.23)   # FILE_SET HEADERS (install-interface header sets)
+project(aether VERSION 0.1.0 LANGUAGES CXX)
+
+include(GNUInstallDirs)   # CMAKE_INSTALL_{INCLUDEDIR,LIBDIR,BINDIR} for the install rules below
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -28,7 +30,16 @@ if(WIN32)
 else()
     add_library(aether STATIC src/socket_posix.cpp)
 endif()
-target_include_directories(aether PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# Public headers as a FILE_SET (also drives the self-containment check below). BASE_DIRS wires the
+# build-interface include dir; install(... FILE_SET HEADERS) below adds the install-interface dir and
+# ships the headers -- one declaration in place of a target_include_directories + install(DIRECTORY).
+file(GLOB AETHER_HEADERS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/include/aether/*.hpp)
+target_sources(aether PUBLIC
+    FILE_SET HEADERS
+    BASE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/include
+    FILES ${AETHER_HEADERS})
+target_compile_features(aether PUBLIC cxx_std_20)   # exported: consumers get C++20 without setting it themselves
+add_library(aether::aether ALIAS aether)   # same target name in-tree (add_subdirectory) and installed
 
 enable_testing()
 
@@ -36,7 +47,6 @@ enable_testing()
 # Every public header must compile on its own (include what you use). One generated translation
 # unit per header, each including only that header; no main, because compiling IS the test. If a
 # header forgets an include, this target fails to build.
-file(GLOB AETHER_HEADERS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/include/aether/*.hpp)
 set(selfcontained_srcs "")
 foreach(hdr ${AETHER_HEADERS})
     get_filename_component(name ${hdr} NAME_WE)
@@ -92,4 +102,43 @@ if(AETHER_BENCH_COMPARE)
     target_link_libraries(aether_bench_compare PRIVATE aether)
     target_include_directories(aether_bench_compare PRIVATE ${zpp_bits_SOURCE_DIR})
     target_compile_options(aether_bench_compare PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,$<$<NOT:$<CONFIG:Debug>>:/O2>,-O3>)
+endif()
+
+# --- install / export ---
+# Make aether consumable from outside the tree. An installed prefix exposes
+# find_package(aether CONFIG) -> the imported target aether::aether, the same name the in-tree
+# ALIAS gives add_subdirectory / FetchContent consumers. Default ON only when aether is the
+# top-level build, so a parent project that pulls aether in does not inherit its install rules.
+option(AETHER_INSTALL "Generate aether install + export rules" ${PROJECT_IS_TOP_LEVEL})
+
+if(AETHER_INSTALL)
+    include(CMakePackageConfigHelpers)
+    set(AETHER_CMAKEDIR ${CMAKE_INSTALL_LIBDIR}/cmake/aether)
+
+    install(TARGETS aether
+        EXPORT aetherTargets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        FILE_SET HEADERS DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})   # ships the headers + the install-interface include dir
+
+    install(EXPORT aetherTargets
+        FILE aetherTargets.cmake
+        NAMESPACE aether::
+        DESTINATION ${AETHER_CMAKEDIR})
+
+    configure_package_config_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/cmake/aetherConfig.cmake.in
+        ${CMAKE_CURRENT_BINARY_DIR}/aetherConfig.cmake
+        INSTALL_DESTINATION ${AETHER_CMAKEDIR})
+
+    write_basic_package_version_file(
+        ${CMAKE_CURRENT_BINARY_DIR}/aetherConfigVersion.cmake
+        VERSION ${PROJECT_VERSION}
+        COMPATIBILITY SameMinorVersion)   # pre-1.0: each 0.x minor may break, so match major.minor
+
+    install(FILES
+        ${CMAKE_CURRENT_BINARY_DIR}/aetherConfig.cmake
+        ${CMAKE_CURRENT_BINARY_DIR}/aetherConfigVersion.cmake
+        DESTINATION ${AETHER_CMAKEDIR})
 endif()

@@ -73,3 +73,28 @@ jobs:
         run: cmake --build build --config Debug
       - name: Test
         run: ctest --test-dir build -C Debug --output-on-failure
+
+  # Prove the install/export rules: install aether to a prefix, then consume it from a SEPARATE
+  # project via find_package(aether) -> aether::aether. Covers the Windows leg too, where the
+  # exported target carries ws2_32/bcrypt. Release on both sides so the imported config matches on
+  # multi-config generators (MSVC); -DCMAKE_BUILD_TYPE covers single-config, --config multi-config.
+  package:
+    name: package / ${{ matrix.os }}
+    needs: [build-test, windows]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure aether
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build aether
+        run: cmake --build build --target aether --config Release
+      - name: Install aether
+        run: cmake --install build --prefix "${{ runner.temp }}/aether-prefix" --config Release
+      - name: Configure consumer against the installed package
+        run: cmake -S test/package -B test/package/build -DCMAKE_PREFIX_PATH="${{ runner.temp }}/aether-prefix" -DCMAKE_BUILD_TYPE=Release
+      - name: Build consumer
+        run: cmake --build test/package/build --config Release

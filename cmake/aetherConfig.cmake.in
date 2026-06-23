@@ -1,0 +1,7 @@
+@PACKAGE_INIT@
+
+# aether is zero-dependency: no find_dependency() calls. ws2_32/bcrypt on Windows are
+# system libraries carried on the exported target, resolved by the linker directly.
+include("${CMAKE_CURRENT_LIST_DIR}/aetherTargets.cmake")
+
+check_required_components(aether)
