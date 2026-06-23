@@ -31,6 +31,7 @@ inline constexpr int          timeSyncPingBytes       = 8;      // TimeSyncPing 
 inline constexpr int          timeSyncPongBytes       = 16;     // TimeSyncPong payload: [u64 echoed ns][u64 responder ns]
 inline constexpr std::uint8_t channelWireFragmentFlag = 0x80;   // channel byte high bit: this wire is a fragment
 inline constexpr std::uint8_t channelWireChannelMask  = 0x07;   // channel byte low 3 bits: channel id (<= 8 channels)
+static_assert(maxChannelCount <= channelWireChannelMask + 1, "channel id must fit the low bits of the channel wire byte");
 // channelWireSeqBytes / packetWireOverhead / effectivePayloadBudget / maxFragmentChunk are single-sourced
 // in config.hpp (MTU-derived sizing; validateConfig uses them to reject an unfragmentable maxMessageSize).
 
@@ -100,7 +101,7 @@ struct Connection {
     std::optional<EncryptionKey> recvKey;        // the peer's send direction
     std::optional<X25519Key>     resumeMaster;   // ECDH shared secret, cached to re-key a fast reconnect
     NonceCounter                 sendNonce{};
-    ReplayWindow                 recvReplay{};
+    ReplayWindow                 recvReplay{};                // 64-bit sliding window (replayWindowBits, crypto.hpp)
     bool                         pendingAck        = false;
     bool                         dataSentThisTick  = false;
     ClockSync                    clockSync{};                 // estimated offset to the peer's clock

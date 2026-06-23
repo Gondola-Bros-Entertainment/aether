@@ -146,6 +146,13 @@ template <class T> std::optional<T> deltaUnpack(Reader& r, const T& prev) {
     std::uint8_t mask[maskBytes ? maskBytes : 1] = {};
     if (!readBytes(r, mask, maskBytes)) return std::nullopt;
 
+    // Reject a non-canonical changemask: our encoder only ever sets the low n bits, so any high padding
+    // bit set in the last mask byte is malformed/hostile input.
+    if constexpr (n % 8 != 0) {
+        constexpr auto validLow = static_cast<std::uint8_t>((1u << (n % 8)) - 1);
+        if (mask[maskBytes - 1] & static_cast<std::uint8_t>(~validLow)) return std::nullopt;
+    }
+
     T curr = prev;                                  // unchanged fields inherit the baseline
     bool ok = true;
     std::size_t i = 0;

@@ -251,7 +251,7 @@ inline bool forEachBatchWire(ByteSpan data, F&& f) {
     if (msgCount > maxMsgsPerPacket) return false;   // the encoder never coalesces more than this; reject a malformed/oversized batch
     std::size_t offset = 1;
     for (int n = 0; n < msgCount; ++n) {             // validate the whole framing first -- all-or-nothing: a malformed batch dispatches nothing
-        if (offset + 2 > data.size()) return false;
+        if (data.size() - offset < 2) return false;   // offset <= size() (loop invariant) -> subtraction form, not the additive shape the standard forbids
         const std::size_t len = getU16BE(data.data() + offset);
         offset += 2 + len;
         if (offset > data.size()) return false;

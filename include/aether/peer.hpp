@@ -270,9 +270,9 @@ inline void queueControlPacket(NetPeer& peer, PacketType ptype, const Bytes& pay
 
 // --- handshake handlers ---
 inline std::vector<PeerEvent> handleNewConnectionRequest(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
-    // Cheapest gate first: a per-source rate check, so a flood is shed before paying for the token
-    // decrypt and the X25519 keygen below.
-    if (!rateLimiterAllow(peer.rateLimiter, sockAddrToKey(pid.addr), now)) { peer.rateLimitDrops += 1; return {}; }
+    // The per-source rate gate already ran in handleConnectionRequest (the sole caller); here the order
+    // is token-validate -> half-open cap -> client cap -> X25519 keygen, cheapest security check first
+    // so a flood without a valid token never reaches the keygen.
     std::uint64_t playerId = 0;
     if (peer.config.tokenKey) {   // auth on: a valid sealed token gates everything below (incl. keygen) -- the DoS shield
         const auto tr = validateConnectToken(*peer.config.tokenKey, peer.tokenValidator, pkt.payload, now);
@@ -297,6 +297,11 @@ inline std::vector<PeerEvent> handleNewConnectionRequest(NetPeer& peer, const Pe
     return {};
 }
 inline std::vector<PeerEvent> handleConnectionRequest(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
+    // One per-source rate gate covering every reflective reply below (the idempotent Accepted, the
+    // resume Accepted, the challenge resend, and a fresh request via handleNewConnectionRequest, its
+    // sole caller, which trusts this gate) -- so a spoofed source cannot bounce an amplified stream off
+    // the server.
+    if (!rateLimiterAllow(peer.rateLimiter, sockAddrToKey(pid.addr), now)) { peer.rateLimitDrops += 1; return {}; }
     if (peer.connections.count(pid)) { queueControlPacket(peer, PacketType::ConnectionAccepted, {}, pid); return {}; }
     // reconnect: a request carrying a recently-dropped session token re-establishes that session
     // fast, skipping the challenge -- the token (the original clientSalt) is the credential. The
@@ -583,6 +588,11 @@ inline std::vector<RawPacket> encryptOutgoing(NetPeer& peer, const PeerId& pid, 
         header.type = op.type;
         const Bytes serialized = serializePacket(Packet{ header, op.payload });
         if (conn.sendKey && isPostHandshake(op.type)) {
+            // Fail closed: never wrap the send counter -- reusing a (key,nonce) pair would be
+            // catastrophic for ChaCha20-Poly1305. 2^64 packets on one un-rekeyed session is unreachable
+            // (~585,000 years at 1M pkt/s); a session that somehow reached it stops sending and times
+            // out rather than reuse a nonce.
+            if (conn.sendNonce.value == UINT64_MAX) continue;
             const NonceCounter nonce = conn.sendNonce;
             Bytes combined(serialized.begin(), serialized.begin() + static_cast<std::ptrdiff_t>(packetHeaderBytes));
             const Bytes enc = encrypt(*conn.sendKey, nonce, peer.config.protocolId,

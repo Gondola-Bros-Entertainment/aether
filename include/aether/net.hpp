@@ -51,7 +51,7 @@ inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<Chan
     for (;;) {
         Address   from{};
         const int n = recvFrom(h.socket, std::span<std::uint8_t>(scratch.data(), scratch.size()), from);
-        if (n < 0) break;   // -1 == no more data; a 0-byte datagram returns 0 and is drained (CRC-rejected) so it cannot stall the queue
+        if (n < 0) break;   // -1 == no more data (or a hard socket error); a 0-byte datagram returns 0 and is drained (CRC-rejected) so it cannot stall the queue
         Bytes raw(scratch.begin(), scratch.begin() + n);
         if (h.rendezvousAddr && addrEqual(from, *h.rendezvousAddr)) {
             if (const auto paired = decodePaired(raw)) {   // a pairing reply from the rendezvous

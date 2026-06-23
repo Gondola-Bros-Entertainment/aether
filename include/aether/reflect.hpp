@@ -50,8 +50,10 @@ template <class U>           inline constexpr bool isStdOptional<std::optional<U
 
 // Cap the up-front reserve when decoding a length-prefixed vector from untrusted bytes, so a hostile
 // element COUNT cannot inflate the allocation: reserve at most ~64KB worth of elements (one minimum),
-// then grow as elements actually decode. The caller already bounds the count to the remaining byte
-// budget, so the decode loop stays bounded by the input size even for a zero-width element type.
+// then grow as elements actually decode. The caller bounds the count to the remaining byte budget, so
+// element count is bounded by input size. Note this caps reserved BYTES, not total decoded object
+// memory: a vector of nested-dynamic elements (e.g. vector<string> of empties, ~1 wire byte each) can
+// still expand to ~24x the wire size in objects -- bounded overall by maxMessageSize, not unbounded.
 inline constexpr std::size_t decodeReserveByteBudget = std::size_t{ 64 } * 1024;
 template <class E> constexpr std::size_t decodeReserveCount(std::uint64_t n) noexcept {
     constexpr std::size_t cap = sizeof(E) >= decodeReserveByteBudget ? 1 : decodeReserveByteBudget / sizeof(E);

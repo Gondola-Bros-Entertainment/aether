@@ -146,7 +146,9 @@ using TokenNonce = std::array<std::uint8_t, connectTokenNonceBytes>;
 
 struct ConnectToken {
     std::uint64_t playerId{};    // your verified player identity (e.g. a Firebase UID)
-    MonoTime      expiresAt{};   // absolute expiry; the server rejects the token at/after this
+    MonoTime      expiresAt{};   // absolute expiry, rejected at/after this. MUST be on the same clock the
+                                 // server feeds to peerProcess -- mint from a shared wall-clock epoch, not
+                                 // a per-host monotonic counter (those are not comparable across machines).
     Bytes         userData;      // opaque app data carried to the server (role, region, ...)
 };
 
@@ -225,6 +227,11 @@ inline void evictOldest(TokenValidator& tv) {
                                          [](const auto& a, const auto& b) { return a.second.ns < b.second.ns; });
     tv.usedNonces.erase(oldest);
 }
+// Bound the replay table: drop expired nonces first, and only if still over the cap evict the oldest.
+// Tradeoff: if more than maxTrackedTokens *concurrently unexpired* nonces are tracked (a sustained
+// flood of distinct valid tokens), the oldest unexpired nonce is evicted and its token could replay
+// once before its own expiresAt. The cap is required for memory safety; size it above peak concurrent
+// logins within the token lifetime.
 inline void enforceLimit(TokenValidator& tv, MonoTime now) {
     if (static_cast<int>(tv.usedNonces.size()) <= tv.maxTrackedTokens) return;
     cleanupExpired(tv, now);
