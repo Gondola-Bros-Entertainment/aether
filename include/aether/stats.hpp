@@ -31,12 +31,13 @@ struct NetworkStats {
     std::uint64_t     bytesSent          = 0;
     std::uint64_t     bytesReceived      = 0;
     double            rtt                = 0.0;
-    double            packetLoss         = 0.0;
+    double            packetLoss         = 0.0;   // FRACTION in [0,1], not a percent (multiply by 100 to display)
     double            bandwidthUp        = 0.0;
     double            bandwidthDown      = 0.0;
     ConnectionQuality connectionQuality  = ConnectionQuality::Excellent;
     CongestionLevel   congestionLevel    = CongestionLevel::None;
     std::uint64_t     decryptionFailures = 0;
+    int               pathMtu            = 0;     // confirmed path MTU (config.mtu until discovery raises it)
 };
 
 } // namespace aether

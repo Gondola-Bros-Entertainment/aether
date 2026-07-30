@@ -26,8 +26,9 @@ enum class PacketType : std::uint8_t {
     PayloadBatch        = 8,   // several coalesced channel messages (count + length-prefixed framing)
     TimeSyncPing        = 9,   // clock sync: [u64 sender ns]
     TimeSyncPong        = 10,  // clock sync reply: [u64 echoed ns][u64 responder ns]
+    MtuProbe            = 11,  // path-MTU probe: padding to a target datagram size, no app data (mtu.hpp)
 };
-inline constexpr std::uint8_t packetTypeMax = 10;
+inline constexpr std::uint8_t packetTypeMax = 11;
 
 // The header fields, unpacked. Just data.
 struct PacketHeader {

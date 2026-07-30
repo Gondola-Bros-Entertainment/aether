@@ -3,6 +3,7 @@
 // plain Channel struct + free functions.
 #pragma once
 
+#include "aether/reliability.hpp"   // ReceivedBuffer: the sequence-dedup ring, shared with the packet layer
 #include "aether/types.hpp"
 
 #include <array>
@@ -33,7 +34,7 @@ struct ChannelConfig {
     double       orderedBufferTimeout = 5000.0;
     int          maxOrderedBufferSize = 64;
     int          maxReliableRetries   = 10;
-    int          maxReceiveBufferSize = 8192;   // cap on undrained delivered messages (+ pending acks): a memory shield against an app that stops draining
+    int          maxReceiveBufferSize = 8192;   // cap on undrained delivered messages: a memory shield against an app that stops draining
     std::uint8_t priority             = 0;
 };
 inline ChannelConfig unreliableChannel()        { return { .deliveryMode = DeliveryMode::Unreliable        }; }
@@ -49,6 +50,7 @@ struct ChannelMessage {
     bool        reliable        = false;
     bool        forceRetransmit = false;   // set by a triple-NACK: resend on the next pass, ignoring the RTO
     std::uint8_t                 fragmentCount = 0;   // 0/1 == sent in one packet; >1 == split into this many fragments
+    std::uint8_t                 sentFragments = 0;   // first-send progress: fragments [0, sentFragments) have gone out (paced across ticks by the send budget)
     std::array<std::uint64_t, 4> fragAckBits{};       // which fragments are acked (256-bit, matches maxFragmentCount 255); message acked when all set
 };
 
@@ -61,10 +63,21 @@ struct Channel {
     SequenceNum   remoteSeq{};
     std::map<SequenceNum, ChannelMessage>             sendBuffer;
     std::vector<Bytes>                                receiveBuffer;
-    std::vector<SequenceNum>                          pendingAck;
     std::map<SequenceNum, std::pair<Bytes, MonoTime>> orderedBuffer;
     SequenceNum   orderedExpected{};
-    std::uint64_t totalSent = 0, totalReceived = 0, totalDropped = 0, totalRetransmits = 0;
+    // ReliableUnordered has no ordering state to infer duplicates from, so it dedups explicitly: a
+    // retransmit whose ack was lost carries a message we may already have delivered, and delivering it
+    // twice would make a "reliable" channel at-least-once. The other modes need no window (ordered
+    // compares against orderedExpected, sequenced against remoteSeq, unreliable is fire-and-forget).
+    ReceivedBuffer recvDedup{};
+    std::uint64_t totalSent = 0, totalReceived = 0, totalRetransmits = 0;
+    // Intake accounting, kept as three distinct facts because they mean opposite things to an app: DROPPED
+    // is data that is gone (an unreliable message with no room, one over the size cap, one superseded on a
+    // sequenced channel), DUPLICATE is a retransmit of something already delivered (expected on a lossy
+    // link, harmless), and REFUSED is backpressure -- a reliable message a full buffer turned away, left
+    // unacked so the sender brings it back. Folding refusals into "dropped" would report healthy
+    // backpressure as data loss on a channel that in fact lost nothing.
+    std::uint64_t totalDropped = 0, totalDuplicate = 0, totalRefused = 0;
 };
 
 inline Channel newChannel(ChannelId id, const ChannelConfig& cfg) {
@@ -96,7 +109,7 @@ inline SendResult channelSend(Channel& ch, const Bytes& payload, MonoTime now) {
 // Peek the next UNSENT message (lowest sequence first), looking PAST in-flight ones so several
 // messages can be in flight at once -- a sliding window, not stop-and-wait (one per RTT). Cleans
 // acked entries out. Returns a pointer INTO the send buffer (no payload copy); it is valid only
-// until the buffer is next mutated, so read it before commitOutgoingMessage(seq), which consumes it.
+// until the buffer is next mutated, so read it before commitOutgoingMessage, which consumes it.
 inline const ChannelMessage* peekOutgoingMessage(Channel& ch) {
     for (auto it = ch.sendBuffer.begin(); it != ch.sendBuffer.end(); ) {
         if (it->second.acked)           { it = ch.sendBuffer.erase(it); continue; }
@@ -106,11 +119,14 @@ inline const ChannelMessage* peekOutgoingMessage(Channel& ch) {
     return nullptr;
 }
 // Consume the message peekOutgoingMessage returned (by sequence): reliable -> mark sent (retry 1,
-// kept for retransmit), unreliable -> remove (fire and forget).
-inline void commitOutgoingMessage(Channel& ch, SequenceNum seq) {
+// kept for retransmit), unreliable -> remove (fire and forget). `now` restarts the RTO clock: the
+// message may have waited queued behind others (or spread its fragments over several ticks) since
+// channelSend stamped it, and an RTO measured from creation would fire the moment a delayed send
+// finally completed.
+inline void commitOutgoingMessage(Channel& ch, SequenceNum seq, MonoTime now) {
     auto it = ch.sendBuffer.find(seq);
     if (it == ch.sendBuffer.end() || it->second.acked || it->second.retryCount != 0) return;
-    if (it->second.reliable) it->second.retryCount = 1;
+    if (it->second.reliable) { it->second.retryCount = 1; it->second.sendTime = now; }
     else                     ch.sendBuffer.erase(it);
 }
 
@@ -118,14 +134,20 @@ inline void commitOutgoingMessage(Channel& ch, SequenceNum seq) {
 // CANDIDATES only -- send state advances in commitRetransmit, called once a candidate is actually
 // admitted past the congestion budget, so a budget-blocked retransmit does not burn a retry or
 // reset its RTO. Messages past the retry limit are dropped here (that is not budget-gated).
-inline std::vector<ChannelMessage> getRetransmitMessages(Channel& ch, MonoTime now, double rtoMs) {
-    std::vector<ChannelMessage> out;
+//
+// The candidates are POINTERS into the send buffer, not copies -- a retransmit pass runs every tick on
+// a lossy link, and copying each candidate's payload just to decide whether the budget admits it is a
+// per-tick heap copy of data already in hand. They stay valid while the caller walks them (the only
+// mutation in that loop is commitRetransmit, which edits a message in place); they are invalidated by
+// anything that erases from the send buffer, so do not hold them across a channelSend or channelUpdate.
+inline std::vector<const ChannelMessage*> getRetransmitMessages(Channel& ch, MonoTime now, double rtoMs) {
+    std::vector<const ChannelMessage*> out;
     if (!isReliable(ch.config.deliveryMode)) return out;
     for (auto it = ch.sendBuffer.begin(); it != ch.sendBuffer.end(); ) {
         ChannelMessage& msg = it->second;
         if (msg.acked || msg.retryCount == 0) { ++it; continue; }
         if (msg.retryCount > ch.config.maxReliableRetries) { it = ch.sendBuffer.erase(it); ch.totalDropped += 1; continue; }
-        if (msg.forceRetransmit || elapsedMs(msg.sendTime, now) >= rtoMs) out.push_back(msg);
+        if (msg.forceRetransmit || elapsedMs(msg.sendTime, now) >= rtoMs) out.push_back(&msg);
         ++it;
     }
     return out;
@@ -151,70 +173,107 @@ inline void markForRetransmit(Channel& ch, SequenceNum seq) noexcept {
 }
 
 // --- receiving ---
-inline void deliverOrdered(Channel& ch, Bytes payload);
-inline void bufferOrdered(Channel& ch, SequenceNum seq, Bytes payload, MonoTime now);
+//
+// Acknowledgement is entirely PACKET level: the packet header's ack + ack bitfield resolve the
+// (channel, seq, fragment) triples the sent-packet ring recorded, and processAcks feeds those to
+// acknowledgeMessage. A channel therefore keeps no ack list of its own.
+//
+// Which is why every intake function below reports whether it ACCEPTED the message. A receiver must not
+// acknowledge data it did not take: if a full buffer discards a message the packet carrying it has
+// already been acked, the sender marks it delivered and never sends it again -- silent loss on a channel
+// whose entire promise is that it does not lose things. Returning false leaves the packet unacknowledged,
+// so the sender retransmits, and the caps become end-to-end BACKPRESSURE instead of a data leak. (This
+// only works because duplicates are recognized: the retransmit of a message that did land arrives again
+// and must be acked, not delivered twice -- see the dedup in onMessageReceived.)
+//
+// "Accepted" means "no retransmit would help": delivered, or permanently unacceptable (a duplicate, or a
+// payload over the channel's declared size cap -- resending those changes nothing). It is false only for
+// a TRANSIENT refusal, which clears as the app drains or the ordering gap fills.
+inline bool deliverOrdered(Channel& ch, Bytes&& payload);
+inline bool bufferOrdered(Channel& ch, SequenceNum seq, Bytes&& payload, MonoTime now);
 inline void flushOrderedBuffer(Channel& ch);
 
 // Buffer a delivered message, capped at maxReceiveBufferSize so an app that stops draining cannot grow
-// the receive buffer without bound. When full the incoming message is dropped (the already-buffered,
-// in-order-for-ordered-channels backlog is kept) -- a last-resort memory shield, not normal-path loss.
-inline void pushReceived(Channel& ch, Bytes payload) {
-    if (static_cast<int>(ch.receiveBuffer.size()) >= ch.config.maxReceiveBufferSize) { ch.totalDropped += 1; return; }
+// the receive buffer without bound. At the cap it returns false and the payload is left untouched (it is
+// only moved from on success), so a reliable caller can leave it for the sender to retransmit. The caller
+// does the accounting, because only it knows whether a refusal here is recoverable.
+inline bool pushReceived(Channel& ch, Bytes&& payload) {
+    if (static_cast<int>(ch.receiveBuffer.size()) >= ch.config.maxReceiveBufferSize) return false;
     ch.receiveBuffer.push_back(std::move(payload));
     ch.totalReceived += 1;
-}
-inline void pushPendingAck(Channel& ch, SequenceNum seq) {
-    if (static_cast<int>(ch.pendingAck.size()) >= ch.config.maxReceiveBufferSize) return;   // same bound; pending acks are drained via takePendingAcks
-    ch.pendingAck.push_back(seq);
+    return true;
 }
 
-inline void onMessageReceived(Channel& ch, SequenceNum seq, Bytes payload, MonoTime now) {
+inline bool onMessageReceived(Channel& ch, SequenceNum seq, Bytes payload, MonoTime now) {
     // Enforce the channel's size contract on RECEIVE too, not just send: a peer (or a reassembled
     // fragment stream) can present a payload far larger than maxMessageSize, and buffering it would
     // bypass the cap the channel declared. A legitimately-sent message is always within the bound.
-    if (static_cast<int>(payload.size()) > ch.config.maxMessageSize) { ch.totalDropped += 1; return; }
+    if (static_cast<int>(payload.size()) > ch.config.maxMessageSize) { ch.totalDropped += 1; return true; }   // never acceptable
     switch (ch.config.deliveryMode) {
         case DeliveryMode::Unreliable:
-            pushReceived(ch, std::move(payload));
-            break;
+            // Nothing retransmits an unreliable message, so a refusal here is a real drop, not backpressure.
+            if (!pushReceived(ch, std::move(payload))) { ch.totalDropped += 1; }
+            return true;
         case DeliveryMode::UnreliableSequenced:
-            if (newer(seq, ch.remoteSeq)) { pushReceived(ch, std::move(payload)); ch.remoteSeq = seq; }
-            else                          { ch.totalDropped += 1; }
-            break;
+            if (!newer(seq, ch.remoteSeq)) { ch.totalDropped += 1; return true; }   // superseded by a newer one
+            if (!pushReceived(ch, std::move(payload))) { ch.totalDropped += 1; return true; }
+            ch.remoteSeq = seq;
+            return true;
         case DeliveryMode::ReliableUnordered:
-            pushReceived(ch, std::move(payload));
-            pushPendingAck(ch, seq);
-            break;
+            if (rbExists(ch.recvDedup, seq)) { ch.totalDuplicate += 1; return true; }   // already delivered
+            if (!pushReceived(ch, std::move(payload))) { ch.totalRefused += 1; return false; }
+            rbInsert(ch.recvDedup, seq);   // recorded only once it is genuinely delivered
+            return true;
         case DeliveryMode::ReliableOrdered:
-            pushPendingAck(ch, seq);
-            if (seq == ch.orderedExpected) deliverOrdered(ch, std::move(payload));
-            else                           bufferOrdered(ch, seq, std::move(payload), now);
-            break;
+            // Three cases, and the third is the one that matters: a sequence OLDER than the one we are
+            // waiting for has already been delivered (or flushed past), so it is a duplicate. Buffering
+            // it instead would redeliver it on the next timeout flush AND drag orderedExpected backward.
+            if      (seq == ch.orderedExpected)      return deliverOrdered(ch, std::move(payload));
+            else if (newer(seq, ch.orderedExpected)) return bufferOrdered(ch, seq, std::move(payload), now);
+            ch.totalDuplicate += 1;
+            return true;
         case DeliveryMode::ReliableSequenced:
-            pushPendingAck(ch, seq);
-            if (newer(seq, ch.remoteSeq)) { pushReceived(ch, std::move(payload)); ch.remoteSeq = seq; }
-            else                          { ch.totalDropped += 1; }
-            break;
+            if (!newer(seq, ch.remoteSeq)) { ch.totalDuplicate += 1; return true; }   // superseded or a repeat
+            if (!pushReceived(ch, std::move(payload))) { ch.totalRefused += 1; return false; }
+            ch.remoteSeq = seq;
+            return true;
     }
+    return true;
 }
 
-inline void deliverOrdered(Channel& ch, Bytes payload) {
-    pushReceived(ch, std::move(payload));
+// Deliver the message the ordering window is waiting for, then drain whatever it unblocks. The window
+// advances only once the message is actually in the receive buffer -- advancing past a refused message
+// would lose it and desync every sequence after it.
+inline bool deliverOrdered(Channel& ch, Bytes&& payload) {
+    if (!pushReceived(ch, std::move(payload))) { ch.totalRefused += 1; return false; }
     ch.orderedExpected = next(ch.orderedExpected);
     flushOrderedBuffer(ch);
+    return true;
 }
-inline void bufferOrdered(Channel& ch, SequenceNum seq, Bytes payload, MonoTime now) {
-    if (static_cast<int>(ch.orderedBuffer.size()) >= ch.config.maxOrderedBufferSize) { ch.totalDropped += 1; return; }
+inline bool bufferOrdered(Channel& ch, SequenceNum seq, Bytes&& payload, MonoTime now) {
+    // A sequence already waiting in the buffer is a duplicate (a network dup, or a batch retransmit
+    // re-carrying a message that did land): ack it and keep the original entry. Re-inserting would
+    // reset its flush-timeout clock, and at the cap it would refuse -- and block the ack of -- a
+    // message the channel already holds.
+    if (ch.orderedBuffer.find(seq) != ch.orderedBuffer.end()) { ch.totalDuplicate += 1; return true; }
+    if (static_cast<int>(ch.orderedBuffer.size()) >= ch.config.maxOrderedBufferSize) { ch.totalRefused += 1; return false; }
     ch.orderedBuffer[seq] = { std::move(payload), now };
+    return true;
 }
 inline void flushOrderedBuffer(Channel& ch) {
     for (;;) {
         auto it = ch.orderedBuffer.find(ch.orderedExpected);
         if (it == ch.orderedBuffer.end()) break;
-        pushReceived(ch, std::move(it->second.first));
+        if (!pushReceived(ch, std::move(it->second.first))) break;   // receive buffer full: leave it buffered, retry next drain
         ch.orderedBuffer.erase(it);
         ch.orderedExpected = next(ch.orderedExpected);
     }
+}
+
+// Has this fragment been acked? Only meaningful for a message the sender recorded as fragmented; the
+// send path reads it to retransmit just the fragments still missing.
+inline bool fragmentAcked(const ChannelMessage& msg, std::uint8_t fragIndex) noexcept {
+    return (msg.fragAckBits[fragIndex >> 6] & (std::uint64_t{ 1 } << (fragIndex & 63))) != 0;
 }
 
 // Ack one fragment of a message (fragIndex 0 for an unfragmented message). A fragmented message is
@@ -229,20 +288,9 @@ inline void acknowledgeMessage(Channel& ch, SequenceNum seq, std::uint8_t fragIn
     for (const std::uint64_t w : m.fragAckBits) seen += std::popcount(w);
     if (seen >= m.fragmentCount) m.acked = true;
 }
-// Record that a message was split into `count` fragments (set right after it is first committed).
-inline void setMessageFragmentCount(Channel& ch, SequenceNum seq, std::uint8_t count) noexcept {
-    auto it = ch.sendBuffer.find(seq);
-    if (it != ch.sendBuffer.end()) it->second.fragmentCount = count;
-}
-
 inline std::vector<Bytes> channelReceive(Channel& ch) {
     std::vector<Bytes> out = std::move(ch.receiveBuffer);
     ch.receiveBuffer.clear();
-    return out;
-}
-inline std::vector<SequenceNum> takePendingAcks(Channel& ch) {
-    std::vector<SequenceNum> out = std::move(ch.pendingAck);
-    ch.pendingAck.clear();
     return out;
 }
 
@@ -252,6 +300,10 @@ inline void cleanupAcked(Channel& ch) {
         if (it->second.acked) it = ch.sendBuffer.erase(it);
         else                  ++it;
 }
+// Give up on a gap that never filled: deliver what has been waiting past the timeout and resume
+// ordering after it. The window only ever moves FORWARD -- a flush must never rewind orderedExpected,
+// or every already-delivered sequence in between becomes deliverable a second time and the messages
+// after it stall until they time out too. Whatever the flush skipped past is a permanent gap.
 inline void flushTimedOutOrdered(Channel& ch, MonoTime now) {
     if (!isOrdered(ch.config.deliveryMode) || ch.orderedBuffer.empty()) return;
     const double timeout = ch.config.orderedBufferTimeout;
@@ -259,14 +311,17 @@ inline void flushTimedOutOrdered(Channel& ch, MonoTime now) {
     bool        anyFlushed = false;
     for (auto it = ch.orderedBuffer.begin(); it != ch.orderedBuffer.end(); ) {
         if (elapsedMs(it->second.second, now) >= timeout) {
-            pushReceived(ch, std::move(it->second.first));
+            if (!pushReceived(ch, std::move(it->second.first))) { ++it; continue; }   // no room: keep it buffered for the next pass
             if (!anyFlushed || newer(it->first, maxFlushed)) { maxFlushed = it->first; anyFlushed = true; }   // wrap-aware max, not raw <
             it = ch.orderedBuffer.erase(it);
         } else {
             ++it;
         }
     }
-    if (anyFlushed) ch.orderedExpected = next(maxFlushed);
+    if (!anyFlushed) return;
+    const SequenceNum resumeAt = next(maxFlushed);
+    if (newer(resumeAt, ch.orderedExpected)) ch.orderedExpected = resumeAt;   // forward only, wrap-aware
+    flushOrderedBuffer(ch);   // the flush may have exposed a buffered successor -- deliver it now, not next tick
 }
 inline void channelUpdate(Channel& ch, MonoTime now) { cleanupAcked(ch); flushTimedOutOrdered(ch, now); }
 
@@ -275,10 +330,11 @@ inline void resetChannel(Channel& ch) {
     ch.remoteSeq = {};
     ch.sendBuffer.clear();
     ch.receiveBuffer.clear();
-    ch.pendingAck.clear();
     ch.orderedBuffer.clear();
     ch.orderedExpected = {};
-    ch.totalSent = ch.totalReceived = ch.totalDropped = ch.totalRetransmits = 0;
+    ch.recvDedup       = ReceivedBuffer{};
+    ch.totalSent = ch.totalReceived = ch.totalRetransmits = 0;
+    ch.totalDropped = ch.totalDuplicate = ch.totalRefused = 0;
 }
 
 } // namespace aether

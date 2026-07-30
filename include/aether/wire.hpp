@@ -56,10 +56,16 @@ inline void writeWire(BitWriter& w, const Ranged<T, Lo, Hi>& r) noexcept {
     writeBits(w, static_cast<std::uint32_t>(off),
               bitsForMax(static_cast<std::uint64_t>(Hi) - static_cast<std::uint64_t>(Lo)));
 }
+// The decoder clamps like the encoder does. A field's range costs bitsForMax(span) bits, which only
+// represents the span exactly when it is 2^n-1: a Ranged<0,5> reads 3 bits, so untrusted wire bytes can
+// present 6 or 7. Ranged's contract is that the value is in [Lo, Hi] -- callers index and switch on it --
+// so it holds for hostile input too, not just for values this library encoded.
 template <class T, T Lo, T Hi>
 inline void readWire(BitReader& rd, Ranged<T, Lo, Hi>& r) noexcept {
-    const std::uint32_t off = readBits(rd, bitsForMax(static_cast<std::uint64_t>(Hi) - static_cast<std::uint64_t>(Lo)));
-    r.value = static_cast<T>(static_cast<std::uint64_t>(Lo) + off);
+    constexpr std::uint64_t span = static_cast<std::uint64_t>(Hi) - static_cast<std::uint64_t>(Lo);
+    const std::uint32_t     off  = readBits(rd, bitsForMax(span));
+    const std::uint64_t     clamped = off > span ? span : off;
+    r.value = static_cast<T>(static_cast<std::uint64_t>(Lo) + clamped);
 }
 
 template <float Lo, float Hi, int Bits>

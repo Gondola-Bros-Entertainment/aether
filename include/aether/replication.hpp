@@ -17,7 +17,12 @@
 namespace aether {
 
 using BaselineSeq = std::uint16_t;
-inline constexpr BaselineSeq noBaseline      = 0xFFFF;   // sentinel: no baseline, full state follows
+// Sentinel in the 2-byte payload header: "no baseline, full state follows". 0xFFFF is therefore RESERVED
+// by the wire format and can never identify a real snapshot -- a delta encoded against a baseline with
+// that id would be read by the receiver as a full snapshot and decode to garbage. Every entry point below
+// declines it, so a caller that numbers its snapshots straight through the wrap loses nothing but the
+// ability to use that one id as a baseline (the snapshot itself still sends, as a delta or in full).
+inline constexpr BaselineSeq noBaseline      = 0xFFFF;
 inline constexpr int         maxSnapshotBytes = 65536;   // scratch buffer cap for one snapshot
 // Bare-struct cap defaults, so a default-constructed DeltaTracker/BaselineManager is usable rather
 // than silently one-deep (a cap of 0 keeps a single entry, so deltaOnAck for any but the most recent
@@ -84,6 +89,7 @@ template <class T> Bytes deltaEncode(DeltaTracker<T>& tracker, BaselineSeq seqNu
         out[0] = static_cast<std::uint8_t>(noBaseline);
         out[1] = static_cast<std::uint8_t>(noBaseline >> 8);
     }
+    if (seqNum == noBaseline) return out;   // reserved id: the snapshot is sent, but never becomes a baseline
     if (static_cast<int>(tracker.pending.size()) >= tracker.maxPending && !tracker.pending.empty()) tracker.pending.pop_front();
     tracker.pending.push_back({ seqNum, current });
     return out;
@@ -125,6 +131,8 @@ template <class T> BaselineManager<T> newBaselineManager(int maxSnapshots, doubl
     return m;
 }
 template <class T> void pushBaseline(BaselineManager<T>& m, BaselineSeq seqNum, const T& state, MonoTime now) {
+    if (seqNum == noBaseline) return;   // reserved id (see noBaseline): storing it would never be looked up
+
     // now is monotonic across pushes, so expired snapshots are always a front prefix -- pop them in
     // place rather than rebuilding (and copying every surviving T into) a fresh deque each push.
     while (!m.snapshots.empty() && elapsedMs(std::get<2>(m.snapshots.front()), now) >= m.timeoutMs) m.snapshots.pop_front();

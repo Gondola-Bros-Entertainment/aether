@@ -4,6 +4,7 @@
 // is no OOB read on hostile input; the run completing IS the test.
 #include <aether/aether.hpp>
 
+#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -20,6 +21,23 @@ struct Probe { std::int32_t a; float b; std::uint64_t c; bool d; std::int16_t e;
 // hid (an unfuzzed string length), so the hostile-byte sweep must cover them.
 struct Dyn { std::string s; std::vector<std::uint32_t> v; std::optional<std::int64_t> o; std::vector<std::string> vs; };
 
+// Wide enough (20 fields) for the ADAPTIVE changemask, so the sparse-index decoder -- mode byte,
+// index list, canonical-form rejection -- takes the same hostile-bytes beating as everything else.
+struct WideProbe {
+    std::uint8_t f00, f01, f02, f03, f04, f05, f06, f07, f08, f09;
+    std::uint8_t f10, f11, f12, f13, f14, f15, f16, f17, f18, f19;
+};
+
+// The BIT-level path, which the byte-oriented probes above never touch. Every field here has a wire
+// contract, so arbitrary bytes must decode to values inside it -- the ranges are deliberately not
+// powers of two, so the wire has bit patterns above Hi that a decoder could otherwise let through.
+struct BitProbe {
+    aether::Ranged<std::uint8_t, 0, 5>    small;    // 3 bits, raw 6 and 7 are out of contract
+    aether::Ranged<int, -100, 100>        signed_;  // 8 bits, raw 201..255 out of contract
+    aether::Quantized<-1.0f, 1.0f, 12>    q;
+    bool                                  flag{};
+};
+
 aether::Bytes randomBytes(std::uint64_t& s, std::size_t n) {
     aether::Bytes b(n);
     for (std::size_t i = 0; i < n; ++i) {
@@ -35,7 +53,8 @@ aether::Bytes randomBytes(std::uint64_t& s, std::size_t n) {
 int main() {
     std::uint64_t s = 0xA5A51234DEADull;
     const Probe prev{ 1, 2.0f, 3, true, 4, 5 };
-    const Dyn   dynPrev{ "hello", { 1, 2, 3 }, std::int64_t{ -7 }, { "a", "b" } };
+    const Dyn       dynPrev{ "hello", { 1, 2, 3 }, std::int64_t{ -7 }, { "a", "b" } };
+    const WideProbe widePrev{};
 
     for (int i = 0; i < 100000; ++i) {
         const auto lenR = aether::nextRandom(s);
@@ -72,7 +91,20 @@ int main() {
         (void) aether::deserialize<Dyn>(r3);
         aether::Reader r4{ data.data(), data.size(), 0 };
         (void) aether::deltaUnpack(r4, dynPrev);
+        aether::Reader r5{ data.data(), data.size(), 0 };
+        (void) aether::deltaUnpack(r5, widePrev);   // the adaptive (sparse-index) mask decoder
+
+        // the bit-packed path: arbitrary bytes must never yield a wire-contract value outside its range.
+        // This is an assertion, not just a no-crash sweep -- an out-of-range Ranged is a value the app
+        // will index or switch on, so the range is a promise the decoder has to keep on hostile input.
+        aether::BitReader br{ data.data(), data.size() };
+        if (const auto bits = aether::unpackBits<BitProbe>(br)) {
+            assert(bits->small.value <= 5);
+            assert(bits->signed_.value >= -100 && bits->signed_.value <= 100);
+            assert(bits->q.value >= -1.0f && bits->q.value <= 1.0f);
+        }
     }
-    std::printf("aether fuzz OK: 100k iterations of random/truncated bytes (fixed + dynamic decoders), no crash\n");
+    std::printf("aether fuzz OK: 100k iterations of random/truncated bytes (fixed + dynamic + bit-packed "
+                "decoders), no crash and every wire contract held\n");
     return 0;
 }

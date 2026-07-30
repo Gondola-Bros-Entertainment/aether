@@ -45,13 +45,13 @@ struct PeerEvent {
     ChannelId           channel   = ChannelId{};                     // Message
     Bytes               data{};                                      // Message
     PeerId              other{};                                     // Migrated: new id (peer = old)
-    std::uint64_t       playerId = 0;                                // Connected: verified connect-token identity (server side)
+    std::uint64_t       playerId = 0;                                // Connected / Reconnected: verified connect-token identity (server side)
 };
 inline PeerEvent evConnected(const PeerId& p, ConnectionDirection d, std::uint64_t playerId = 0) { return { .kind = PeerEvent::Connected, .peer = p, .direction = d, .playerId = playerId }; }
 inline PeerEvent evDisconnected(const PeerId& p, DisconnectReason r) { return { .kind = PeerEvent::Disconnected, .peer = p, .reason = r }; }
 inline PeerEvent evMessage(const PeerId& p, ChannelId ch, Bytes d)   { return { .kind = PeerEvent::Message, .peer = p, .channel = ch, .data = std::move(d) }; }
 inline PeerEvent evMigrated(const PeerId& oldP, const PeerId& newP)  { return { .kind = PeerEvent::Migrated, .peer = oldP, .other = newP }; }
-inline PeerEvent evReconnected(const PeerId& p)                      { return { .kind = PeerEvent::Reconnected, .peer = p }; }
+inline PeerEvent evReconnected(const PeerId& p, std::uint64_t playerId = 0) { return { .kind = PeerEvent::Reconnected, .peer = p, .playerId = playerId }; }
 
 struct IncomingPacket { PeerId from; Bytes data; };
 struct RawPacket      { PeerId to;   Bytes data; };
@@ -108,7 +108,7 @@ inline std::optional<ResumeRequest> decodeResume(const Bytes& b) {
     return r;
 }
 
-// salt + ephemeral public key -- the handshake key-exchange payload (8-byte salt + 32-byte key).
+// salt + ephemeral public key -- the CHALLENGE payload (8-byte salt + 32-byte key).
 inline Bytes encodeSaltAndKey(std::uint64_t salt, const X25519Key& pub) {
     Bytes b = encodeSalt(salt);
     b.insert(b.end(), pub.begin(), pub.end());
@@ -121,6 +121,33 @@ inline std::optional<std::pair<std::uint64_t, X25519Key>> decodeSaltAndKey(const
     X25519Key pub{};
     for (std::size_t i = 0; i < static_cast<std::size_t>(x25519KeySize); ++i) pub[i] = b[saltBytes + i];
     return std::pair<std::uint64_t, X25519Key>{ *salt, pub };
+}
+
+// The RESPONSE payload: the client's salt + ephemeral key, plus the server's challenge salt echoed
+// back. The echo is the return-routability proof and the reason the challenge round-trip exists at
+// all: serverSalt is a 64-bit CSPRNG draw that only ever travelled to the client's claimed address,
+// so a source-spoofing peer that never received the challenge cannot produce it, and cannot make the
+// server commit a keypair and a connection slot to an address it has never actually reached.
+struct ConnectionResponsePayload {
+    std::uint64_t clientSalt{};
+    X25519Key     pub{};
+    std::uint64_t serverSaltEcho{};
+};
+inline Bytes encodeConnectionResponse(std::uint64_t clientSalt, const X25519Key& pub, std::uint64_t serverSaltEcho) {
+    Bytes b = encodeSaltAndKey(clientSalt, pub);
+    const Bytes echo = encodeSalt(serverSaltEcho);
+    b.insert(b.end(), echo.begin(), echo.end());
+    return b;
+}
+inline std::optional<ConnectionResponsePayload> decodeConnectionResponse(const Bytes& b) {
+    if (b.size() < 2 * saltBytes + static_cast<std::size_t>(x25519KeySize)) return std::nullopt;
+    const auto sk = decodeSaltAndKey(b);
+    if (!sk) return std::nullopt;
+    ConnectionResponsePayload r;
+    r.clientSalt     = sk->first;
+    r.pub            = sk->second;
+    r.serverSaltEcho = getU64(b.data() + saltBytes + x25519KeySize);
+    return r;
 }
 // An ephemeral keypair from the OS CSPRNG, and the X25519 shared secret used as the session key.
 inline void genEphemeralKeypair(X25519Key& priv, X25519Key& pub) {
@@ -161,9 +188,9 @@ inline void applySessionKeys(Connection& conn, const X25519Key& shared, std::uin
     conn.resumeMaster = shared;
 }
 // Resume authenticator. The fast-reconnect token (clientSalt) travels in cleartext during the original
-// handshake, so on its own it is a bearer credential a passive observer could replay to burn a victim's
-// resume. The MAC binds the request to the ECDH master (which never touches the wire): only a holder of
-// the master can mint a valid resume, so a token-only observer cannot. (It does NOT stop replay of a
+// handshake, so on its own it is a bearer credential: anyone who observed it could present it and burn the
+// real client's one-shot resume. The MAC binds the request to the ECDH master (which never touches the
+// wire): only a holder of the master can mint a valid resume. (It does NOT stop replay of a
 // captured live resume request -- that needs a challenge round-trip, which would defeat 0-RTT resume;
 // the residual lands in the documented unauthenticated-handshake trade-off.) The MAC key is HChaCha20
 // over the master with a domain byte distinct from the directional KDF.
@@ -220,8 +247,6 @@ inline std::uint64_t sockAddrToKey(const Address& addr) noexcept {
 }
 
 // --- peer state ---
-inline constexpr double peerFragmentTimeoutMs     = 5000.0;
-inline constexpr int    peerFragmentMaxBufferSize = 1024 * 1024;
 inline constexpr double migrationCooldownMs       = 5000.0;
 inline constexpr double resumeGraceMs             = 30000.0;   // window a dropped session token can reconnect in
 
@@ -229,7 +254,8 @@ inline constexpr double resumeGraceMs             = 30000.0;   // window a dropp
 // negotiated -- restored on reconnect so a resumed session stays encrypted, not downgraded to plaintext.
 struct ResumableSession {
     MonoTime                 at{};
-    std::optional<X25519Key> master;   // ECDH shared secret, to re-key a resumed session with a fresh salt
+    std::optional<X25519Key> master;     // ECDH shared secret, to re-key a resumed session with a fresh salt
+    std::uint64_t            playerId{}; // the connect-token identity the original handshake verified
 };
 
 inline constexpr double tokenReplayLifetimeMs = 86400000.0;   // remember a used token nonce this long (replay defense)
@@ -261,11 +287,14 @@ inline NetPeer newPeerState(const Address& localAddr, const NetworkConfig& confi
 // --- internal helpers ---
 inline void cleanupPeer(NetPeer& peer, const PeerId& pid)   { peer.fragmentAssemblers.erase(pid); }
 inline void removePending(NetPeer& peer, const PeerId& pid) { peer.pending.erase(pid); }
-inline bool isPostHandshake(PacketType t) noexcept { return t == PacketType::Payload || t == PacketType::PayloadBatch || t == PacketType::Keepalive || t == PacketType::Disconnect || t == PacketType::TimeSyncPing || t == PacketType::TimeSyncPong; }
+inline bool isPostHandshake(PacketType t) noexcept { return t == PacketType::Payload || t == PacketType::PayloadBatch || t == PacketType::Keepalive || t == PacketType::Disconnect || t == PacketType::TimeSyncPing || t == PacketType::TimeSyncPong || t == PacketType::MtuProbe; }
 
+inline Bytes frameCleartextDatagram(const PacketHeader& header, const Bytes& payload);
+
+// Handshake and control packets are cleartext by definition (there is no session key yet).
 inline void queueControlPacket(NetPeer& peer, PacketType ptype, const Bytes& payload, const PeerId& pid) {
     const PacketHeader header{ ptype, SequenceNum{ 0 }, SequenceNum{ 0 }, 0 };
-    peer.sendQueue.push_back(RawPacket{ pid, appendCrc32(serializePacket(Packet{ header, payload })) });
+    peer.sendQueue.push_back(RawPacket{ pid, frameCleartextDatagram(header, payload) });
 }
 
 // --- handshake handlers ---
@@ -311,16 +340,27 @@ inline std::vector<PeerEvent> handleConnectionRequest(NetPeer& peer, const PeerI
         const auto rit = peer.resumableTokens.find(resume->token);
         if (rit != peer.resumableTokens.end() && rit->second.master && elapsedMs(rit->second.at, now) < resumeGraceMs
             && detail::constTimeEq(resumeMac(*rit->second.master, resume->token, resume->freshSalt).data(), resume->mac.data(), 16)) {
-            const X25519Key master = *rit->second.master;
+            // A resume takes a client slot like any other connection, so it is subject to the same cap.
+            // Denied WITHOUT burning the resumable, so the client can resume once a slot frees.
+            if (static_cast<int>(peer.connections.size()) >= peer.config.maxClients) {
+                queueControlPacket(peer, PacketType::ConnectionDenied, encodeDenyReason(DenyReason::ServerFull), pid);
+                return {};
+            }
+            const X25519Key     master   = *rit->second.master;
+            // The resume MAC proves possession of the ECDH master, which only the peer that completed
+            // the original (token-validated) handshake holds -- so the identity that handshake verified
+            // carries over. Without this a resumed session came up anonymous on a token-gated server.
+            const std::uint64_t playerId = rit->second.playerId;
             peer.resumableTokens.erase(rit);   // burn only on a MAC-authenticated resume (proof of master possession)
             peer.pending.erase(pid);
             Connection conn = newConnection(peer.config, resume->token, now);
+            conn.playerId = playerId;
             applySessionKeys(conn, master, resume->freshSalt, /*isServer=*/true);   // re-key from the client's fresh salt
             touchRecvTime(conn, now);
             markConnected(conn, now);
             peer.connections[pid] = std::move(conn);
             queueControlPacket(peer, PacketType::ConnectionAccepted, {}, pid);
-            return { evReconnected(pid) };
+            return { evReconnected(pid, playerId) };
         }
         // No entry / expired / bad MAC falls through to a normal handshake. A bad MAC does NOT burn the
         // resumable, so a token-only observer cannot deny the real client its fast reconnect.
@@ -342,23 +382,38 @@ inline std::vector<PeerEvent> handleConnectionChallenge(NetPeer& peer, const Pee
         it->second.sessionShared  = x25519Shared(it->second.ephemeralPriv, sk->second);
         it->second.ephemeralReady = true;
     }
-    queueControlPacket(peer, PacketType::ConnectionResponse, encodeSaltAndKey(it->second.clientSalt, it->second.ephemeralPub), pid);
+    queueControlPacket(peer, PacketType::ConnectionResponse,
+                       encodeConnectionResponse(it->second.clientSalt, it->second.ephemeralPub, it->second.serverSalt), pid);
     return {};
 }
 inline std::vector<PeerEvent> handleConnectionResponse(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
     const auto it = peer.pending.find(pid);
     if (it == peer.pending.end() || it->second.direction != ConnectionDirection::Inbound) return {};
-    const auto sk = decodeSaltAndKey(pkt.payload);
-    if (!sk) return {};
-    const std::uint64_t clientSalt = sk->first;
+    const auto resp = decodeConnectionResponse(pkt.payload);
+    if (!resp) return {};
+    // Return-routability gate. A wrong echo is DROPPED silently -- no deny, and crucially the pending
+    // survives: replying would make the server a reflector, and cancelling the pending would let
+    // anyone who can guess an in-progress client's address abort its handshake. The real client's
+    // request retry re-drives the same (retransmit-stable) challenge.
+    if (resp->serverSaltEcho != it->second.serverSalt) return {};
+    const std::uint64_t clientSalt = resp->clientSalt;
     if (clientSalt == 0 || clientSalt == it->second.serverSalt) {
         removePending(peer, pid);
         queueControlPacket(peer, PacketType::ConnectionDenied, encodeDenyReason(DenyReason::InvalidChallenge), pid);
         return {};
     }
+    // Re-check the client cap here, not only at the request: several handshakes admitted while there was
+    // room can complete in the same tick, and inserting unconditionally would take the connection table
+    // past maxClients. maxPending bounds how far it could overshoot, but "bounded overshoot" is still an
+    // exceeded limit, so the last arrivals are denied ServerFull instead.
+    if (static_cast<int>(peer.connections.size()) >= peer.config.maxClients) {
+        removePending(peer, pid);
+        queueControlPacket(peer, PacketType::ConnectionDenied, encodeDenyReason(DenyReason::ServerFull), pid);
+        return {};
+    }
     Connection conn = newConnection(peer.config, clientSalt, now);
     conn.playerId = it->second.playerId;   // the identity validated from the client's connect token (0 if auth off)
-    const X25519Key shared = x25519Shared(it->second.ephemeralPriv, sk->second);
+    const X25519Key shared = x25519Shared(it->second.ephemeralPriv, resp->pub);
     applySessionKeys(conn, shared, clientSalt, /*isServer=*/true);   // salt = the client's fresh salt
     touchRecvTime(conn, now);
     markConnected(conn, now);
@@ -422,28 +477,46 @@ inline std::optional<MigrationCandidate> findMigrationCandidate(const NetPeer& p
 }
 
 // --- payload / fragment / migration dispatch ---
-inline std::vector<PeerEvent> handleFragment(NetPeer& peer, const PeerId& pid, ChannelId channel, ByteSpan fragData, MonoTime now) {
+// Feed one fragment to the reassembler and, if it completed a message, route it. Returns whether the
+// packet may be acked: a fragment that is merely still assembling is accepted (it is held in the
+// assembler), while a completed message the channel refused is not.
+inline bool handleFragment(NetPeer& peer, const PeerId& pid, ChannelId channel, ByteSpan fragData, MonoTime now) {
     FragmentAssembler& assembler =
-        peer.fragmentAssemblers.try_emplace(pid, newFragmentAssembler(peerFragmentTimeoutMs, peerFragmentMaxBufferSize, peer.config.maxFragments)).first->second;
+        peer.fragmentAssemblers
+            .try_emplace(pid, newFragmentAssembler(peer.config.fragmentTimeoutMs, peer.config.maxReassemblyBufferSize,
+                                                   peer.config.maxFragments))
+            .first->second;
     const auto complete = processFragment(assembler, fragData.data(), fragData.size(), now);
-    if (!complete) return {};
+    if (!complete) return true;
     const auto cs = decodeChannelSeq(ByteSpan(complete->data(), complete->size()));
-    if (!cs) return {};
-    if (const auto it = peer.connections.find(pid); it != peer.connections.end())
-        receiveIncomingPayload(it->second, channel, cs->first, Bytes(cs->second.begin(), cs->second.end()), now);
-    return {};
+    if (!cs) return true;   // malformed inner wire: resending it would not fix it
+    const auto it = peer.connections.find(pid);
+    if (it == peer.connections.end()) return true;
+    return receiveIncomingPayload(it->second, channel, cs->first, Bytes(cs->second.begin(), cs->second.end()), now);
 }
 // Route one channel-wire ([channel/fragment byte][seq][data]) into the connection's channels. Takes a
 // span into the decrypted scratch; the single owned copy is materialized here, where a message is handed
-// off to persist in the channel buffer -- everything upstream of this point is alloc-free.
-inline void receiveChannelWire(NetPeer& peer, const PeerId& pid, Connection& conn, ByteSpan wire, MonoTime now) {
-    if (wire.empty()) return;
+// off to persist in the channel buffer -- everything upstream of this point is alloc-free. Returns
+// whether the wire was accepted, which decides whether the carrying packet may be acked.
+inline bool receiveChannelWire(NetPeer& peer, const PeerId& pid, Connection& conn, ByteSpan wire, MonoTime now) {
+    if (wire.empty()) return true;
     const auto [channel, isFragment] = decodePayloadHeader(wire[0]);
     const ByteSpan rest = wire.subspan(1);
-    if (isFragment) { handleFragment(peer, pid, channel, rest, now); return; }
-    if (wire.size() < static_cast<std::size_t>(minPayloadSize)) return;
+    if (isFragment) return handleFragment(peer, pid, channel, rest, now);
+    if (wire.size() < static_cast<std::size_t>(minPayloadSize)) return true;   // truncated wire, not a capacity problem
     if (const auto cs = decodeChannelSeq(rest))
-        receiveIncomingPayload(conn, channel, cs->first, Bytes(cs->second.begin(), cs->second.end()), now);
+        return receiveIncomingPayload(conn, channel, cs->first, Bytes(cs->second.begin(), cs->second.end()), now);
+    return true;
+}
+// Route a decrypted payload (one wire, or a coalesced batch) and report whether ALL of it was accepted.
+// A batch is all-or-nothing for acking purposes: if any message was refused the packet goes unacked, the
+// sender retransmits every message it carried, and the ones that did land are recognized as duplicates.
+inline bool routeDecryptedPayload(NetPeer& peer, const PeerId& pid, Connection& conn, PacketType ptype,
+                                  ByteSpan payload, MonoTime now) {
+    if (ptype != PacketType::PayloadBatch) return receiveChannelWire(peer, pid, conn, payload, now);
+    bool accepted = true;
+    forEachBatchWire(payload, [&](ByteSpan w) { accepted = receiveChannelWire(peer, pid, conn, w, now) && accepted; });
+    return accepted;
 }
 inline std::vector<PeerEvent> handleMigration(NetPeer& peer, const PeerId& newPid, const Packet& pkt, MonoTime now) {
     if (!peer.config.enableConnectionMigration) return {};
@@ -479,13 +552,11 @@ inline std::vector<PeerEvent> handleMigration(NetPeer& peer, const PeerId& newPi
     }
     // Route the now-decrypted payload on the migrated connection -- same span path as the keyed receive.
     Connection& mconn = peer.connections[newPid];
-    processIncomingHeader(mconn, pkt.header, now);
+    processIncomingAcks(mconn, pkt.header, now);
     touchRecvTime(mconn, now);
     const ByteSpan mpayload(dec->plaintext.data(), dec->plaintext.size());
-    if (pkt.header.type == PacketType::PayloadBatch)
-        forEachBatchWire(mpayload, [&](ByteSpan w) { receiveChannelWire(peer, newPid, mconn, w, now); });
-    else
-        receiveChannelWire(peer, newPid, mconn, mpayload, now);
+    if (routeDecryptedPayload(peer, newPid, mconn, pkt.header.type, mpayload, now))
+        recordReceivedPacket(mconn, pkt.header);   // ack only what the channels took
     return { evMigrated(cand->oldPeer, newPid) };
 }
 
@@ -510,7 +581,8 @@ inline std::vector<PeerEvent> handlePacketByType(NetPeer& peer, const PeerId& pi
         case PacketType::PayloadBatch:  return handleMigration(peer, pid, pkt, now);
         case PacketType::TimeSyncPing:
         case PacketType::TimeSyncPong:
-        case PacketType::Keepalive:     return {};   // only meaningful on a keyed connection -> handled in handlePacket
+        case PacketType::Keepalive:
+        case PacketType::MtuProbe:      return {};   // only meaningful on a keyed connection -> handled in handlePacket
     }
     return {};
 }
@@ -551,14 +623,14 @@ inline std::vector<PeerEvent> handlePacket(NetPeer& peer, const PeerId& pid, con
             cleanupPeer(peer, pid);
             return { evDisconnected(pid, reason) };
         }
-        processIncomingHeader(conn, *header, now);
+        processIncomingAcks(conn, *header, now);   // the peer's acks always land, whatever we do with the payload
         touchRecvTime(conn, now);
         switch (ptype) {
             case PacketType::Payload:
-                receiveChannelWire(peer, pid, conn, payload, now);
-                break;
             case PacketType::PayloadBatch:
-                forEachBatchWire(payload, [&](ByteSpan w) { receiveChannelWire(peer, pid, conn, w, now); });
+                // Ack this packet only if every message it carried was accepted. A refused message stays
+                // unacknowledged, so the sender retransmits it instead of believing it was delivered.
+                if (!routeDecryptedPayload(peer, pid, conn, ptype, payload, now)) return {};
                 break;
             case PacketType::TimeSyncPing:
                 if (payload.size() >= 8) sendTimeSyncPong(conn, getU64(payload.data()), now);   // echo our reply stamped with our clock
@@ -568,8 +640,10 @@ inline std::vector<PeerEvent> handlePacket(NetPeer& peer, const PeerId& pid, con
                     clockSyncObserve(conn.clockSync, static_cast<double>(getU64(payload.data())) / nsPerMs,
                                      static_cast<double>(getU64(payload.data() + 8)) / nsPerMs, static_cast<double>(now.ns) / nsPerMs);
                 break;
-            default: break;   // Keepalive: the header processing above is all it needs
+            default: break;   // Keepalive / MtuProbe: the header processing above is all they need
+                              // (a probe's padding means nothing; ACKING it below is the discovery signal)
         }
+        recordReceivedPacket(conn, *header);   // fully consumed -> our next header acks it
         return {};
     }
 
@@ -579,6 +653,47 @@ inline std::vector<PeerEvent> handlePacket(NetPeer& peer, const PeerId& pid, con
     return handlePacketByType(peer, pid, pkt, now, ptype);
 }
 
+// --- outgoing: build the datagram in its final layout, in one allocation ---
+// A datagram is [header:9][payload][crc:4] in the clear, or [header:9][counter:8][ciphertext][tag:16][crc:4]
+// once keyed. Both are assembled directly into one exactly-sized buffer: the size is known before any
+// bytes are written, so the ciphertext is encrypted straight into place and the CRC is computed over the
+// finished bytes. (Serializing, slicing off the header, encrypting into a second buffer, appending it, then
+// copying the whole thing again to add a CRC cost five allocations and four copies of the payload per
+// packet -- on the hot path, for every datagram, while the receive path next door copies nothing.)
+inline void writeCrc32Trailer(Bytes& datagram) noexcept {
+    const std::size_t body = datagram.size() - crc32Size;
+    putU32(datagram.data() + body, crc32c(datagram.data(), body));   // little-endian, matching appendCrc32
+}
+
+inline Bytes frameCleartextDatagram(const PacketHeader& header, const Bytes& payload) {
+    Bytes out(packetHeaderBytes + payload.size() + static_cast<std::size_t>(crc32Size));
+    Writer w{ out.data(), packetHeaderBytes, 0, true };
+    writeHeader(w, header);
+    if (!payload.empty()) std::memcpy(out.data() + packetHeaderBytes, payload.data(), payload.size());
+    writeCrc32Trailer(out);
+    return out;
+}
+
+// The keyed form. The cleartext header is authenticated as AAD (so tampering with it fails the tag), and
+// the nonce counter travels in the clear ahead of the ciphertext, exactly as the receive path expects.
+inline Bytes sealDatagram(const EncryptionKey& key, NonceCounter counter, std::uint32_t protocolId,
+                          const PacketHeader& header, const Bytes& payload) {
+    const std::size_t ctOffset = packetHeaderBytes + static_cast<std::size_t>(nonceSize);
+    Bytes out(ctOffset + payload.size() + static_cast<std::size_t>(authTagSize) + static_cast<std::size_t>(crc32Size));
+    Writer w{ out.data(), packetHeaderBytes, 0, true };
+    writeHeader(w, header);
+
+    std::uint8_t nonce[12];
+    buildNonce(counter.value, protocolId, nonce);
+    std::memcpy(out.data() + packetHeaderBytes, nonce, static_cast<std::size_t>(nonceSize));   // counter, 8 bytes BE
+    aeadSeal(key.data(), nonce, out.data(), packetHeaderBytes,                                 // AAD: the header just written
+             payload.data(), payload.size(),
+             out.data() + ctOffset,                                                            // ciphertext, in place
+             out.data() + ctOffset + payload.size());                                          // tag, straight after it
+    writeCrc32Trailer(out);
+    return out;
+}
+
 // --- outgoing: encrypt post-handshake payloads, append CRC ---
 inline std::vector<RawPacket> encryptOutgoing(NetPeer& peer, const PeerId& pid, Connection& conn, const std::vector<OutgoingPacket>& packets) {
     std::vector<RawPacket> out;
@@ -586,7 +701,6 @@ inline std::vector<RawPacket> encryptOutgoing(NetPeer& peer, const PeerId& pid, 
     for (const OutgoingPacket& op : packets) {
         PacketHeader header = op.header;
         header.type = op.type;
-        const Bytes serialized = serializePacket(Packet{ header, op.payload });
         if (conn.sendKey && isPostHandshake(op.type)) {
             // Fail closed: never wrap the send counter -- reusing a (key,nonce) pair would be
             // catastrophic for ChaCha20-Poly1305. 2^64 packets on one un-rekeyed session is unreachable
@@ -594,15 +708,10 @@ inline std::vector<RawPacket> encryptOutgoing(NetPeer& peer, const PeerId& pid, 
             // out rather than reuse a nonce.
             if (conn.sendNonce.value == UINT64_MAX) continue;
             const NonceCounter nonce = conn.sendNonce;
-            Bytes combined(serialized.begin(), serialized.begin() + static_cast<std::ptrdiff_t>(packetHeaderBytes));
-            const Bytes enc = encrypt(*conn.sendKey, nonce, peer.config.protocolId,
-                                      serialized.data(), packetHeaderBytes,   // the cleartext header, authenticated as AAD
-                                      serialized.data() + packetHeaderBytes, serialized.size() - packetHeaderBytes);
-            combined.insert(combined.end(), enc.begin(), enc.end());
-            out.push_back(RawPacket{ pid, appendCrc32(combined) });
+            out.push_back(RawPacket{ pid, sealDatagram(*conn.sendKey, nonce, peer.config.protocolId, header, op.payload) });
             conn.sendNonce = NonceCounter{ nonce.value + 1 };
         } else {
-            out.push_back(RawPacket{ pid, appendCrc32(serialized) });
+            out.push_back(RawPacket{ pid, frameCleartextDatagram(header, op.payload) });
         }
     }
     return out;
@@ -624,7 +733,7 @@ inline std::vector<PeerEvent> updateConnections(NetPeer& peer, MonoTime now) {
     std::vector<PeerId>    disconnected;
     for (auto& [pid, conn] : peer.connections) {
         if (updateTick(conn, now)) {
-            peer.resumableTokens[conn.clientSalt] = { now, conn.resumeMaster };   // token + shared secret, to re-key a reconnect
+            peer.resumableTokens[conn.clientSalt] = { now, conn.resumeMaster, conn.playerId };   // token + shared secret + identity, to restore on reconnect
             events.push_back(evDisconnected(pid, DisconnectReason::Timeout));
             disconnected.push_back(pid);
         } else if (connectionState(conn) == ConnectionState::Disconnected) {
@@ -659,12 +768,17 @@ inline void retryPendingConnections(NetPeer& peer, MonoTime now) {
         }
     }
 }
+// Expire half-open handshakes. Only an OUTBOUND pending reports a timeout: we asked to connect and the
+// attempt failed, which the caller is waiting to hear about. An inbound pending that never completed is
+// a peer that walked away (or never existed -- a spoofed request); surfacing Disconnected for it would
+// report a disconnect for a peer that was never connected, once per abandoned handshake.
 inline std::vector<PeerEvent> cleanupPending(NetPeer& peer, MonoTime now) {
     const double           timeout = peer.config.connectionRequestTimeoutMs;
     std::vector<PeerEvent> events;
     for (auto it = peer.pending.begin(); it != peer.pending.end();) {
         if (elapsedMs(it->second.createdAt, now) > timeout) {
-            events.push_back(evDisconnected(it->first, DisconnectReason::Timeout));
+            if (it->second.direction == ConnectionDirection::Outbound)
+                events.push_back(evDisconnected(it->first, DisconnectReason::Timeout));
             it = peer.pending.erase(it);
         } else {
             ++it;
@@ -733,8 +847,11 @@ inline void peerReconnect(NetPeer& peer, const PeerId& pid, std::uint64_t token,
     peer.pending[pid] = pend;
     queueControlPacket(peer, PacketType::ConnectionRequest, encodeResume(token, freshSalt, mac), pid);
 }
-inline void peerDisconnect(NetPeer& peer, const PeerId& pid, MonoTime now) {
-    if (const auto it = peer.connections.find(pid); it != peer.connections.end()) disconnect(it->second, DisconnectReason::Requested, now);
+// Disconnect a peer, telling it why. The reason travels on the wire and arrives as the remote's
+// Disconnected event, so a server can distinguish a kick from an ordinary close (default Requested).
+inline void peerDisconnect(NetPeer& peer, const PeerId& pid, MonoTime now,
+                           DisconnectReason reason = DisconnectReason::Requested) {
+    if (const auto it = peer.connections.find(pid); it != peer.connections.end()) disconnect(it->second, reason, now);
 }
 // Gracefully shut the whole peer down: move every connection to Disconnecting and drain the
 // resulting Disconnect packets, returned for the caller to flush before closing the socket.
@@ -769,6 +886,12 @@ inline bool peerIsConnected(const NetPeer& peer, const PeerId& pid) { return pee
 inline std::optional<std::uint64_t> peerSessionToken(const NetPeer& peer, const PeerId& pid) {
     const auto it = peer.connections.find(pid);
     return it == peer.connections.end() ? std::nullopt : std::optional<std::uint64_t>(it->second.clientSalt);
+}
+// The connect-token identity this connection authenticated (0 when auth is off). Survives a fast
+// reconnect, so a server can attribute a resumed session without having cached the Connected event.
+inline std::optional<std::uint64_t> peerPlayerId(const NetPeer& peer, const PeerId& pid) {
+    const auto it = peer.connections.find(pid);
+    return it == peer.connections.end() ? std::nullopt : std::optional<std::uint64_t>(it->second.playerId);
 }
 inline std::optional<NetworkStats> peerStats(const NetPeer& peer, const PeerId& pid) {
     const auto it = peer.connections.find(pid);

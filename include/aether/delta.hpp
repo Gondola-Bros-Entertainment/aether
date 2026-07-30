@@ -120,18 +120,49 @@ template <class T> std::optional<T> unpack(Reader& r) {
     return std::nullopt;
 }
 
-// --- delta snapshot: changemask (one bit per top-level field) + only changed fields ---
+// --- delta snapshot: a changemask, then only the changed fields ---
+//
+// The mask adapts to the struct's width at compile time and to the change count at run time:
+//   fieldCount <= 16: the plain bitmap, (n+7)/8 bytes, no discriminator. A mode byte would cost as
+//     much as it could ever save at this width.
+//   fieldCount  > 16: one mode byte. A value < maskBytes is a count of 1-byte field indices that
+//     follow (strictly ascending); 0xFF means a full bitmap follows. Sparse is chosen exactly when
+//     it is strictly smaller, so a wide struct with few changed fields -- the replication steady
+//     state -- pays per change, not per field. (A 32-field struct sends one changed field under a
+//     2-byte mask instead of 4.)
+// Both sides derive the layout from fieldCount<T>() alone, so encode and decode cannot disagree.
+// The decoder rejects every encoding the encoder would not produce (non-canonical): sparse where a
+// bitmap was due (and vice versa), unordered or out-of-range indices, padding bits -- one change-set,
+// one wire form, exactly as the bitmap path has always enforced with its padding-bit check.
+inline constexpr std::size_t  deltaSparseFieldMin = 17;    // adaptive from here up (reflection caps at 32)
+inline constexpr std::uint8_t deltaMaskBitmap     = 0xFF;  // mode byte: a full bitmap follows
+
 template <class T> void deltaPack(Writer& w, const T& prev, const T& curr) {
     constexpr std::size_t n         = fieldCount<T>();
     constexpr std::size_t maskBytes = (n + 7) / 8;
     std::uint8_t mask[maskBytes ? maskBytes : 1] = {};
+    std::uint8_t changed[n ? n : 1];
+    std::size_t  changedCount = 0;
 
     std::size_t i = 0;
     forEachFieldPair(prev, curr, [&](const auto& p, const auto& c) {
-        if (!fieldEqual(p, c)) mask[i >> 3] |= static_cast<std::uint8_t>(1u << (i & 7));
+        if (!fieldEqual(p, c)) {
+            mask[i >> 3] |= static_cast<std::uint8_t>(1u << (i & 7));
+            changed[changedCount++] = static_cast<std::uint8_t>(i);   // ascending by construction
+        }
         ++i;
     });
-    writeBytes(w, mask, maskBytes);
+    if constexpr (n >= deltaSparseFieldMin) {
+        if (changedCount < maskBytes) {   // 1 + count vs 1 + maskBytes: sparse strictly smaller
+            write(w, static_cast<std::uint8_t>(changedCount));
+            writeBytes(w, changed, changedCount);
+        } else {
+            write(w, deltaMaskBitmap);
+            writeBytes(w, mask, maskBytes);
+        }
+    } else {
+        writeBytes(w, mask, maskBytes);
+    }
 
     i = 0;
     forEachFieldPair(prev, curr, [&](const auto& p, const auto& c) {
@@ -144,13 +175,38 @@ template <class T> std::optional<T> deltaUnpack(Reader& r, const T& prev) {
     constexpr std::size_t n         = fieldCount<T>();
     constexpr std::size_t maskBytes = (n + 7) / 8;
     std::uint8_t mask[maskBytes ? maskBytes : 1] = {};
-    if (!readBytes(r, mask, maskBytes)) return std::nullopt;
 
-    // Reject a non-canonical changemask: our encoder only ever sets the low n bits, so any high padding
-    // bit set in the last mask byte is malformed/hostile input.
-    if constexpr (n % 8 != 0) {
-        constexpr auto validLow = static_cast<std::uint8_t>((1u << (n % 8)) - 1);
-        if (mask[maskBytes - 1] & static_cast<std::uint8_t>(~validLow)) return std::nullopt;
+    // Canonical bitmap: only the low n bits may be set -- the encoder never sets a padding bit.
+    const auto bitmapCanonical = [&]() {
+        if constexpr (n % 8 != 0) {
+            constexpr auto validLow = static_cast<std::uint8_t>((1u << (n % 8)) - 1);
+            return (mask[maskBytes - 1] & static_cast<std::uint8_t>(~validLow)) == 0;
+        } else {
+            return true;
+        }
+    };
+    if constexpr (n >= deltaSparseFieldMin) {
+        const auto mode = read<std::uint8_t>(r);
+        if (!mode) return std::nullopt;
+        if (*mode == deltaMaskBitmap) {
+            if (!readBytes(r, mask, maskBytes)) return std::nullopt;
+            if (!bitmapCanonical()) return std::nullopt;
+            int setBits = 0;
+            for (std::size_t b = 0; b < maskBytes; ++b) setBits += std::popcount(mask[b]);
+            if (static_cast<std::size_t>(setBits) < maskBytes) return std::nullopt;   // this few changes is always sent sparse
+        } else {
+            if (*mode >= maskBytes) return std::nullopt;   // this many changes is always sent as a bitmap
+            int last = -1;
+            for (std::uint8_t k = 0; k < *mode; ++k) {
+                const auto idx = read<std::uint8_t>(r);
+                if (!idx || *idx >= n || static_cast<int>(*idx) <= last) return std::nullopt;   // in range, strictly ascending
+                last = *idx;
+                mask[*idx >> 3] |= static_cast<std::uint8_t>(1u << (*idx & 7));
+            }
+        }
+    } else {
+        if (!readBytes(r, mask, maskBytes)) return std::nullopt;
+        if (!bitmapCanonical()) return std::nullopt;
     }
 
     T curr = prev;                                  // unchanged fields inherit the baseline

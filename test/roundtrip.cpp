@@ -24,6 +24,7 @@
 #include "aether/serialize.hpp"
 #include "aether/socket.hpp"
 #include "aether/stats.hpp"
+#include "aether/testnet.hpp"
 #include "aether/types.hpp"
 #include "aether/util.hpp"
 #include "aether/x25519.hpp"
@@ -181,8 +182,8 @@ int main() {
     {
         aether::ReliableEndpoint ep{};
         const aether::ChannelId ch{ 0 };
-        for (int i = 0; i < 3; ++i) {
-            const auto s = aether::nextSequence(ep);
+        for (std::uint16_t i = 0; i < 3; ++i) {
+            const aether::SequenceNum s{ i };
             aether::onPacketSent(ep, s, aether::MonoTime{ 0 }, ch, s, 100);
         }
         assert(aether::packetsInFlight(ep) == 3);
@@ -221,9 +222,9 @@ int main() {
             last = aether::processAcks(ep, ackSeq, ackBits, aether::MonoTime{ 60ull * 1000000 });
         assert(!last.fastRetransmit.empty());           // seq 0 declared lost
         assert(ep.totalLost > 0);                        // the (previously dead) counter moves
-        assert(aether::packetLossPercent(ep) > 0.0);     // ...and the metric is no longer pinned at 0
+        assert(aether::packetLossFraction(ep) > 0.0);     // ...and the metric is no longer pinned at 0
         std::printf("aether loss-metric OK: a NACKed packet registers as loss (totalLost=%llu, loss=%.0f%%)\n",
-                    static_cast<unsigned long long>(ep.totalLost), aether::packetLossPercent(ep) * 100.0);
+                    static_cast<unsigned long long>(ep.totalLost), aether::packetLossFraction(ep) * 100.0);
     }
 
     // channel: reliable sends pipeline -- several messages go in flight in one drain, not the old
@@ -239,7 +240,7 @@ int main() {
         for (;;) {
             const auto m = aether::peekOutgoingMessage(ch);
             if (!m) break;
-            aether::commitOutgoingMessage(ch, m->sequence);
+            aether::commitOutgoingMessage(ch, m->sequence, aether::MonoTime{ 0 });
             ++emitted;
         }
         assert(emitted == 4);   // all four in flight at once (stop-and-wait would have emitted 1)
@@ -251,7 +252,7 @@ int main() {
     {
         aether::Channel ch = aether::newChannel(aether::ChannelId{ 0 }, aether::reliableOrderedChannel());
         const auto sr = aether::channelSend(ch, aether::Bytes{ 1, 2, 3 }, aether::MonoTime{ 0 });
-        aether::commitOutgoingMessage(ch, sr.seq);                 // in flight: retryCount 1, sendTime 0
+        aether::commitOutgoingMessage(ch, sr.seq, aether::MonoTime{ 0 });   // in flight: retryCount 1, sendTime 0
         const aether::MonoTime later{ 200ull * 1000000 };          // 200ms > 100ms RTO
         const auto cands = aether::getRetransmitMessages(ch, later, 100.0);
         assert(cands.size() == 1);                                                                  // RTO elapsed -> candidate
@@ -351,8 +352,9 @@ int main() {
         std::printf("aether elapsedMs-saturate OK: reversed time -> 0 (no unsigned-wrap deadline storm)\n");
     }
 
-    // config: validation rejects the unbounded/broken caps (0 fragments, 0 reassembly bytes, 0
-    // replication caps) that would otherwise allow unbounded buffers or a silently one-deep tracker.
+    // config: validation rejects every cap whose zero/negative value would break the transport instead
+    // of loudly failing setup -- unbounded reassembly buffers, a half-open table that admits nobody, a
+    // sequence distance that rejects all reorders, a reassembly timeout that expires on arrival.
     {
         const aether::NetworkConfig c;   // defaults are valid
         assert(!aether::validateConfig(c));
@@ -360,9 +362,80 @@ int main() {
         assert(aether::validateConfig(c1) == aether::ConfigError::InvalidMaxFragments);
         aether::NetworkConfig c2 = c; c2.maxReassemblyBufferSize = 0;
         assert(aether::validateConfig(c2) == aether::ConfigError::InvalidReassemblyBufferSize);
-        aether::NetworkConfig c3 = c; c3.maxBaselineSnapshots = 0;
-        assert(aether::validateConfig(c3) == aether::ConfigError::InvalidReplicationCaps);
-        std::printf("aether config-bounds OK: zero fragment/reassembly/replication caps rejected\n");
+        aether::NetworkConfig c3 = c; c3.maxPending = 0;
+        assert(aether::validateConfig(c3) == aether::ConfigError::InvalidMaxPending);
+        aether::NetworkConfig c4 = c; c4.maxInFlight = 0;
+        assert(aether::validateConfig(c4) == aether::ConfigError::InvalidMaxInFlight);
+        aether::NetworkConfig c5 = c; c5.maxSequenceDistance = 0;
+        assert(aether::validateConfig(c5) == aether::ConfigError::InvalidMaxSequenceDistance);
+        aether::NetworkConfig c6 = c; c6.fragmentTimeoutMs = 0.0;
+        assert(aether::validateConfig(c6) == aether::ConfigError::InvalidFragmentTimeout);
+        aether::NetworkConfig c7 = c; c7.connectionRequestMaxRetries = -1;
+        assert(aether::validateConfig(c7) == aether::ConfigError::InvalidConnectionRequestRetries);
+        // maxInFlight past the sent ring's physical capacity is a lie the ring cannot honor (records
+        // would displace a full cycle early rather than track more packets) -- rejected, not degraded.
+        aether::NetworkConfig c8 = c; c8.maxInFlight = aether::sentBufferSize + 1;
+        assert(aether::validateConfig(c8) == aether::ConfigError::InvalidMaxInFlight);
+        aether::NetworkConfig c9 = c; c9.maxInFlight = aether::sentBufferSize;   // exactly the ring is fine
+        assert(!aether::validateConfig(c9));
+        std::printf("aether config-bounds OK: zero fragment/reassembly/pending/in-flight/seq-distance caps rejected\n");
+    }
+
+    // The unfragmentable-message backstop DISPOSES of the message. buildMessageWires can only report
+    // ok=false on a config that bypassed validateConfig; the old path "consumed" such a message with
+    // commitOutgoingMessage, which KEEPS a reliable message for retransmit -- so it re-qualified as a
+    // retransmit candidate every tick forever, a zombie the drop counter hid.
+    {
+        aether::NetworkConfig cfg;                                     // NOT validated, deliberately:
+        cfg.defaultChannelConfig.maxMessageSize = 400000;              // past the ~295KB fragmentable ceiling
+        aether::Connection conn = aether::newConnection(cfg, 1, aether::MonoTime{ 0 });
+        aether::markConnected(conn, aether::MonoTime{ 0 });
+
+        const auto sendErr = aether::sendMessage(conn, aether::ChannelId{ 0 }, aether::Bytes(400000, 0x42), aether::MonoTime{ 0 });
+        assert(!sendErr);
+        aether::updateConnectedPure(conn, aether::MonoTime{ 1000000 });
+        const aether::Channel& ch = conn.channels[0];
+        assert(ch.totalDropped == 1);
+        assert(ch.sendBuffer.empty());                                 // disposed, not committed-and-kept
+        aether::updateConnectedPure(conn, aether::MonoTime{ 400000000 });   // past the RTO: nothing re-qualifies
+        assert(ch.totalDropped == 1 && conn.pendingWires.empty());
+        std::printf("aether oversized-backstop OK: an unfragmentable reliable message is disposed, not a retransmit zombie\n");
+    }
+
+    // config: the caps that used to be validated and then ignored are actually WIRED -- a config value
+    // that tunes nothing is a trap, so pin that these two reach the objects they configure.
+    {
+        aether::NetworkConfig cfg;
+        cfg.maxInFlight         = 8;
+        cfg.maxSequenceDistance = 1000;
+        cfg.fragmentTimeoutMs   = 250.0;
+        assert(!aether::validateConfig(cfg));
+
+        const aether::Connection conn = aether::newConnection(cfg, 1, aether::MonoTime{ 0 });
+        assert(conn.reliability.maxInFlight == 8);              // reached the reliability endpoint...
+        assert(conn.reliability.maxSeqDistance == 1000);
+
+        aether::Connection reset = conn;                         // ...and survives a reset (was reverting to defaults)
+        aether::resetConnection(reset);
+        assert(reset.reliability.maxInFlight == 8 && reset.reliability.maxSeqDistance == 1000);
+
+        // maxInFlight really bounds the sent ring: the 9th packet evicts the oldest.
+        aether::Connection ev = aether::newConnection(cfg, 2, aether::MonoTime{ 0 });
+        const aether::ChannelId ch0{ 0 };
+        for (std::uint16_t s = 0; s < 12; ++s)
+            aether::onPacketSent(ev.reliability, aether::SequenceNum{ s }, aether::MonoTime{ s }, ch0, aether::SequenceNum{ s }, 10);
+        assert(aether::packetsInFlight(ev.reliability) == 8 && ev.reliability.packetsEvicted == 4);
+
+        // fragmentTimeoutMs reaches the reassembler the peer builds per source.
+        const aether::Address addrS = aether::addrLocalhost(7401);
+        aether::NetPeer S = aether::newPeerState(addrS, cfg, aether::MonoTime{ 0 });
+        const aether::PeerId from{ aether::addrLocalhost(7402) };
+        std::uint8_t frag[aether::fragmentHeaderSize + 4]{};
+        aether::writeFragmentHeader(frag, aether::FragmentHeader{ aether::MessageId{ 1 }, 0, 2 });   // 1 of 2, never completes
+        aether::handleFragment(S, from, aether::ChannelId{ 0 }, aether::ByteSpan(frag, sizeof frag), aether::MonoTime{ 0 });
+        assert(S.fragmentAssemblers.at(from).timeoutMs == 250.0);
+        assert(S.fragmentAssemblers.at(from).maxBufferSize == cfg.maxReassemblyBufferSize);
+        std::printf("aether config-wiring OK: maxInFlight + maxSequenceDistance + fragmentTimeoutMs reach their objects\n");
     }
 
     // fragment: split a 2500-byte message into MTU-sized pieces and reassemble it
@@ -391,9 +464,8 @@ int main() {
         aether::onMessageReceived(ch, aether::SequenceNum{ 1 }, m1, aether::MonoTime{ 0 });   // fills the gap
         const auto got = aether::channelReceive(ch);
         assert(got.size() == 3 && got[0] == m0 && got[1] == m1 && got[2] == m2);
-        const auto acks = aether::takePendingAcks(ch);
-        assert(acks.size() == 3);
-        std::printf("aether channel OK: out-of-order [0,2,1] -> in-order [0,1,2], %zu acks\n", acks.size());
+        assert(ch.orderedExpected == aether::SequenceNum{ 3 });   // the reorder window advanced past all three
+        std::printf("aether channel OK: out-of-order [0,2,1] -> in-order [0,1,2]\n");
     }
 
     // bit-packed reflective serialize: the wire contract lives in the field types, so the
@@ -645,8 +717,8 @@ int main() {
     {
         assert(!aether::validateConfig(aether::NetworkConfig{}));
         aether::NetworkConfig bad;
-        bad.fragmentThreshold = bad.mtu + 1;
-        assert(aether::validateConfig(bad) == aether::ConfigError::FragmentThresholdExceedsMtu);
+        bad.mtu = aether::minMtu - 1;   // below the smallest MTU any path is required to carry
+        assert(aether::validateConfig(bad) == aether::ConfigError::InvalidMtu);
         const auto rejected = aether::openHost(aether::addrLocalhost(0), bad, aether::MonoTime{ 0 });
         assert(!rejected);   // openHost now refuses an invalid config
         assert(aether::assessConnectionQuality(20.0, 0.0)  == aether::ConnectionQuality::Excellent);
@@ -675,7 +747,8 @@ int main() {
         int delivered = 0;
         for (const auto& pkt : outgoing) {
             if (pkt.type != aether::PacketType::Payload || pkt.payload.size() < 3) continue;
-            aether::processIncomingHeader(b, pkt.header, aether::MonoTime{ 2000000 });
+            aether::processIncomingAcks(b, pkt.header, aether::MonoTime{ 2000000 });
+            aether::recordReceivedPacket(b, pkt.header);
             const auto& w = pkt.payload;
             const auto chan = static_cast<std::uint8_t>(w[0] & 0x07);
             const aether::SequenceNum chSeq{ static_cast<std::uint16_t>((w[1] << 8) | w[2]) };
@@ -720,7 +793,8 @@ int main() {
                                            aether::Bytes(wire.begin() + 3, wire.end()), aether::MonoTime{ 2000000 });
         };
         for (const auto& pkt : outgoing) {
-            aether::processIncomingHeader(b, pkt.header, aether::MonoTime{ 2000000 });
+            aether::processIncomingAcks(b, pkt.header, aether::MonoTime{ 2000000 });
+            aether::recordReceivedPacket(b, pkt.header);
             if (pkt.type == aether::PacketType::PayloadBatch) {
                 const auto wires = aether::unbatchMessages(pkt.payload);
                 assert(wires);
@@ -775,7 +849,8 @@ int main() {
         const auto shuttle = [&](aether::Connection& from, aether::Connection& to, aether::MonoTime now) {
             for (const auto& pkt : aether::drainSendQueue(from)) {
                 if (lost()) continue;                            // dropped on the wire
-                aether::processIncomingHeader(to, pkt.header, now);
+                aether::processIncomingAcks(to, pkt.header, now);
+                aether::recordReceivedPacket(to, pkt.header);
                 if (pkt.type == aether::PacketType::Payload && pkt.payload.size() >= 3) {
                     const auto& w = pkt.payload;
                     const auto chan = static_cast<std::uint8_t>(w[0] & 0x07);
@@ -1093,33 +1168,25 @@ int main() {
         const aether::Bytes token = aether::sealConnectToken(K, aether::ConnectToken{ 12345, aether::MonoTime{ 3600ull * 1000000000 }, {} });
         aether::peerConnectWithToken(C, idS, token, aether::MonoTime{ 0 });
 
-        std::vector<aether::IncomingPacket> toS, toC;
-        std::uint64_t t = 0, connectedPlayer = 0;
-        bool up = false;
-        for (int k = 0; k < 14 && !up; ++k) {
-            t += 1000000;
-            const auto rc = aether::peerProcess(C, aether::MonoTime{ t }, toC); toC.clear();
-            const auto rs = aether::peerProcess(S, aether::MonoTime{ t }, toS); toS.clear();
-            for (const auto& p : rc.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toS.push_back(aether::IncomingPacket{ idC, *s });
-            for (const auto& p : rs.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toC.push_back(aether::IncomingPacket{ idS, *s });
-            for (const auto& e : rs.events) if (e.kind == aether::PeerEvent::Connected) { up = true; connectedPlayer = e.playerId; }
-        }
-        assert(up && connectedPlayer == 12345 && aether::peerIsConnected(S, idC));   // server authenticated the player
+        aether::TestLink link = aether::newTestLink(C, idC, S, idS);
+        std::uint64_t    connectedPlayer = 0;
+        const aether::MonoTime t = aether::testLinkRun(link, aether::MonoTime{ 0 }, 1000000, 14,
+                                                       [&](const aether::TestLinkStep& s) {
+            for (const auto& e : s.bEvents) if (e.kind == aether::PeerEvent::Connected) connectedPlayer = e.playerId;
+            return connectedPlayer != 0;
+        });
+        assert(connectedPlayer == 12345 && aether::peerIsConnected(S, idC));   // server authenticated the player
 
         // a client with NO token is rejected (server requires one): it never connects.
         const aether::PeerId idX{ aether::addrLocalhost(7103) };
         aether::NetPeer X = aether::newPeerState(aether::addrLocalhost(7103), clientCfg, aether::MonoTime{ 2 });
-        aether::peerConnect(X, idS, aether::MonoTime{ t });   // no token
-        std::vector<aether::IncomingPacket> toS2, toX;
+        aether::peerConnect(X, idS, t);   // no token
+        aether::TestLink xlink = aether::newTestLink(X, idX, S, idS);
         bool xUp = false;
-        for (int k = 0; k < 14 && !xUp; ++k) {
-            t += 1000000;
-            const auto rx = aether::peerProcess(X, aether::MonoTime{ t }, toX);  toX.clear();
-            const auto rs = aether::peerProcess(S, aether::MonoTime{ t }, toS2); toS2.clear();
-            for (const auto& p : rx.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toS2.push_back(aether::IncomingPacket{ idX, *s });
-            for (const auto& p : rs.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toX.push_back(aether::IncomingPacket{ idS, *s });
-            for (const auto& e : rs.events) if (e.kind == aether::PeerEvent::Connected) xUp = true;
-        }
+        aether::testLinkRun(xlink, t, 1000000, 14, [&](const aether::TestLinkStep& s) {
+            xUp = xUp || aether::testHasEvent(s.bEvents, aether::PeerEvent::Connected);
+            return xUp;
+        });
         assert(!xUp && !aether::peerIsConnected(S, idX));   // no valid token -> never connected
         std::printf("aether auth OK: valid token connects (playerId %llu surfaced), tokenless client rejected\n",
                     static_cast<unsigned long long>(connectedPlayer));
@@ -1371,8 +1438,14 @@ int main() {
         aether::NetworkConfig c3;
         c3.defaultChannelConfig.maxMessageSize = 400000;   // beyond maxFragmentCount fragments at the default MTU -> rejected at setup, not dropped at send
         assert(validateConfig(c3) == aether::ConfigError::MessageTooLargeToFragment);
+        // ...and the fragment ceiling is the ONLY size limit: a message far bigger than one send-rate
+        // bucket validates fine, because fragment pacing spreads its emission across ticks (the old
+        // whole-message admission rejected this as MessageExceedsSendBudget).
+        aether::NetworkConfig c4;
+        c4.defaultChannelConfig.maxMessageSize = static_cast<int>(aether::maxFragmentableMessage(c4));   // ~295KB >> one bucket
+        assert(!validateConfig(c4));
         assert(!validateConfig(aether::NetworkConfig{}));   // defaults remain valid
-        std::printf("aether channel-config-validation OK: non-positive caps + unfragmentable maxMessageSize rejected\n");
+        std::printf("aether channel-config-validation OK: non-positive caps + unfragmentable maxMessageSize rejected; budget no longer caps size\n");
     }
 
     // channel: the ordered-buffer timeout flush advances past the WRAP-AWARE max sequence. Buffer two
@@ -1422,20 +1495,93 @@ int main() {
         assert(!aether::peerSend(A, idB, aether::ChannelId{ 0 }, big, aether::MonoTime{ t }));   // accepted; will fragment
 
         aether::Bytes received;
-        int drop = 0;
+        int drop = 0, fragmentsSent = 0;
         for (int tick = 0; tick < 400 && received.empty(); ++tick) {
             t += 1000000;
             const auto ra = aether::peerProcess(A, aether::MonoTime{ t }, toA); toA.clear();
             auto       rb = aether::peerProcess(B, aether::MonoTime{ t }, toB); toB.clear();   // non-const: we move the received message out of its event
             for (const auto& p : ra.outgoing) {
                 assert(static_cast<int>(p.data.size()) <= cfg.mtu);   // no oversized datagram -> it really fragmented
-                if (auto s = aether::validateAndStripCrc32(p.data)) if (drop++ % 3 != 0) toB.push_back(aether::IncomingPacket{ idA, *s });   // drop ~1/3 of A->B
+                auto s = aether::validateAndStripCrc32(p.data);
+                if (!s) continue;
+                // The payload is encrypted, but the header type is not: at a 1200 MTU each ~1156-byte
+                // fragment fills its own datagram, so payload-carrying datagrams count fragment sends.
+                const auto pkt = aether::deserializePacket(*s);
+                if (pkt && (pkt->header.type == aether::PacketType::Payload
+                         || pkt->header.type == aether::PacketType::PayloadBatch)) ++fragmentsSent;
+                if (drop++ % 3 != 0) toB.push_back(aether::IncomingPacket{ idA, *s });   // drop ~1/3 of A->B
             }
             for (const auto& p : rb.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toA.push_back(aether::IncomingPacket{ idB, *s });
             for (auto& e : rb.events) if (e.kind == aether::PeerEvent::Message) received = std::move(e.data);
         }
         assert(received == big);   // exact reassembly under loss
-        std::printf("aether fragmentation-e2e OK: %zu-byte reliable message fragmented + reassembled under ~33%% loss\n", big.size());
+        // With ~1/3 of fragments lost, 5 fragments cost 7 datagrams: the 5 originals plus the 2 that were
+        // dropped. Resending the whole message per retransmit round costs 10 here (measured), and the gap
+        // widens with the fragment count -- so this bound fails on a regression back to full resends rather
+        // than quietly costing bandwidth.
+        assert(fragmentsSent < 10);
+        std::printf("aether fragmentation-e2e OK: %zu-byte reliable message fragmented + reassembled under "
+                    "~33%% loss, %d fragment wires sent for 5 fragments\n", big.size(), fragmentsSent);
+    }
+
+    // congestion window, END TO END under sustained loss. The window is opt-in and no test had ever
+    // driven it through the real send path, which is where its byte accounting was wrong: lost and
+    // evicted packets never gave their bytes back, an ack arriving alongside a loss was discarded
+    // outright, unreliable traffic was charged but could never be credited, and the charge unit
+    // (per-message wire bytes) did not match the credit unit (whole-packet payload). Each of those
+    // leaks bytesInFlight upward until the window admits nothing. Soak it and require that every
+    // message still lands and the window ends up empty.
+    {
+        aether::NetworkConfig cfg;
+        cfg.useCwndCongestion = true;
+        cfg.channelConfigs.push_back(aether::reliableOrderedChannel());
+        cfg.channelConfigs.push_back(aether::unreliableChannel());   // never acked -- must not be charged
+        cfg.maxChannels = 2;
+        assert(!aether::validateConfig(cfg));
+
+        const aether::Address addrA = aether::addrLocalhost(7301), addrB = aether::addrLocalhost(7302);
+        const aether::PeerId  idA{ addrA }, idB{ addrB };
+        aether::NetPeer A = aether::newPeerState(addrA, cfg, aether::MonoTime{ 0 });
+        aether::NetPeer B = aether::newPeerState(addrB, cfg, aether::MonoTime{ 0 });
+        aether::peerConnect(A, idB, aether::MonoTime{ 0 });
+
+        std::vector<aether::IncomingPacket> toA, toB;
+        std::uint64_t t = 0;
+        int  sent = 0, delivered = 0, drop = 0;
+        constexpr int totalMessages = 60;
+        for (int tick = 0; tick < 4000 && delivered < totalMessages; ++tick) {
+            t += 1000000;   // 1ms
+            if (sent < totalMessages && aether::peerIsConnected(A, idB)) {
+                const aether::Bytes payload(700, static_cast<std::uint8_t>(sent));
+                if (!aether::peerSend(A, idB, aether::ChannelId{ 0 }, payload, aether::MonoTime{ t })) ++sent;
+                aether::peerSend(A, idB, aether::ChannelId{ 1 }, aether::Bytes(200, 0x5A), aether::MonoTime{ t });   // unreliable filler
+            }
+            const auto ra = aether::peerProcess(A, aether::MonoTime{ t }, toA); toA.clear();
+            auto       rb = aether::peerProcess(B, aether::MonoTime{ t }, toB); toB.clear();
+            for (const auto& p : ra.outgoing)
+                if (auto s = aether::validateAndStripCrc32(p.data)) if (drop++ % 4 != 0) toB.push_back(aether::IncomingPacket{ idA, *s });   // ~25% loss A->B
+            for (const auto& p : rb.outgoing)
+                if (auto s = aether::validateAndStripCrc32(p.data)) toA.push_back(aether::IncomingPacket{ idB, *s });
+            for (const auto& e : rb.events)
+                if (e.kind == aether::PeerEvent::Message && e.channel == aether::ChannelId{ 0 }) ++delivered;
+        }
+        assert(sent == totalMessages);
+        assert(delivered == totalMessages);   // every reliable message arrived: the window never wedged shut
+
+        // Quiet drain: no new sends, no loss. Once every outstanding packet has resolved, the window
+        // must be exactly empty -- any byte that was charged and never credited shows up here.
+        for (int tick = 0; tick < 400; ++tick) {
+            t += 1000000;
+            const auto ra = aether::peerProcess(A, aether::MonoTime{ t }, toA); toA.clear();
+            const auto rb = aether::peerProcess(B, aether::MonoTime{ t }, toB); toB.clear();
+            for (const auto& p : ra.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toB.push_back(aether::IncomingPacket{ idA, *s });
+            for (const auto& p : rb.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toA.push_back(aether::IncomingPacket{ idB, *s });
+        }
+        const auto& sender = A.connections.at(idB);
+        assert(sender.cwnd.has_value());
+        assert(sender.cwnd->bytesInFlight == 0);   // every charged byte was credited back exactly once
+        std::printf("aether cwnd-e2e OK: %d/%d reliable messages under ~25%% loss, window drained to 0 in-flight\n",
+                    delivered, totalMessages);
     }
 
     // channel: the receive buffer is capped, so an app that stops draining cannot grow it without bound.
@@ -1550,6 +1696,367 @@ int main() {
         assert(S.rateLimitDrops > 0 && !aether::peerIsConnected(S, from));   // flood shed past the per-source limit; nothing connected
         std::printf("aether migration rate-limit OK: %llu spoofed attempts shed, no trial-decrypt storm\n",
                     static_cast<unsigned long long>(S.rateLimitDrops));
+    }
+
+    // SELECTIVE FRAGMENT RETRANSMIT: a fragmented message re-renders only the fragments the peer has not
+    // acked. The channel already tracked which ones landed (fragAckBits, read by fragmentAcked), but the
+    // send path ignored it and rebuilt the whole message -- so one lost chunk out of N put N fragments back
+    // on a link that was already dropping packets, N-1 of them pure waste.
+    {
+        aether::NetworkConfig cfg;                      // default 1200 MTU -> ~1156-byte chunks
+        aether::ChannelConfig cc = aether::reliableOrderedChannel();
+        cc.maxMessageSize = 16384;
+        cfg.defaultChannelConfig = cc;
+        assert(!aether::validateConfig(cfg));
+
+        aether::Channel ch = aether::newChannel(aether::ChannelId{ 0 }, cc);
+        const auto sr = aether::channelSend(ch, aether::Bytes(5000, 0xAB), aether::MonoTime{ 0 });
+        assert(sr.error == aether::ChannelError::None);
+
+        // First send: nothing is acked and the channel has not recorded a fragment count yet, so every
+        // fragment is rendered, each tagged with its own index.
+        const aether::ChannelMessage* peek = aether::peekOutgoingMessage(ch);
+        assert(peek);
+        const aether::MessageWires first = aether::buildMessageWires(cfg, 0, *peek);
+        assert(first.ok && first.fragmentCount > 1);
+        assert(first.wires.size() == first.fragmentCount);
+        for (std::size_t i = 0; i < first.wires.size(); ++i) assert(first.wires[i].fragIndex == i);
+
+        aether::commitOutgoingMessage(ch, sr.seq, aether::MonoTime{ 0 });
+        ch.sendBuffer.at(sr.seq).fragmentCount = first.fragmentCount;
+
+        // Every fragment lands except index 2.
+        constexpr std::uint8_t missing = 2;
+        for (std::uint8_t i = 0; i < first.fragmentCount; ++i)
+            if (i != missing) aether::acknowledgeMessage(ch, sr.seq, i);
+        const aether::ChannelMessage& stored = ch.sendBuffer.at(sr.seq);
+        assert(!stored.acked);                                  // one piece short of complete
+        assert(!aether::fragmentAcked(stored, missing) && aether::fragmentAcked(stored, 0));
+
+        // The retransmit render carries exactly the missing fragment -- and still reports the message's
+        // TOTAL fragment count, which is what the channel needs to know when it is finally whole.
+        const aether::MessageWires again = aether::buildMessageWires(cfg, 0, stored);
+        assert(again.ok && again.wires.size() == 1);
+        assert(again.wires[0].fragIndex == missing);
+        assert(again.fragmentCount == first.fragmentCount);
+        assert(again.wires[0].data == first.wires[missing].data);   // byte-identical to the piece that was lost
+
+        // Acking the last one completes it, and there is then nothing left to resend.
+        aether::acknowledgeMessage(ch, sr.seq, missing);
+        assert(ch.sendBuffer.at(sr.seq).acked);
+        const aether::MessageWires complete = aether::buildMessageWires(cfg, 0, ch.sendBuffer.at(sr.seq));
+        assert(complete.wires.empty());
+        std::printf("aether selective-retransmit OK: %u-fragment message resends 1 wire, not %u\n",
+                    static_cast<unsigned>(first.fragmentCount), static_cast<unsigned>(first.fragmentCount));
+    }
+
+    // INCREMENTAL FRAGMENT PACING. A fragmented message no longer has to fit one token bucket: its
+    // fragments are emitted across ticks as budget accrues, resuming at msg.sentFragments. The old gate
+    // admitted a message only as a whole, which capped maxMessageSize at one full bucket
+    // (min(4*sendRate, maxPacketRate) * mtu) and rejected anything past it at validateConfig.
+    {
+        aether::NetworkConfig cfg;
+        cfg.sendRate      = 5.0;    // bucket: 6KB at base rate...
+        cfg.maxPacketRate = 10.0;   // ...12KB at the AIMD peak
+        aether::ChannelConfig cc = aether::reliableOrderedChannel();
+        cc.maxMessageSize        = 30000;   // ~27 fragments, ~30KB of wire: more than TWO peak buckets
+        cfg.defaultChannelConfig = cc;
+        assert(!aether::validateConfig(cfg));
+
+        aether::Connection conn = aether::newConnection(cfg, 1, aether::MonoTime{ 0 });
+        aether::markConnected(conn, aether::MonoTime{ 0 });
+        const auto sendErr = aether::sendMessage(conn, aether::ChannelId{ 0 }, aether::Bytes(30000, 0x7E), aether::MonoTime{ 0 });
+        assert(!sendErr);
+
+        aether::updateConnectedPure(conn, aether::MonoTime{ 1000000 });   // first tick: the bucket seeds full (6KB) -> ~5 fragments
+        aether::Channel& ch = conn.channels[0];
+        const aether::ChannelMessage& msg = ch.sendBuffer.begin()->second;
+        assert(msg.fragmentCount > 1);                    // total recorded up front: an early ack must see it
+        assert(msg.sentFragments > 0);                    // some fragments went out...
+        assert(msg.sentFragments < msg.fragmentCount);    // ...but not all: the message exceeds the bucket
+        assert(msg.retryCount == 0);                      // not committed until fully emitted
+        const std::uint8_t afterFirst = msg.sentFragments;
+
+        aether::updateConnectedPure(conn, aether::MonoTime{ 1000001 });   // no time passed -> no budget earned -> no progress
+        assert(msg.sentFragments == afterFirst);
+
+        // Budget accrues with time; the message finishes over later ticks and only then commits, with
+        // the RTO clock starting at completion. Count what was actually emitted: exactly one wire per
+        // fragment, no re-sends and no gaps.
+        std::size_t   payloadPackets = 0;
+        std::uint64_t t              = 1000001;
+        for (const auto& pkt : aether::drainSendQueue(conn))
+            if (pkt.type == aether::PacketType::Payload || pkt.type == aether::PacketType::PayloadBatch) ++payloadPackets;
+        for (int tick = 0; tick < 100 && msg.retryCount == 0; ++tick) {
+            t += 500000000;   // 500ms: at 5 pkts/s each tick earns ~2.5 fragments of budget
+            aether::updateConnectedPure(conn, aether::MonoTime{ t });
+            for (const auto& pkt : aether::drainSendQueue(conn))
+                if (pkt.type == aether::PacketType::Payload || pkt.type == aether::PacketType::PayloadBatch) ++payloadPackets;
+        }
+        assert(msg.retryCount == 1);                         // fully emitted + committed
+        assert(msg.sentFragments == msg.fragmentCount);
+        assert(msg.sendTime.ns == t);                        // RTO runs from emission completion, not channelSend
+        assert(payloadPackets == msg.fragmentCount);         // every fragment exactly once (each fills its own datagram)
+        std::printf("aether fragment-pacing OK: %u-fragment message emitted over ticks (%u after one bucket), one wire each\n",
+                    static_cast<unsigned>(msg.fragmentCount), static_cast<unsigned>(afterFirst));
+    }
+
+    // ...and end to end: a message bigger than the peak bucket is delivered whole through two real
+    // peers. Under the old whole-message admission this config was unbuildable, and the message would
+    // have stalled at the head of its channel forever if it ever got in.
+    {
+        aether::NetworkConfig cfg;
+        cfg.sendRate      = 20.0;   // 24KB bucket
+        cfg.maxPacketRate = 40.0;
+        aether::ChannelConfig cc = aether::reliableOrderedChannel();
+        cc.maxMessageSize        = 60000;   // ~52 fragments, ~2.5 buckets
+        cfg.defaultChannelConfig = cc;
+        assert(!aether::validateConfig(cfg));
+
+        const aether::Address addrA = aether::addrLocalhost(8811), addrB = aether::addrLocalhost(8812);
+        const aether::PeerId  idA{ addrA }, idB{ addrB };
+        aether::NetPeer A = aether::newPeerState(addrA, cfg, aether::MonoTime{ 0 });
+        aether::NetPeer B = aether::newPeerState(addrB, cfg, aether::MonoTime{ 0 });
+        aether::peerConnect(A, idB, aether::MonoTime{ 0 });
+
+        aether::TestLink link = aether::newTestLink(A, idA, B, idB);
+        aether::MonoTime t    = aether::testLinkConnect(link, aether::MonoTime{ 0 }, 1000000, 40);
+        assert(aether::peerIsConnected(A, idB));
+
+        aether::Bytes big(60000);
+        for (std::size_t i = 0; i < big.size(); ++i) big[i] = static_cast<std::uint8_t>(i * 31u);
+        const auto err = aether::peerSend(A, idB, aether::ChannelId{ 0 }, big, t);
+        assert(!err);
+
+        aether::Bytes received;
+        aether::testLinkRun(link, t, 10000000 /*10ms*/, 600, [&](aether::TestLinkStep step) {
+            for (aether::PeerEvent& e : step.bEvents)
+                if (e.kind == aether::PeerEvent::Message) received = std::move(e.data);
+            return !received.empty();
+        });
+        assert(received == big);   // reassembled exactly, from an emission spread over many ticks
+        std::printf("aether pacing-e2e OK: %zu-byte message (>2 send buckets) delivered whole\n", big.size());
+    }
+
+    // ADAPTIVE CHANGEMASK: past 16 fields the delta's mask switches per-snapshot between sparse
+    // indices (few changes -- the replication steady state) and a bitmap (many), chosen by whichever
+    // is smaller. A 20-field struct (3-byte bitmap) sending one changed byte-field costs 3 bytes
+    // total, not 4 -- and the decoder rejects every wire form the encoder would not produce.
+    {
+        struct Wide {
+            std::uint8_t f00, f01, f02, f03, f04, f05, f06, f07, f08, f09;
+            std::uint8_t f10, f11, f12, f13, f14, f15, f16, f17, f18, f19;
+        };
+        static_assert(aether::fieldCount<Wide>() == 20);
+        std::uint8_t buf[64];
+        const Wide base{};
+        const auto deltaBytes = [&](const Wide& to) {
+            aether::Writer w{ buf, sizeof buf, 0, true };
+            aether::deltaPack(w, base, to);
+            aether::Reader r{ buf, w.pos, 0 };
+            const auto back = aether::deltaUnpack(r, base);
+            assert(back && std::memcmp(&*back, &to, sizeof(Wide)) == 0);   // every form reconstructs exactly
+            return w.pos;
+        };
+        Wide w1 = base; w1.f07 = 9;
+        Wide w2 = w1;   w2.f19 = 5;
+        Wide w3 = w2;   w3.f00 = 1;
+        Wide all{};
+        std::uint8_t* ab = reinterpret_cast<std::uint8_t*>(&all);
+        for (std::size_t k = 0; k < sizeof(Wide); ++k) ab[k] = static_cast<std::uint8_t>(k + 1);
+        assert(deltaBytes(base) == 1);   // nothing changed: one mode byte, not a 3-byte zero bitmap
+        assert(deltaBytes(w1)   == 3);   // 1 change:  mode + index + value   (bitmap would be 4+)
+        assert(deltaBytes(w2)   == 5);   // 2 changes: mode + 2 idx + 2 values
+        assert(deltaBytes(w3)   == 7);   // 3 changes == bitmap bytes: mode + 3-byte bitmap + 3 values
+        assert(deltaBytes(all)  == 24);  // everything: mode + bitmap + 20 values
+
+        // Hostile wire forms: each is decodable-looking but non-canonical or malformed -> nullopt.
+        const auto rejects = [&](std::initializer_list<std::uint8_t> bytes) {
+            const aether::Bytes hostile(bytes);
+            aether::Reader r{ hostile.data(), hostile.size(), 0 };
+            return !aether::deltaUnpack(r, base).has_value();
+        };
+        assert(rejects({ 0x03, 0x01, 0x02, 0x03, 0x09, 0x09, 0x09 }));   // sparse count == bitmap bytes: always sent as bitmap
+        assert(rejects({ 0x02, 0x05, 0x03, 0x09, 0x09 }));               // indices not ascending
+        assert(rejects({ 0x02, 0x05, 0x05, 0x09, 0x09 }));               // duplicate index
+        assert(rejects({ 0x01, 0x14, 0x09 }));                           // index 20 out of range (fields 0..19)
+        assert(rejects({ 0x01 }));                                       // truncated: promised index missing
+        assert(rejects({ 0xFF, 0x03, 0x00, 0x00, 0x09, 0x09 }));         // bitmap with 2 bits: always sent sparse
+        assert(rejects({ 0xFF, 0xFF, 0xFF, 0xFF }));                     // bitmap padding bits set (fields stop at 19)
+        std::printf("aether adaptive-mask OK: sparse 1/20 costs 3 bytes (was 4), canonical-form rejection holds\n");
+    }
+
+    // Reassembly expiry is IDLE-based (time since the last new fragment), not total-age: pacing can
+    // legitimately spread a message over longer than the timeout, and a total-age expiry would drop an
+    // assembly that was still advancing. One that stops advancing for a full timeout is abandoned.
+    {
+        aether::FragmentAssembler a = aether::newFragmentAssembler(100.0, 1 << 20, 16);
+        std::uint8_t frag[aether::fragmentHeaderSize + 8]{};
+        const auto feed = [&](std::uint8_t idx, std::uint64_t atMs) {
+            aether::writeFragmentHeader(frag, aether::FragmentHeader{ aether::MessageId{ 9 }, idx, 3 });
+            return aether::processFragment(a, frag, sizeof frag, aether::MonoTime{ atMs * 1000000 });
+        };
+        assert(!feed(0, 0));
+        assert(!feed(1, 80));                  // 80ms gap: inside the idle window
+        const auto done = feed(2, 160);        // total age 160ms > the 100ms timeout -- but never idle
+        assert(done && done->size() == 24);    // completes; total-age expiry would have dropped it at 100ms
+
+        assert(!feed(0, 1000));                // a fresh assembly...
+        assert(!feed(1, 1300));                // ...that went 300ms with nothing new: expired, this re-opens it
+        assert(a.buffers.at(aether::MessageId{ 9 }).fragments.size() == 1);   // only the re-opening fragment held
+        std::printf("aether fragment-idle-expiry OK: advancing assembly outlives the timeout, stalled one expires\n");
+    }
+
+    // RELIABILITY, end to end, when the receiver's REORDER BUFFER OVERRUNS. The packet layer used to
+    // record a datagram as acked before the channel decided whether it could buffer the message, so a full
+    // reorder buffer discarded data the sender had already been told was delivered: silent, permanent loss
+    // on the one channel type whose entire promise is that it does not lose things. Drop exactly one
+    // message on the wire, then overrun the buffer behind the gap it leaves -- every message must still
+    // arrive, because a receiver does not acknowledge what it did not accept.
+    {
+        aether::NetworkConfig cfg;
+        cfg.defaultChannelConfig                      = aether::reliableOrderedChannel();
+        cfg.defaultChannelConfig.maxOrderedBufferSize = 4;       // small, so the overrun is reached at once
+        cfg.defaultChannelConfig.orderedBufferTimeout = 1.0e9;   // never: the give-up flush must not mask it
+        assert(!aether::validateConfig(cfg));
+
+        const aether::Address addrA = aether::addrLocalhost(8801), addrB = aether::addrLocalhost(8802);
+        const aether::PeerId  idA{ addrA }, idB{ addrB };
+        aether::NetPeer A = aether::newPeerState(addrA, cfg, aether::MonoTime{ 0 });
+        aether::NetPeer B = aether::newPeerState(addrB, cfg, aether::MonoTime{ 0 });
+        aether::peerConnect(A, idB, aether::MonoTime{ 0 });
+
+        aether::TestLink link = aether::newTestLink(A, idA, B, idB);
+        aether::MonoTime t    = aether::testLinkConnect(link, aether::MonoTime{ 0 }, 1000000, 40);
+        assert(aether::peerIsConnected(A, idB) && aether::peerIsConnected(B, idA));
+
+        constexpr int total = 30;
+        int  sent = 0, delivered = 0;
+        bool droppedFirst = false;
+        std::vector<aether::IncomingPacket> toA, toB;
+        for (int tick = 0; tick < 3000 && delivered < total; ++tick) {
+            t = aether::MonoTime{ t.ns + 1000000 };
+            while (sent < total) {                                   // fill the pipeline as fast as it accepts
+                const aether::Bytes payload{ static_cast<std::uint8_t>(sent) };
+                if (aether::peerSend(A, idB, aether::ChannelId{ 0 }, payload, t)) break;   // BufferFull: next tick
+                ++sent;
+            }
+            const auto ra = aether::peerProcess(A, t, toA); toA.clear();
+            const auto rb = aether::peerProcess(B, t, toB); toB.clear();
+            for (const auto& p : ra.outgoing) {
+                auto s = aether::validateAndStripCrc32(p.data);
+                if (!s) continue;
+                const auto pkt = aether::deserializePacket(*s);
+                const bool isPayload = pkt && (pkt->header.type == aether::PacketType::Payload
+                                            || pkt->header.type == aether::PacketType::PayloadBatch);
+                if (isPayload && !droppedFirst) { droppedFirst = true; continue; }   // the one and only loss
+                toB.push_back(aether::IncomingPacket{ idA, *s });
+            }
+            for (const auto& p : rb.outgoing)
+                if (auto s = aether::validateAndStripCrc32(p.data)) toA.push_back(aether::IncomingPacket{ idB, *s });
+            for (const auto& e : rb.events)
+                if (e.kind == aether::PeerEvent::Message) ++delivered;
+        }
+        assert(sent == total);
+        assert(delivered == total);   // was 20 of 30: the overrun silently ate a run of messages
+        const auto& chB = B.connections.at(idA).channels[0];
+        assert(chB.totalRefused > 0);    // the overrun really happened...
+        assert(chB.totalDropped == 0);   // ...and cost nothing: refusals are backpressure, not loss
+        std::printf("aether reliable-overrun OK: %d/%d delivered through a reorder-buffer overrun "
+                    "(%llu refusals, %llu duplicates, 0 dropped)\n", delivered, total,
+                    static_cast<unsigned long long>(chB.totalRefused),
+                    static_cast<unsigned long long>(chB.totalDuplicate));
+    }
+
+    // peer: a disconnect carries its REASON to the other end, so a kick is distinguishable from an
+    // ordinary close. The reason byte was hardcoded to Requested, leaving Kicked unreachable through
+    // the peer API -- a server could not tell a player why it dropped them.
+    {
+        const aether::NetworkConfig cfg;
+        const aether::Address addrS = aether::addrLocalhost(7501), addrC = aether::addrLocalhost(7502);
+        const aether::PeerId  idS{ addrS }, idC{ addrC };
+        aether::NetPeer S = aether::newPeerState(addrS, cfg, aether::MonoTime{ 0 });
+        aether::NetPeer C = aether::newPeerState(addrC, cfg, aether::MonoTime{ 0 });
+        aether::peerConnect(C, idS, aether::MonoTime{ 0 });
+
+        aether::TestLink link = aether::newTestLink(C, idC, S, idS);
+        aether::MonoTime t    = aether::testLinkConnect(link, aether::MonoTime{ 0 }, 1000000, 24);
+        assert(aether::peerIsConnected(S, idC) && aether::peerIsConnected(C, idS));
+
+        aether::peerDisconnect(S, idC, t, aether::DisconnectReason::Kicked);
+        aether::DisconnectReason seen = aether::DisconnectReason::Requested;
+        bool dropped = false;
+        aether::testLinkRun(link, t, 1000000, 8, [&](const aether::TestLinkStep& s) {
+            for (const auto& e : s.aEvents)
+                if (e.kind == aether::PeerEvent::Disconnected) { seen = e.reason; dropped = true; }
+            return dropped;
+        });
+        assert(dropped && seen == aether::DisconnectReason::Kicked);   // the client learns it was kicked
+        std::printf("aether disconnect-reason OK: a kick arrives as Kicked, not a generic close\n");
+    }
+
+    // stats: bandwidth must DECAY when a peer goes quiet. The sliding window is pruned on record, so a
+    // connection that stops sending kept reporting its last observed throughput forever -- an app pacing
+    // itself off bandwidthUp would keep believing a link it is no longer using is saturated.
+    {
+        const aether::NetworkConfig cfg;
+        aether::Connection conn = aether::newConnection(cfg, 1, aether::MonoTime{ 0 });
+        aether::markConnected(conn, aether::MonoTime{ 0 });
+
+        aether::recordBytesSent(conn, 6000, aether::MonoTime{ 0 });
+        aether::recordBytesReceived(conn, 3000, aether::MonoTime{ 0 });
+        aether::updateTick(conn, aether::MonoTime{ 1000000 });                  // 1ms later: inside the window
+        assert(conn.stats.bandwidthUp > 0.0 && conn.stats.bandwidthDown > 0.0);
+
+        // Idle well past the 1s window. Sends nothing, so nothing prunes the window on record.
+        aether::updateTick(conn, aether::MonoTime{ 3000ull * 1000000 });
+        assert(conn.stats.bandwidthUp == 0.0 && conn.stats.bandwidthDown == 0.0);
+        std::printf("aether bandwidth-decay OK: an idle connection reports 0 B/s, not its last burst\n");
+    }
+
+    // The send path builds each datagram in ONE allocation, directly in its final layout. That is a
+    // performance change to a WIRE FORMAT, so the bytes must be identical to the composed form it replaced
+    // (serialize -> slice the header -> encrypt into a second buffer -> append -> copy again for the CRC):
+    // a faster build that shifts a single byte is a protocol break, not an optimization.
+    {
+        aether::EncryptionKey key{};
+        for (int i = 0; i < 32; ++i) key[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(i * 11 + 3);
+        constexpr std::uint32_t protocolId = 0xFEEDBEEFu;
+        const aether::PacketHeader header{ aether::PacketType::PayloadBatch, aether::SequenceNum{ 4242 },
+                                           aether::SequenceNum{ 4200 }, 0x0F0F0F0Fu };
+        const aether::NonceCounter counter{ 99 };
+        const aether::Bytes payload = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+
+        // cleartext: header || payload || crc
+        const aether::Bytes clearRef   = aether::appendCrc32(aether::serializePacket(aether::Packet{ header, payload }));
+        const aether::Bytes clearBuilt = aether::frameCleartextDatagram(header, payload);
+        assert(clearBuilt == clearRef);
+
+        // keyed: header || counter || ciphertext || tag || crc
+        const aether::Bytes serialized = aether::serializePacket(aether::Packet{ header, payload });
+        aether::Bytes combined(serialized.begin(), serialized.begin() + static_cast<std::ptrdiff_t>(aether::packetHeaderBytes));
+        const aether::Bytes enc = aether::encrypt(key, counter, protocolId,
+                                                  serialized.data(), aether::packetHeaderBytes,
+                                                  serialized.data() + aether::packetHeaderBytes,
+                                                  serialized.size() - aether::packetHeaderBytes);
+        combined.insert(combined.end(), enc.begin(), enc.end());
+        const aether::Bytes sealedRef   = aether::appendCrc32(combined);
+        const aether::Bytes sealedBuilt = aether::sealDatagram(key, counter, protocolId, header, payload);
+        assert(sealedBuilt == sealedRef);
+
+        // ...and it round-trips through the real receive path: CRC, header, then decrypt under the header
+        // as AAD, which is the check that the AAD really covers the bytes that were written.
+        const auto stripped = aether::validateAndStripCrc32(sealedBuilt);
+        assert(stripped);
+        aether::Reader rr{ stripped->data(), stripped->size(), 0 };
+        const auto gotHeader = aether::readHeader(rr);
+        assert(gotHeader && gotHeader->sequence == header.sequence && gotHeader->ack == header.ack
+               && gotHeader->ackBits == header.ackBits && gotHeader->type == header.type);
+        const auto opened = aether::decrypt(key, protocolId, stripped->data(), aether::packetHeaderBytes,
+                                            stripped->data() + aether::packetHeaderBytes,
+                                            stripped->size() - aether::packetHeaderBytes);
+        assert(opened && opened->plaintext == payload && opened->counter.value == counter.value);
+        std::printf("aether datagram-framing OK: one-allocation build is byte-identical to the composed form\n");
     }
 
     {   // zero-copy step 1: the alloc-free primitives must match their owning forms byte-for-byte

@@ -83,7 +83,41 @@ int main() {
         assert(std::fabs(hi - 1.0f) < eps);
     }
 
+    // A Ranged field whose span is not 2^n-1 has unrepresented bit patterns: Ranged<0,5> costs 3 bits,
+    // so raw 6 and 7 are decodable but out of contract. The decoder must clamp them like the encoder
+    // clamps on the way out -- the type promises a value in [Lo, Hi], and callers index and switch on
+    // that promise, so it has to hold for hostile bytes and not just for values this library wrote.
+    {
+        using R = aether::Ranged<std::uint8_t, 0, 5>;
+        static_assert(aether::bitsForMax(5) == 3, "Ranged<0,5> should cost 3 bits");
+        for (std::uint32_t raw = 0; raw < 8; ++raw) {
+            std::uint8_t buf[4]{};
+            aether::BitWriter w{ buf, sizeof buf };
+            aether::writeBits(w, raw, 3);            // stands in for a hostile or buggy encoder
+            const std::size_t n = aether::flushBits(w);
+            assert(w.ok);
+
+            aether::BitReader r{ buf, n };
+            R out{ 0 };
+            aether::readWire(r, out);
+            assert(r.ok);
+            assert(out.value <= 5);                                       // in contract for every input
+            assert(out.value == (raw <= 5 ? static_cast<std::uint8_t>(raw) : 5));   // exact below the cap, clamped above
+        }
+        // A negative-Lo range clamps to Hi the same way (the offset is unsigned, so this checks the
+        // clamp happens before the Lo shift, not after).
+        using S = aether::Ranged<int, -10, -8>;      // span 2 -> 2 bits, so raw 3 is out of range
+        std::uint8_t sbuf[4]{};
+        aether::BitWriter sw{ sbuf, sizeof sbuf };
+        aether::writeBits(sw, 3u, 2);
+        const std::size_t sn = aether::flushBits(sw);
+        aether::BitReader sr{ sbuf, sn };
+        S sout{ -10 };
+        aether::readWire(sr, sout);
+        assert(sr.ok && static_cast<int>(sout) == -8);
+    }
+
     std::printf("aether wire-edges OK: negative-Lo, full-int32 (32 bits), zero-bit Ranged, "
-                "Quantized<32> endpoints all round-trip\n");
+                "Quantized<32> endpoints round-trip; out-of-range Ranged wire values clamp into contract\n");
     return 0;
 }

@@ -1,147 +1,152 @@
-// aether - pure deterministic network for testing. A fully in-memory link with configurable
-// latency, loss, jitter, duplicates, and reordering, plus a multi-peer TestWorld. No real sockets,
-// fully reproducible. Data-first: plain structs + free functions, state mutated in place.
+// aether - deterministic in-memory network. Runs real NetPeers against each other with no sockets:
+// packets are carried by value, so loss, latency, jitter, duplication and reordering are exact and
+// reproducible from a seed. This is what the library's own tests drive, and the same thing an app can
+// use to test its netcode in CI without binding a port.
+//
+// The unit is a LINK between two peers. testLinkStep advances both a tick, moves each side's outgoing
+// datagrams through the impairment model (CRC-validated on arrival, exactly like the socket layer), and
+// hands back the events both sides raised. Data-first: plain structs + free functions.
 #pragma once
 
 #include "aether/peer.hpp"
 #include "aether/security.hpp"
-#include "aether/socket.hpp"
-#include "aether/types.hpp"
 #include "aether/util.hpp"
 
 #include <cstdint>
 #include <deque>
-#include <map>
-#include <optional>
 #include <utility>
 #include <vector>
 
 namespace aether {
 
-inline constexpr std::uint64_t testNsPerMs                  = 1000000;
-inline constexpr std::uint64_t testNetOutOfOrderMaxDelayNs  = 50000000;   // 50ms
-inline constexpr std::uint64_t testNetDuplicateJitterNs     = 10000000;   // 10ms
-
-struct TestNetConfig {
-    std::uint64_t latencyNs        = 0;
-    double        lossRate         = 0.0;
-    std::uint64_t jitterNs         = 0;
-    double        duplicateChance  = 0.0;
-    double        outOfOrderChance = 0.0;
+// Impairments applied per direction. All-zero (the default) is a perfect link.
+struct TestLinkConfig {
+    double        lossRate         = 0.0;   // fraction of datagrams dropped, [0,1]
+    std::uint64_t latencyNs        = 0;     // constant one-way delay
+    std::uint64_t jitterNs         = 0;     // uniform extra delay in [0, jitterNs]
+    double        duplicateChance  = 0.0;   // fraction of datagrams delivered twice
+    double        outOfOrderChance = 0.0;   // fraction given a large extra delay, so they land late
+    int           maxDatagramBytes = 0;     // path MTU: datagrams larger than this vanish, exactly like a real black hole (0 = unlimited)
 };
 
-struct InFlightPacket { Address from{}; Address to{}; Bytes data; MonoTime deliverAt{}; };
+inline constexpr std::uint64_t testOutOfOrderDelayNs  = 50000000;   // 50ms: enough to land behind later packets
+inline constexpr std::uint64_t testDuplicateJitterNs  = 10000000;   // 10ms spread between a packet and its duplicate
 
-struct TestNetState {
-    MonoTime                              currentTime{};
-    Address                               localAddr{};
-    std::deque<InFlightPacket>            inFlight;
-    std::deque<std::pair<Bytes, Address>> inbox;
-    TestNetConfig                         config;
-    std::uint64_t                         rng    = 42;   // deterministic seed
-    bool                                  closed = false;
+// One datagram in flight, addressed by the peer it is going TO.
+struct TestDatagram { PeerId to; Bytes data; MonoTime deliverAt{}; };
+
+// A bidirectional link between exactly two peers. `a` and `b` are borrowed, not owned -- the caller
+// keeps the NetPeers (and their configs, which the link never inspects).
+struct TestLink {
+    NetPeer*                 a = nullptr;
+    NetPeer*                 b = nullptr;
+    PeerId                   ida{};
+    PeerId                   idb{};
+    TestLinkConfig           aToB{};
+    TestLinkConfig           bToA{};
+    std::deque<TestDatagram> inFlight;
+    std::uint64_t            rng = 0x9E3779B97F4A7C15ull;   // fixed seed -> the same run every time
 };
 
-inline TestNetState initialTestNetState(const Address& localAddr) {
-    TestNetState s;
-    s.localAddr = localAddr;
-    return s;
+inline TestLink newTestLink(NetPeer& a, const PeerId& ida, NetPeer& b, const PeerId& idb) {
+    TestLink link;
+    link.a   = &a;
+    link.b   = &b;
+    link.ida = ida;
+    link.idb = idb;
+    return link;
+}
+// Apply the same impairments in both directions.
+inline void testLinkImpair(TestLink& link, const TestLinkConfig& both) { link.aToB = both; link.bToA = both; }
+
+inline std::uint64_t testLinkNext(TestLink& link) {
+    const auto r = nextRandom(link.rng);
+    link.rng = r.state;
+    return r.output;
 }
 
-// Send: schedule the packet in flight, applying loss / latency / jitter / reorder / duplicate.
-inline void testNetSend(TestNetState& st, const Address& to, const Bytes& bytes) {
-    if (st.closed) return;
-    const TestNetConfig& cfg = st.config;
-    const auto r1 = nextRandom(st.rng); st.rng = r1.state;
-    if (randomDouble(r1.output) < cfg.lossRate) return;                       // dropped
-    const auto r2 = nextRandom(st.rng); st.rng = r2.state;
-    const std::uint64_t jitterMod = cfg.jitterNs + 1;   // wraps to 0 only when jitterNs == UINT64_MAX
-    const std::uint64_t jitter = cfg.jitterNs == 0 ? 0 : (jitterMod == 0 ? r2.output : r2.output % jitterMod);
-    const auto r3 = nextRandom(st.rng); st.rng = r3.state;
-    std::uint64_t oooDelay = 0;
-    if (randomDouble(r3.output) < cfg.outOfOrderChance) {
-        const auto r3b = nextRandom(st.rng); st.rng = r3b.state;   // independent draw for the delay magnitude
-        oooDelay = r3b.output % (testNetOutOfOrderMaxDelayNs + 1);
+// Queue one datagram, applying the direction's impairments. Dropped packets simply never queue.
+inline void testLinkEmit(TestLink& link, const TestLinkConfig& cfg, const PeerId& to, Bytes data, MonoTime now) {
+    if (cfg.maxDatagramBytes > 0 && static_cast<int>(data.size()) > cfg.maxDatagramBytes) return;   // oversized: silently eaten, no ICMP
+    if (cfg.lossRate > 0.0 && randomDouble(testLinkNext(link)) < cfg.lossRate) return;
+
+    std::uint64_t delay = cfg.latencyNs;
+    if (cfg.jitterNs > 0) delay += testLinkNext(link) % (cfg.jitterNs + 1);
+    if (cfg.outOfOrderChance > 0.0 && randomDouble(testLinkNext(link)) < cfg.outOfOrderChance)
+        delay += testLinkNext(link) % (testOutOfOrderDelayNs + 1);
+
+    const MonoTime deliverAt{ now.ns + delay };
+    const bool     duplicate = cfg.duplicateChance > 0.0 && randomDouble(testLinkNext(link)) < cfg.duplicateChance;
+    if (duplicate) {
+        const MonoTime dupAt{ deliverAt.ns + testLinkNext(link) % (testDuplicateJitterNs + 1) };
+        link.inFlight.push_back(TestDatagram{ to, data, dupAt });   // copy: the original is moved below
     }
-    const MonoTime deliverAt{ st.currentTime.ns + cfg.latencyNs + jitter + oooDelay };
-    st.inFlight.push_back(InFlightPacket{ st.localAddr, to, bytes, deliverAt });
-    const auto r4 = nextRandom(st.rng); st.rng = r4.state;
-    if (randomDouble(r4.output) < cfg.duplicateChance) {
-        const auto r5 = nextRandom(st.rng); st.rng = r5.state;
-        const MonoTime dupAt{ deliverAt.ns + (r5.output % (testNetDuplicateJitterNs + 1)) };
-        st.inFlight.push_back(InFlightPacket{ st.localAddr, to, bytes, dupAt });
-    }
+    link.inFlight.push_back(TestDatagram{ to, std::move(data), deliverAt });
 }
 
-// Receive one delivered packet (CRC validated + stripped); nullopt if the inbox is empty.
-inline std::optional<std::pair<Bytes, Address>> testNetRecv(TestNetState& st) {
-    if (st.inbox.empty()) return std::nullopt;
-    auto front = std::move(st.inbox.front());
-    st.inbox.pop_front();
-    auto v = validateAndStripCrc32(front.first);
-    if (!v) return std::nullopt;                                              // drop corrupt
-    return std::pair<Bytes, Address>{ std::move(*v), front.second };
+// Everything due at or before `now`, in delivery order; the rest stays in flight. Two packets due in
+// the same tick keep their queue order, so reordering comes only from the delay model.
+inline std::vector<TestDatagram> testLinkDue(TestLink& link, MonoTime now) {
+    std::vector<TestDatagram> due;
+    std::deque<TestDatagram>  still;
+    for (TestDatagram& d : link.inFlight) {
+        if (d.deliverAt.ns <= now.ns) due.push_back(std::move(d));
+        else                          still.push_back(std::move(d));
+    }
+    link.inFlight = std::move(still);
+    return due;
 }
 
-// Advance time and move any in-flight packets addressed to us into the inbox.
-inline void advanceTime(TestNetState& st, MonoTime newTime) {
-    std::deque<InFlightPacket> still;
-    for (auto& p : st.inFlight) {
-        if (p.deliverAt.ns <= newTime.ns) {
-            if (addrEqual(p.to, st.localAddr)) st.inbox.push_back({ p.data, p.from });
-        } else {
-            still.push_back(std::move(p));
-        }
+// The events each side raised this tick. Kept separate because "which peer saw this" is exactly what a
+// test asserts on (a server's Connected is not a client's).
+struct TestLinkStep { std::vector<PeerEvent> aEvents; std::vector<PeerEvent> bEvents; };
+
+// Advance the link one tick: deliver what is due, process both peers, and queue what they sent. A
+// datagram whose CRC does not validate is dropped here, as the real IO layer would.
+inline TestLinkStep testLinkStep(TestLink& link, MonoTime now) {
+    std::vector<IncomingPacket> toA, toB;
+    for (TestDatagram& d : testLinkDue(link, now)) {
+        auto stripped = validateAndStripCrc32(d.data);
+        if (!stripped) continue;
+        if (d.to == link.ida) toA.push_back(IncomingPacket{ link.idb, std::move(*stripped) });
+        else                  toB.push_back(IncomingPacket{ link.ida, std::move(*stripped) });
     }
-    st.currentTime = newTime;
-    st.inFlight    = std::move(still);
+
+    PeerProcessResult ra = peerProcess(*link.a, now, toA);
+    PeerProcessResult rb = peerProcess(*link.b, now, toB);
+    for (RawPacket& p : ra.outgoing) testLinkEmit(link, link.aToB, link.idb, std::move(p.data), now);
+    for (RawPacket& p : rb.outgoing) testLinkEmit(link, link.bToA, link.ida, std::move(p.data), now);
+    return { std::move(ra.events), std::move(rb.events) };
 }
 
-inline void simulateLatency(TestNetState& st, std::uint64_t ms) { st.config.latencyNs = ms * testNsPerMs; }
-inline void simulateLoss(TestNetState& st, double rate) { st.config.lossRate = rate; }
-inline int  testPendingCount(const TestNetState& st) { return static_cast<int>(st.inFlight.size()); }
-
-// --- multi-peer world ---
-struct TestWorld {
-    std::map<PeerId, TestNetState> peers;
-    MonoTime                       globalTime{};
-};
-
-inline TestWorld newTestWorld() { return TestWorld{}; }
-
-// Get (creating if needed) the state for a peer at the given address.
-inline TestNetState& worldPeer(TestWorld& w, const Address& addr) {
-    const PeerId pid{ addr };
-    auto it = w.peers.find(pid);
-    if (it == w.peers.end()) {
-        TestNetState s = initialTestNetState(addr);
-        s.currentTime = w.globalTime;
-        it = w.peers.emplace(pid, std::move(s)).first;
+// Step the link until `stop(step)` returns true, or maxTicks have passed; returns the time reached.
+// The tick period is the caller's, so a test can run at whatever rate it wants to model.
+template <class Stop>
+inline MonoTime testLinkRun(TestLink& link, MonoTime from, std::uint64_t tickNs, int maxTicks, Stop&& stop) {
+    MonoTime now = from;
+    for (int k = 0; k < maxTicks; ++k) {
+        now = MonoTime{ now.ns + tickNs };
+        if (stop(testLinkStep(link, now))) break;
     }
-    return it->second;
+    return now;
 }
 
-// Deliver every ready packet to its destination's inbox; keep the rest with their senders.
-inline void deliverPackets(TestWorld& w) {
-    std::vector<InFlightPacket> all;
-    for (auto& [pid, ps] : w.peers) {
-        (void)pid;
-        for (auto& p : ps.inFlight) all.push_back(std::move(p));
-        ps.inFlight.clear();
-    }
-    for (auto& p : all) {
-        if (p.deliverAt.ns <= w.globalTime.ns) {
-            if (const auto it = w.peers.find(PeerId{ p.to }); it != w.peers.end()) it->second.inbox.push_back({ p.data, p.from });
-        } else {
-            if (const auto it = w.peers.find(PeerId{ p.from }); it != w.peers.end()) it->second.inFlight.push_back(std::move(p));
-        }
-    }
+// Did either side raise this kind of event this tick?
+inline bool testHasEvent(const std::vector<PeerEvent>& events, PeerEvent::Kind kind) {
+    for (const PeerEvent& e : events)
+        if (e.kind == kind) return true;
+    return false;
 }
 
-inline void worldAdvanceTime(TestWorld& w, MonoTime newTime) {
-    w.globalTime = newTime;
-    for (auto& [pid, ps] : w.peers) { (void)pid; ps.currentTime = newTime; }
-    deliverPackets(w);
+// Run a link until both peers report Connected (the handshake), or the tick budget runs out. Returns
+// the time reached; check peerIsConnected on both sides to confirm.
+inline MonoTime testLinkConnect(TestLink& link, MonoTime from, std::uint64_t tickNs, int maxTicks) {
+    bool aUp = false, bUp = false;
+    return testLinkRun(link, from, tickNs, maxTicks, [&](const TestLinkStep& s) {
+        aUp = aUp || testHasEvent(s.aEvents, PeerEvent::Connected);
+        bUp = bUp || testHasEvent(s.bEvents, PeerEvent::Connected);
+        return aUp && bUp;
+    });
 }
 
 } // namespace aether

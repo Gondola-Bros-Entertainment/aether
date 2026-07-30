@@ -105,6 +105,26 @@ int main() {
         const double dec = nsPer([&] { aether::Reader r{ buf, deltaBytes, 0 }; auto o = aether::deltaUnpack(r, prev); sink(o); });
         std::printf("%-12s %12.2f %12.2f %8zu\n", "delta 2/12", enc, dec, deltaBytes);
     }
+    // wide-struct delta at the reflection cap: past 16 fields the changemask goes ADAPTIVE, so one
+    // changed field costs a 2-byte sparse mask instead of a 4-byte bitmap (delta.hpp).
+    {
+        struct WideEntity {
+            float         p0{}, p1{}, p2{}, p3{}, p4{}, p5{}, p6{}, p7{};
+            std::int32_t  i0{}, i1{}, i2{}, i3{}, i4{}, i5{}, i6{}, i7{};
+            std::uint16_t s0{}, s1{}, s2{}, s3{}, s4{}, s5{}, s6{}, s7{};
+            std::uint8_t  b0{}, b1{}, b2{}, b3{}, b4{}, b5{}, b6{}, b7{};
+        };
+        static_assert(aether::fieldCount<WideEntity>() == 32);
+        WideEntity wprev{};
+        WideEntity wcurr = wprev;
+        wcurr.p3 = 1.5f;   // one of thirty-two fields moves
+        aether::Writer wm{ buf, sizeof buf, 0, true }; aether::deltaPack(wm, wprev, wcurr);
+        const std::size_t wideBytes = wm.pos;
+        const double enc = nsPer([&] { aether::Writer w{ buf, sizeof buf, 0, true }; aether::deltaPack(w, wprev, wcurr); sink(buf); });
+        aether::Writer w{ buf, sizeof buf, 0, true }; aether::deltaPack(w, wprev, wcurr);
+        const double dec = nsPer([&] { aether::Reader r{ buf, wideBytes, 0 }; auto o = aether::deltaUnpack(r, wprev); sink(o); });
+        std::printf("%-12s %12.2f %12.2f %8zu\n", "delta 1/32", enc, dec, wideBytes);
+    }
 
     return 0;
 }

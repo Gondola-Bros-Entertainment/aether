@@ -5,10 +5,12 @@
 #include "aether/types.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <map>
 #include <optional>
+#include <utility>
 #include <vector>
 
 namespace aether {
@@ -35,16 +37,34 @@ inline std::optional<FragmentHeader> readFragmentHeader(const std::uint8_t* p, s
 // --- splitting ---
 struct FragmentResult { std::vector<Bytes> fragments; bool tooMany{}; };
 
+// How many fragments a message of `len` bytes needs at `maxPayload` bytes each. 0 means it cannot be
+// fragmented at all: either there is nothing to send, or it would need more than maxFragmentCount pieces
+// (the fragment index is one byte by design). Computed and range-checked in size_t BEFORE any narrowing,
+// because a >2GiB len would otherwise overflow an int cast, wrap past the guard, and silently drop the
+// message. Exposed separately so a caller that wants only SOME fragments (a partial retransmit) can size
+// the set without building every piece first.
+inline std::size_t fragmentCountFor(std::size_t len, int maxPayload) noexcept {
+    if (len == 0 || maxPayload <= 0) return 0;
+    const std::size_t count = (len + static_cast<std::size_t>(maxPayload) - 1) / static_cast<std::size_t>(maxPayload);
+    return count > static_cast<std::size_t>(maxFragmentCount) ? 0 : count;
+}
+// The byte range fragment `index` covers. Half-open [start, end); end is clamped, so the last fragment is
+// short. The single source of the offset math, shared by whole-message and per-fragment builds.
+inline std::pair<std::size_t, std::size_t> fragmentRange(std::size_t len, int maxPayload, std::size_t index) noexcept {
+    const std::size_t start = index * static_cast<std::size_t>(maxPayload);
+    return { start, std::min(start + static_cast<std::size_t>(maxPayload), len) };
+}
+
 inline FragmentResult fragmentMessage(MessageId id, const std::uint8_t* data, std::size_t len, int maxPayload) {
     FragmentResult r;
-    if (len == 0 || maxPayload <= 0) return r;
-    // Compute and range-check in size_t BEFORE narrowing: a >2GiB len would otherwise overflow the
-    // int cast (e.g. wrap to 0) and slip past the maxFragmentCount guard, silently dropping the message.
-    const std::size_t count = (len + static_cast<std::size_t>(maxPayload) - 1) / static_cast<std::size_t>(maxPayload);
-    if (count > static_cast<std::size_t>(maxFragmentCount)) { r.tooMany = true; return r; }
+    const std::size_t count = fragmentCountFor(len, maxPayload);
+    if (count == 0) {
+        r.tooMany = len != 0 && maxPayload > 0;   // distinguish "too many to fragment" from "nothing to fragment"
+        return r;
+    }
+    r.fragments.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {           // count <= 255 here, so the uint8_t index/count casts below are exact
-        const std::size_t start = i * static_cast<std::size_t>(maxPayload);
-        const std::size_t end   = std::min(start + static_cast<std::size_t>(maxPayload), len);
+        const auto [start, end] = fragmentRange(len, maxPayload, i);
         Bytes frag(static_cast<std::size_t>(fragmentHeaderSize) + (end - start));
         writeFragmentHeader(frag.data(), FragmentHeader{ id, static_cast<std::uint8_t>(i), static_cast<std::uint8_t>(count) });
         std::memcpy(frag.data() + fragmentHeaderSize, data + start, end - start);
@@ -57,7 +77,7 @@ inline FragmentResult fragmentMessage(MessageId id, const std::uint8_t* data, st
 struct FragmentBuffer {
     std::map<std::uint8_t, Bytes> fragments;
     std::uint8_t count{};
-    MonoTime     createdAt{};
+    MonoTime     lastFragmentAt{};   // when the last NEW fragment landed -- expiry is idle-based (see cleanupFragments)
     std::size_t  totalSize{};   // size_t so the running total cannot overflow at a large cap
 };
 struct FragmentAssembler {
@@ -71,9 +91,15 @@ inline FragmentAssembler newFragmentAssembler(double timeoutMs, int maxSize, int
     return { {}, timeoutMs, maxSize, maxBuffers, 0 };
 }
 
+// Expire assemblies that have stopped making progress. IDLE-based (time since the last new fragment),
+// not total-age: the sender paces a large message's fragments across ticks at its budget's rate, so a
+// legitimate assembly can take longer than the timeout while still advancing, and a total-age expiry
+// would drop it mid-assembly. One that has gone a full timeout with nothing new is abandoned (its
+// sender gave up, died, or burned its retries) and is dropped. Memory stays bounded either way:
+// maxBufferSize and maxBuffers cap it regardless of how slowly an assembly advances.
 inline void cleanupFragments(FragmentAssembler& a, MonoTime now) {
     for (auto it = a.buffers.begin(); it != a.buffers.end(); ) {
-        if (elapsedMs(it->second.createdAt, now) >= a.timeoutMs) {
+        if (elapsedMs(it->second.lastFragmentAt, now) >= a.timeoutMs) {
             a.currentSize -= it->second.totalSize;
             it = a.buffers.erase(it);
         } else {
@@ -81,10 +107,11 @@ inline void cleanupFragments(FragmentAssembler& a, MonoTime now) {
         }
     }
 }
+// Evict the least-recently-advancing assembly (the one most likely abandoned) to make room.
 inline bool expireOldestFragment(FragmentAssembler& a) {
     auto oldest = a.buffers.end();
     for (auto it = a.buffers.begin(); it != a.buffers.end(); ++it)
-        if (oldest == a.buffers.end() || it->second.createdAt.ns < oldest->second.createdAt.ns) oldest = it;
+        if (oldest == a.buffers.end() || it->second.lastFragmentAt.ns < oldest->second.lastFragmentAt.ns) oldest = it;
     if (oldest == a.buffers.end()) return false;
     a.currentSize -= oldest->second.totalSize;
     a.buffers.erase(oldest);
@@ -99,6 +126,10 @@ inline std::optional<Bytes> processFragment(FragmentAssembler& a, const std::uin
     if (hdr->count == 0) return std::nullopt;   // a 0-fragment message can never complete -- never buffer it
     const std::uint8_t* fragData = data + fragmentHeaderSize;
     const std::size_t   fragSize = len - static_cast<std::size_t>(fragmentHeaderSize);   // len >= fragmentHeaderSize (readFragmentHeader checked)
+    // A fragment with no data is malformed: a real split always puts at least one byte in every piece. It
+    // would otherwise occupy a slot and count toward completion, letting a peer assemble a message out of
+    // nothing.
+    if (fragSize == 0) return std::nullopt;
     const MessageId     msgId    = hdr->messageId;
 
     auto it = a.buffers.find(msgId);
@@ -113,15 +144,16 @@ inline std::optional<Bytes> processFragment(FragmentAssembler& a, const std::uin
         if (a.maxBuffers > 0 && static_cast<int>(a.buffers.size()) >= a.maxBuffers) expireOldestFragment(a);   // bound concurrent messages
         FragmentBuffer nb;
         nb.count = hdr->count;
-        nb.createdAt = now;
+        nb.lastFragmentAt = now;
         it = a.buffers.emplace(msgId, std::move(nb)).first;
     }
     FragmentBuffer& buf = it->second;
 
     if (hdr->index < buf.count && buf.fragments.find(hdr->index) == buf.fragments.end()) {
         buf.fragments.emplace(hdr->index, Bytes(fragData, fragData + fragSize));
-        buf.totalSize  += fragSize;
-        a.currentSize  += fragSize;
+        buf.totalSize      += fragSize;
+        a.currentSize      += fragSize;
+        buf.lastFragmentAt  = now;   // progress: the idle-expiry clock restarts
     }
 
     if (buf.count > 0 && buf.fragments.size() == static_cast<std::size_t>(buf.count)) {

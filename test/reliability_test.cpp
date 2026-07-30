@@ -1,5 +1,5 @@
 // Loss-window unit test: pins lossCount() + the sliding 256-bit LossWindow
-// (recordLossSample / packetLossPercent). assert() is the check, so build WITHOUT
+// (recordLossSample / packetLossFraction). assert() is the check, so build WITHOUT
 // NDEBUG. Data-first: plain structs + free functions, no framework.
 #include "aether/reliability.hpp"
 
@@ -44,8 +44,40 @@ int main() {
         assert(lossCount(w, 10)  == 5);     // 1,3,5,7,9 lost in [0,10)
     }
 
+    // The FIRST packet an endpoint ever sees acknowledges nothing behind it. A default remoteSeq of 0
+    // is not a sequence we received, so seeding the ack bitfield from it shifted in a set bit meaning
+    // "sequence 0 received" -- if packet 0 was the one lost, the sender saw it acked, marked its
+    // reliable messages delivered and never retransmitted them. Silent data loss on the first packet.
+    {
+        ReliableEndpoint rx{};
+        const SequenceNum arrived[] = { SequenceNum{ 1 }, SequenceNum{ 2 } };   // packet 0 was lost
+        onPacketsReceived(rx, arrived, 2);
+        const auto [ackSeq, ackBits] = getAckInfo(rx);
+        assert(ackSeq == SequenceNum{ 2 });
+        assert((ackBits & 0x1u) != 0);      // bit 0 == seq 1: genuinely received
+        assert((ackBits & 0x2u) == 0);      // bit 1 == seq 0: never received, must NOT be acked
+
+        // ...and the sender agrees: seq 0 stays in flight and is retransmittable.
+        ReliableEndpoint tx{};
+        const ChannelId ch{ 0 };
+        for (std::uint16_t s = 0; s < 3; ++s)
+            onPacketSent(tx, SequenceNum{ s }, MonoTime{ 0 }, ch, SequenceNum{ s }, 100);
+        const AckResult res = processAcks(tx, ackSeq, ackBits, MonoTime{ 10ull * 1000000 });
+        assert(res.acked.size() == 2);                       // seqs 1 and 2 only
+        assert(isInFlight(tx, SequenceNum{ 0 }));            // seq 0 is still owed
+    }
+
+    // A first packet that IS seq 0 still acks correctly (the common case: markConnected zeroes localSeq).
+    {
+        ReliableEndpoint rx{};
+        const SequenceNum arrived[] = { SequenceNum{ 0 }, SequenceNum{ 1 } };
+        onPacketsReceived(rx, arrived, 2);
+        const auto [ackSeq, ackBits] = getAckInfo(rx);
+        assert(ackSeq == SequenceNum{ 1 } && (ackBits & 0x1u) != 0);   // bit 0 == seq 0, received
+    }
+
     // sliding window via recordLossSample: count caps at the window size, index wraps
-    // modulo it, and packetLossPercent = lostInWindow / countInWindow.
+    // modulo it, and packetLossFraction = lostInWindow / countInWindow.
 
     // all-received -> 0% loss
     {
@@ -53,7 +85,7 @@ int main() {
         for (int i = 0; i < 100; ++i) recordLossSample(ep, false);
         assert(ep.lossWindowCount == 100 && ep.lossWindowIndex == 100);
         assert(lossCount(ep.lossWindow, ep.lossWindowCount) == 0);
-        assert(packetLossPercent(ep) == 0.0);
+        assert(packetLossFraction(ep) == 0.0);
     }
 
     // a known partial-loss ratio: every 4th packet lost over a sub-full window -> 25%
@@ -69,7 +101,7 @@ int main() {
         assert(ep.lossWindowCount == n);   // still under the 256 cap, no aging yet
         assert(lossCount(ep.lossWindow, ep.lossWindowCount) == expectLost);
         assert(expectLost == 50);
-        const double pct = packetLossPercent(ep);
+        const double pct = packetLossFraction(ep);
         assert(pct > 0.249 && pct < 0.251);   // 50/200 == 0.25
     }
 
@@ -81,22 +113,74 @@ int main() {
         for (int i = 0; i < lossWindowSize; ++i) recordLossSample(ep, true);    // window full, all lost
         assert(ep.lossWindowCount == lossWindowSize);
         assert(lossCount(ep.lossWindow, ep.lossWindowCount) == lossWindowSize); // 256 lost
-        assert(packetLossPercent(ep) == 1.0);                                   // 100%
+        assert(packetLossFraction(ep) == 1.0);                                   // 100%
 
         for (int i = 0; i < lossWindowSize; ++i) recordLossSample(ep, false);   // overwrite all 256 slots
         assert(ep.lossWindowCount == lossWindowSize);                           // count stays capped at 256
         assert(ep.lossWindowIndex == 2 * lossWindowSize);                       // index keeps climbing
         assert(lossCount(ep.lossWindow, ep.lossWindowCount) == 0);              // old losses aged out
-        assert(packetLossPercent(ep) == 0.0);
+        assert(packetLossFraction(ep) == 0.0);
 
         // one more wrapped write lands at slot (512 % 256 == 0): mark it lost -> exactly 1 in 256
         recordLossSample(ep, true);
         assert(ep.lossWindowCount == lossWindowSize);
         assert(lossCount(ep.lossWindow, ep.lossWindowCount) == 1);
-        const double pct = packetLossPercent(ep);
+        const double pct = packetLossFraction(ep);
         assert(pct > 0.0039 && pct < 0.0040);   // 1/256 ~= 0.00390625
     }
 
-    std::printf("aether loss-window OK: lossCount take==64 mask, overflow aging, 0%%/25%%/100%% ratios exact\n");
+    // The sent ring returns every unresolved packet's bytes EXACTLY ONCE. Two paths remove a record
+    // without an ack, and each had a byte-accounting bug the e2e soak was too small to reach:
+    //
+    //  - EVICTION of a packet already declared lost double-released: the declare (lostBytes) and the
+    //    eviction both reported its size, deflating bytesInFlight below truth.
+    //  - DISPLACEMENT leaked: a live record whose slot is reused a full ring cycle later (count still
+    //    under maxInFlight, so the eviction path never ran) was overwritten reporting nothing, so its
+    //    charged bytes stayed "in flight" forever.
+    {
+        // Declare seq 0 lost via triple-NACK, then evict it: the eviction must report 0 bytes.
+        ReliableEndpoint ep{};
+        ep.maxInFlight = 4;
+        const ChannelId ch{ 0 };
+        for (std::uint16_t s = 0; s < 4; ++s)
+            onPacketSent(ep, SequenceNum{ s }, MonoTime{ s }, ch, SequenceNum{ s }, 100);
+        const AckResult nack1 = processAcks(ep, SequenceNum{ 1 }, 0b0,  MonoTime{ 10 });
+        const AckResult nack2 = processAcks(ep, SequenceNum{ 2 }, 0b1,  MonoTime{ 11 });
+        const AckResult nack3 = processAcks(ep, SequenceNum{ 3 }, 0b11, MonoTime{ 12 });
+        assert(nack1.lostBytes == 0 && nack2.lostBytes == 0);
+        assert(nack3.lostBytes == 100);   // the third NACK declares it: released HERE, exactly once
+        for (std::uint16_t s = 4; s < 7; ++s)
+            onPacketSent(ep, SequenceNum{ s }, MonoTime{ 100u + s }, ch, SequenceNum{ s }, 100);
+        assert(onPacketSent(ep, SequenceNum{ 7 }, MonoTime{ 200 }, ch, SequenceNum{ 7 }, 100) == 0);   // not again
+        assert(ep.packetsEvicted == 1);
+
+        // ...but evicting a LIVE (never-declared) victim does report its bytes.
+        ReliableEndpoint ep2{};
+        ep2.maxInFlight = 2;
+        onPacketSent(ep2, SequenceNum{ 0 }, MonoTime{ 0 }, ch, SequenceNum{ 0 }, 300);
+        onPacketSent(ep2, SequenceNum{ 1 }, MonoTime{ 1 }, ch, SequenceNum{ 1 }, 100);
+        assert(onPacketSent(ep2, SequenceNum{ 2 }, MonoTime{ 2 }, ch, SequenceNum{ 2 }, 100) == 300);
+    }
+    {
+        // Displacement: seq 0 stays live and unresolved while 1..255 are sent and acked (in windows
+        // that never cover seq 0), so the ring is nearly empty when seq 256 lands on slot 0.
+        ReliableEndpoint ep{};   // default maxInFlight 256 == ring size: count never forces an eviction
+        const ChannelId ch{ 0 };
+        onPacketSent(ep, SequenceNum{ 0 }, MonoTime{ 0 }, ch, SequenceNum{ 0 }, 777);
+        for (std::uint16_t s = 1; s <= 255; ++s)
+            onPacketSent(ep, SequenceNum{ s }, MonoTime{ s }, ch, SequenceNum{ s }, 100);
+        const std::uint16_t ackPoints[] = { 33, 65, 97, 129, 161, 193, 225, 255 };
+        for (const std::uint16_t a : ackPoints)
+            processAcks(ep, SequenceNum{ a }, 0xFFFFFFFFull, MonoTime{ 500 });
+        assert(packetsInFlight(ep) == 1);   // only seq 0 left, live
+
+        assert(onPacketSent(ep, SequenceNum{ 256 }, MonoTime{ 1000 }, ch, SequenceNum{ 256 }, 100) == 777);
+        assert(ep.packetsEvicted == 1);     // the displacement is an eviction and is counted as one
+        assert(packetsInFlight(ep) == 1);   // the overwrite swapped records; the count did not drift
+        assert(!isInFlight(ep, SequenceNum{ 0 }) && isInFlight(ep, SequenceNum{ 256 }));
+    }
+
+    std::printf("aether loss-window OK: lossCount take==64 mask, overflow aging, 0%%/25%%/100%% ratios exact; "
+                "ring returns unresolved bytes exactly once (lost-then-evicted 0, displaced live counted)\n");
     return 0;
 }

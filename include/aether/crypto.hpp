@@ -214,8 +214,15 @@ inline void poly1305Finish(Poly1305State& st, std::uint8_t tag[16]) noexcept {
     c = h[4] >> 26; h[4] &= 0x3ffffff; h[0] += c * 5;
     c = h[0] >> 26; h[0] &= 0x3ffffff; h[1] += c;
 
-    const bool ge = h[4] == 0x3ffffff && h[3] == 0x3ffffff && h[2] == 0x3ffffff && h[1] == 0x3ffffff && h[0] >= 0x3fffffb;
-    if (ge) { std::uint64_t cc = 5; for (int m = 0; m < 5; ++m) { h[m] += cc; cc = h[m] >> 26; h[m] &= 0x3ffffff; } }
+    // Reduce mod p BRANCHLESSLY. Every limb is 26 bits after the carry chain above, so h < 2^130, and
+    // g = h + 5 carries out of the top limb exactly when h >= 2^130 - 5 == p -- in which case g is
+    // already h - p. Select between them with a mask rather than an if: a data-dependent branch on the
+    // accumulator would leak, through timing, information about a value derived from the one-time key.
+    std::uint64_t g[5];
+    std::uint64_t gc = 5;
+    for (int m = 0; m < 5; ++m) { g[m] = h[m] + gc; gc = g[m] >> 26; g[m] &= 0x3ffffff; }
+    const std::uint64_t takeG = 0ull - gc;   // gc is 0 or 1: all-ones selects g (h was >= p), 0 keeps h
+    for (int m = 0; m < 5; ++m) h[m] = (h[m] & ~takeG) | (g[m] & takeG);
 
     // Reassemble the five 26-bit limbs into the low 128 bits as two uint64 halves, add the
     // 128-bit s key with a manual carry, then serialize little-endian. Portable, no __int128.

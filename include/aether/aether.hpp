@@ -32,6 +32,7 @@
 #include "aether/random.hpp"
 #include "aether/config.hpp"
 #include "aether/congestion.hpp"
+#include "aether/mtu.hpp"
 #include "aether/connection.hpp"
 
 // peer + security
@@ -49,6 +50,5 @@
 // IO + testing
 #include "aether/net.hpp"
 #include "aether/rendezvous.hpp"
-#include "aether/simulator.hpp"
 #include "aether/testnet.hpp"
 // IWYU pragma: end_exports

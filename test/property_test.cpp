@@ -12,6 +12,13 @@ namespace {
 
 struct Probe    { std::int32_t a; float b; std::uint64_t c; bool d; std::int16_t e; std::uint8_t f; };
 struct IntProbe { std::int32_t a; std::uint64_t b; std::int16_t c; std::uint8_t d; bool e; };
+// 20 fields: wide enough for the ADAPTIVE changemask (sparse indices / bitmap mode byte), which the
+// narrow probes above never reach.
+struct WideProbe {
+    std::uint8_t f00, f01, f02, f03, f04, f05, f06, f07, f08, f09;
+    std::uint8_t f10, f11, f12, f13, f14, f15, f16, f17, f18, f19;
+};
+static_assert(aether::fieldCount<WideProbe>() >= aether::deltaSparseFieldMin);
 
 bool floatBitsEqual(float x, float y) {
     std::uint32_t bx = 0, by = 0;
@@ -65,6 +72,25 @@ int main() {
         assert(back && intProbeEqual(*back, q));
     }
 
-    std::printf("aether property OK: 100k serialize roundtrips (floats bit-exact) + 100k delta roundtrips\n");
+    // Adaptive changemask: random change COUNTS sweep both encodings (sparse for few changes, the
+    // bitmap for many) and the boundary between them; every delta must reconstruct exactly.
+    for (int i = 0; i < 100000; ++i) {
+        WideProbe p{};
+        std::uint8_t* pb = reinterpret_cast<std::uint8_t*>(&p);
+        for (std::size_t k = 0; k < sizeof(WideProbe); ++k) pb[k] = static_cast<std::uint8_t>(nextU64(s));
+        WideProbe q = p;
+        std::uint8_t* qb = reinterpret_cast<std::uint8_t*>(&q);
+        const int changes = static_cast<int>(nextU64(s) % 21);   // 0..20 fields mutated
+        for (int k = 0; k < changes; ++k) qb[nextU64(s) % sizeof(WideProbe)] ^= static_cast<std::uint8_t>(nextU64(s) | 1);
+
+        aether::Writer dw{ buf, sizeof buf, 0, true };
+        aether::deltaPack(dw, p, q);
+        aether::Reader dr{ buf, dw.pos, 0 };
+        const auto back = aether::deltaUnpack(dr, p);
+        assert(back && std::memcmp(&*back, &q, sizeof(WideProbe)) == 0);
+    }
+
+    std::printf("aether property OK: 100k serialize roundtrips (floats bit-exact) + 100k delta roundtrips "
+                "+ 100k wide-struct adaptive-mask roundtrips\n");
     return 0;
 }

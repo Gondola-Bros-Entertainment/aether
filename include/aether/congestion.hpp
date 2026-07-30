@@ -9,13 +9,12 @@
 #include "aether/types.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <limits>
 #include <optional>
-#include <span>
-#include <utility>
 #include <vector>
 
 namespace aether {
@@ -31,7 +30,7 @@ inline constexpr double        minRecoverySecs           = 1.0;
 inline constexpr double        maxRecoverySecs           = 60.0;
 inline constexpr double        recoveryHalveIntervalSecs = 10.0;
 inline constexpr double        quickDropThresholdSecs    = 10.0;
-inline constexpr double        sendRateIncrease          = 1.0;   // additive increase, packets/sec
+inline constexpr double        sendRateIncreasePerSec    = 10.0;  // additive increase, packets/sec per second of good conditions
 inline constexpr double        maxSendRateMultiplier     = 4.0;
 inline constexpr double        initialSsthresh           = std::numeric_limits<double>::infinity();
 
@@ -39,41 +38,64 @@ enum class CongestionMode  { Good, Bad };
 enum class CongestionPhase { SlowStart, Avoidance, Recovery };
 
 // --- binary congestion controller (Good/Bad mode with AIMD) ---
+// The byte allowance is a TOKEN BUCKET earned from elapsed time, not a per-tick grant: sendRate is
+// packets per SECOND, so handing out a full second's worth every tick would let a 60Hz loop send 60x
+// the configured rate (and leave the rate arm of the controller effectively inert). Capacity is one
+// second's worth, so an idle gap banks at most a one-second burst instead of unlimited credit.
 struct CongestionController {
     CongestionMode          mode                 = CongestionMode::Good;
     std::optional<MonoTime> goodConditionsStart;
     double                  lossThreshold        = 0.0;
     double                  rttThresholdMs       = 0.0;
     double                  baseSendRate         = 0.0;
+    double                  maxSendRate          = 0.0;   // hard packets/sec ceiling (config maxPacketRate)
     double                  currentSendRate      = 0.0;
-    int                     budgetBytesRemaining = 0;
-    int                     bytesPerTick         = 0;
+    double                  budgetBytes          = 0.0;   // tokens available, bytes
+    double                  burstBytes           = 0.0;   // bucket capacity == one second at the current rate
+    std::optional<MonoTime> lastRefill;
+    std::optional<MonoTime> lastUpdate;          // drives the additive increase off elapsed time, not tick count
     double                  adaptiveRecoverySecs = 0.0;
     std::optional<MonoTime> lastGoodEntry;
     std::optional<MonoTime> lastBadEntry;
 };
 
-inline CongestionController newCongestionController(double baseSendRate, double lossThreshold,
+// The ceiling the additive increase may ramp to: maxSendRateMultiplier above base, held under the
+// configured packet-rate cap (validateConfig already requires maxPacketRate >= sendRate). Taking the
+// min in both directions means a nonsensical cap can only ever slow the sender down, never speed it up.
+inline double ccMaxSendRate(const CongestionController& cc) noexcept {
+    return std::min(cc.baseSendRate * maxSendRateMultiplier, cc.maxSendRate);
+}
+
+inline CongestionController newCongestionController(double baseSendRate, double maxSendRate, double lossThreshold,
                                                    double rttThresholdMs, double recoveryTimeMs) {
     CongestionController cc;
     cc.lossThreshold        = lossThreshold;
     cc.rttThresholdMs       = rttThresholdMs;
     cc.baseSendRate         = baseSendRate;
+    cc.maxSendRate          = maxSendRate;
     cc.currentSendRate      = baseSendRate;
     cc.adaptiveRecoverySecs = recoveryTimeMs / 1000.0;
     return cc;
 }
 
-// Refill the per-tick byte budget = floor(rate * mtu).
-inline void ccRefillBudget(CongestionController& cc, int mtu) {
-    cc.bytesPerTick         = static_cast<int>(cc.currentSendRate * static_cast<double>(mtu));
-    cc.budgetBytesRemaining = cc.bytesPerTick;
+// Earn tokens for the time since the last refill at currentSendRate packets/sec of mtu bytes each.
+// The first call has no elapsed time to earn against, so it seeds a full bucket and starts the clock.
+inline void ccRefillBudget(CongestionController& cc, int mtu, MonoTime now) {
+    cc.burstBytes = cc.currentSendRate * static_cast<double>(mtu);
+    if (!cc.lastRefill) { cc.budgetBytes = cc.burstBytes; cc.lastRefill = now; return; }
+    const double earned = elapsedMs(*cc.lastRefill, now) / 1000.0 * cc.burstBytes;
+    cc.budgetBytes = std::min(cc.budgetBytes + earned, cc.burstBytes);
+    cc.lastRefill  = now;
 }
-inline void ccDeductBudget(CongestionController& cc, int bytes) { cc.budgetBytesRemaining -= bytes; }
+inline void ccDeductBudget(CongestionController& cc, int bytes) { cc.budgetBytes -= static_cast<double>(bytes); }
 
-// Update Good/Bad state from current loss and RTT.
+// Update Good/Bad state from current loss and RTT. Call it once per tick; the additive increase is
+// per SECOND of good conditions, so the ramp is identical at 20Hz and 144Hz (a per-call increment
+// would make the send rate a function of the caller's frame rate).
 inline void ccUpdate(CongestionController& cc, double packetLoss, double rttMs, MonoTime now) {
-    const bool isBad = packetLoss > cc.lossThreshold || rttMs > cc.rttThresholdMs;
+    const bool   isBad      = packetLoss > cc.lossThreshold || rttMs > cc.rttThresholdMs;
+    const double elapsedSec = cc.lastUpdate ? elapsedMs(*cc.lastUpdate, now) / 1000.0 : 0.0;
+    cc.lastUpdate = now;
     if (cc.mode == CongestionMode::Good) {
         if (isBad) {
             const double recoveryMult = (cc.lastGoodEntry && elapsedMs(*cc.lastGoodEntry, now) < quickDropThresholdSecs * 1000.0) ? 2.0 : 1.0;
@@ -83,8 +105,7 @@ inline void ccUpdate(CongestionController& cc, double packetLoss, double rttMs, 
             cc.goodConditionsStart  = std::nullopt;
             cc.adaptiveRecoverySecs = std::min(maxRecoverySecs, cc.adaptiveRecoverySecs * recoveryMult);
         } else {
-            const double maxRate = cc.baseSendRate * maxSendRateMultiplier;
-            cc.currentSendRate   = std::min(maxRate, cc.currentSendRate + sendRateIncrease);
+            cc.currentSendRate = std::min(ccMaxSendRate(cc), cc.currentSendRate + sendRateIncreasePerSec * elapsedSec);
             if (cc.lastGoodEntry) {
                 const double elapsed   = elapsedMs(*cc.lastGoodEntry, now) / 1000.0;
                 const int    intervals = static_cast<int>(elapsed / recoveryHalveIntervalSecs);
@@ -110,13 +131,13 @@ inline void ccUpdate(CongestionController& cc, double packetLoss, double rttMs, 
     }
 }
 
-inline bool ccCanSend(const CongestionController& cc, int packetsSentThisCycle, int packetBytes) {
-    return static_cast<double>(packetsSentThisCycle) < cc.currentSendRate && cc.budgetBytesRemaining >= packetBytes;
+inline bool ccCanSend(const CongestionController& cc, int packetBytes) {
+    return cc.budgetBytes >= static_cast<double>(packetBytes);
 }
 
 inline CongestionLevel ccCongestionLevel(const CongestionController& cc) {
     if (cc.mode == CongestionMode::Bad) return CongestionLevel::Critical;
-    const double budgetRatio = cc.bytesPerTick <= 0 ? 1.0 : static_cast<double>(cc.budgetBytesRemaining) / static_cast<double>(cc.bytesPerTick);
+    const double budgetRatio = cc.burstBytes <= 0.0 ? 1.0 : cc.budgetBytes / cc.burstBytes;
     return budgetRatio < 0.25 ? CongestionLevel::Elevated : CongestionLevel::None;
 }
 
@@ -138,8 +159,16 @@ inline CongestionWindow newCongestionWindow(int mtu) {
     return cw;
 }
 
-inline void cwOnAck(CongestionWindow& cw, int bytes) {
+// Return bytes to the window. Split out from cwOnAck because bytes leave flight for three distinct
+// reasons -- acked, DECLARED LOST, or evicted from the sent ring unresolved -- but only an ack may
+// grow the window. Without this the loss and eviction paths never gave their bytes back and the
+// window filled permanently. Saturates at 0, so a double release can never wrap it.
+inline void cwReleaseInFlight(CongestionWindow& cw, int bytes) noexcept {
     cw.bytesInFlight -= std::min<std::uint64_t>(static_cast<std::uint64_t>(bytes), cw.bytesInFlight);
+}
+
+inline void cwOnAck(CongestionWindow& cw, int bytes) {
+    cwReleaseInFlight(cw, bytes);
     switch (cw.phase) {
         case CongestionPhase::SlowStart:
             cw.cwnd += static_cast<double>(bytes);
@@ -162,6 +191,12 @@ inline void cwOnLoss(CongestionWindow& cw) {
     // RFC 5681 fast recovery: halve ssthresh, then inflate the window by the 3 segments the
     // duplicate acks proved had left the network, so the sender keeps emitting during recovery
     // (cwOnAck deflates back to ssthresh on the first ack of new data).
+    //
+    // ONE reduction per loss episode. A burst drop trips several packets' triple-NACK thresholds within
+    // the same window, and halving on each would cut the window to a fraction of the single reduction
+    // congestion actually calls for. Further losses while already recovering are part of the episode we
+    // have already responded to (NewReno); the exit is cwOnAck's first ack of new data.
+    if (cw.phase == CongestionPhase::Recovery) return;
     cw.ssthresh = std::max(static_cast<double>(minCwndBytes), cw.cwnd / 2.0);
     cw.cwnd     = cw.ssthresh + 3.0 * static_cast<double>(cw.mtu);
     cw.phase    = CongestionPhase::Recovery;
@@ -197,6 +232,11 @@ inline void cwSlowStartRestart(CongestionWindow& cw, double rtoMs, MonoTime now)
         cw.phase    = CongestionPhase::SlowStart;
         cw.cwnd     = static_cast<double>(initialCwndPackets * cw.mtu);
         cw.ssthresh = prevCwnd;
+        // Nothing sent for 2 RTOs means nothing of ours is still in the network: every outstanding
+        // packet was delivered or dropped long ago. Ghost bytes -- a packet lost right before the idle,
+        // never NACKed because no later traffic arrived to reveal it -- would otherwise wedge the fresh
+        // window shut until that packet's ring slot happens to be reused.
+        cw.bytesInFlight = 0;
     }
 }
 
@@ -208,34 +248,60 @@ inline CongestionLevel cwCongestionLevel(const CongestionWindow& cw) {
     return CongestionLevel::None;
 }
 
-// --- bandwidth tracker (sliding window with cached byte total) ---
+// --- bandwidth tracker (fixed sliding window of time buckets) ---
+// Throughput over the last windowDurationMs. The window is a RING OF TIME BUCKETS, not a list of
+// per-packet samples: recording is O(1) with zero heap traffic (a per-packet container node would be an
+// allocation on every datagram, on the hot path), and the footprint per connection is a fixed 1KB
+// regardless of packet rate. Resolution is windowDurationMs / bandwidthBucketCount -- about 16ms at the
+// default 1s window, finer than a frame at 60Hz.
+//
+// A bucket slot holds the absolute bucket number it was written for, so a slot the ring has cycled past
+// is recognized as stale rather than counted. That is what makes the rate DECAY on its own: the reader
+// only sums buckets inside the window ending at `now`, so a connection that stops sending reports its
+// throughput falling to zero without anything having to sweep it. (The previous design pruned on record,
+// which meant an idle connection reported its last burst forever, since nothing was being recorded.)
+inline constexpr int bandwidthBucketCount = 64;
+
 struct BandwidthTracker {
-    std::deque<std::pair<MonoTime, int>> window;
-    double                               windowDurationMs = 0.0;
-    int                                  totalBytes       = 0;
+    std::array<std::uint64_t, bandwidthBucketCount> bucketId{};      // absolute bucket number in each slot
+    std::array<std::uint64_t, bandwidthBucketCount> bucketBytes{};   // bytes recorded into that bucket
+    double windowDurationMs = 0.0;
+    double bucketMs         = 0.0;
 };
 
 inline BandwidthTracker newBandwidthTracker(double windowDurationMs) {
     BandwidthTracker bt;
     bt.windowDurationMs = windowDurationMs;
+    bt.bucketMs         = windowDurationMs / static_cast<double>(bandwidthBucketCount);
     return bt;
 }
 
-inline void btCleanup(BandwidthTracker& bt, MonoTime now) {
-    while (!bt.window.empty() && elapsedMs(bt.window.front().first, now) >= bt.windowDurationMs) {
-        bt.totalBytes -= bt.window.front().second;
-        bt.window.pop_front();
-    }
+// The absolute bucket a timestamp falls in. Monotonic in `now`, and exact well past any realistic
+// uptime (a double holds every integer to 2^53, which at a 16ms bucket is ~4 million years).
+inline std::uint64_t btBucketOf(const BandwidthTracker& bt, MonoTime now) noexcept {
+    if (bt.bucketMs <= 0.0) return 0;
+    return static_cast<std::uint64_t>(static_cast<double>(now.ns) / 1.0e6 / bt.bucketMs);
 }
-inline void btRecord(BandwidthTracker& bt, int bytes, MonoTime now) {
-    bt.window.emplace_back(now, bytes);
-    bt.totalBytes += bytes;
-    btCleanup(bt, now);
+
+inline void btRecord(BandwidthTracker& bt, int bytes, MonoTime now) noexcept {
+    const std::uint64_t id   = btBucketOf(bt, now);
+    const std::size_t   slot = static_cast<std::size_t>(id % bandwidthBucketCount);
+    if (bt.bucketId[slot] != id) { bt.bucketId[slot] = id; bt.bucketBytes[slot] = 0; }   // ring cycled: reuse the slot
+    bt.bucketBytes[slot] += static_cast<std::uint64_t>(bytes);
 }
-inline double btBytesPerSecond(const BandwidthTracker& bt) {
-    if (bt.window.empty()) return 0.0;
-    const double elapsedSecs = bt.windowDurationMs / 1000.0;
-    return elapsedSecs > 0.0 ? static_cast<double>(bt.totalBytes) / elapsedSecs : 0.0;
+
+// Bytes per second over the window ending at `now`. Takes the time because the answer depends on it:
+// the same buckets mean a different rate a second later, and a tracker cannot be read honestly without
+// knowing when "now" is.
+inline double btBytesPerSecond(const BandwidthTracker& bt, MonoTime now) noexcept {
+    if (bt.windowDurationMs <= 0.0) return 0.0;
+    const std::uint64_t newest = btBucketOf(bt, now);
+    const std::uint64_t span   = static_cast<std::uint64_t>(bandwidthBucketCount) - 1;
+    const std::uint64_t oldest = newest > span ? newest - span : 0;
+    std::uint64_t total = 0;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(bandwidthBucketCount); ++i)
+        if (bt.bucketId[i] >= oldest && bt.bucketId[i] <= newest) total += bt.bucketBytes[i];
+    return static_cast<double>(total) / (bt.windowDurationMs / 1000.0);
 }
 
 // --- message unbatching. Decode a coalesced [u8 count][u16 len BE][data]... batch. The encoder is
