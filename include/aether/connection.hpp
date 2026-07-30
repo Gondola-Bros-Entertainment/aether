@@ -289,8 +289,14 @@ inline MessageWires buildMessageWires(const NetworkConfig& cfg, int chIdx, const
 }
 
 // Accumulate a channel-message wire for this tick; flushPendingWires coalesces them into packets.
+// A reliable wire reserves its bytes in the congestion window HERE, at admission, because the window
+// is only charged for real at flush -- and every message in the tick is admitted before that happens.
+// Reserving at admission is what makes cwCanSend bind within a tick instead of testing a stale figure.
+// The reservation is in the same unit flushPendingWires charges (the wire's own size), so the two
+// cancel exactly and pendingBytes is back to 0 once the tick's wires are flushed.
 inline void enqueuePayload(Connection& conn, bool trackReliable, int chIdx,
                            SequenceNum seq, std::uint8_t fragIndex, Bytes wireData) {
+    if (trackReliable && conn.cwnd) cwOnAdmit(*conn.cwnd, static_cast<int>(wireData.size()));
     conn.pendingWires.push_back(
         PendingWire{ std::move(wireData), trackReliable, ChannelMsg{ static_cast<ChannelId>(chIdx), seq, fragIndex } });
 }
@@ -339,16 +345,22 @@ inline void flushPendingWires(Connection& conn, MonoTime now) {
         PacketHeader header = createHeaderInternal(conn);
         header.type = type;
         conn.sendQueue.push_back(OutgoingPacket{ header, type, std::move(payload) });
-        if (relCount > 0) {
-            // Charge the window here, in the same unit processAcks credits back (relBytes), so charge
-            // and release match exactly regardless of how the wires coalesced. An eviction discards a
-            // packet an ack can never resolve, so its bytes are returned immediately.
-            const int evicted = onPacketSent(conn.reliability, conn.localSeq, now,
-                                             std::span<const ChannelMsg>(relMsgs.data(), relCount), relBytes);
-            if (conn.cwnd) {
-                cwOnSend(*conn.cwnd, relBytes, now);
-                cwReleaseInFlight(*conn.cwnd, evicted);
-            }
+        // Register EVERY payload packet, not only the ones carrying reliable messages. The sent ring is
+        // what processAcks walks to produce RTT and loss samples, so registering only reliable packets
+        // left a connection carrying purely unreliable traffic -- the shape of a state-snapshot stream,
+        // which is the common case -- with no samples at all: it reported zero loss and zero RTT while
+        // its rate controller additively increased into a lossy path.
+        //
+        // `size` stays the RELIABLE byte count (0 for an unreliable-only packet), because that is the
+        // unit the congestion window is charged and credited on. So this widens the ack/RTT/loss
+        // signal without touching window accounting by a byte.
+        const int evicted = onPacketSent(conn.reliability, conn.localSeq, now,
+                                         std::span<const ChannelMsg>(relMsgs.data(), relCount), relBytes);
+        if (conn.cwnd) {
+            if (relBytes > 0) cwOnSend(*conn.cwnd, relBytes, now);
+            // An eviction discards a packet an ack can never resolve, so its bytes are returned
+            // immediately -- and the victim may have carried reliable bytes even when this packet does not.
+            cwReleaseInFlight(*conn.cwnd, evicted);
         }
         conn.localSeq         = next(conn.localSeq);
         conn.dataSentThisTick = true;
@@ -563,6 +575,10 @@ inline void resetConnection(Connection& conn) {
     conn.dataSentThisTick = false;
     for (Channel& ch : conn.channels) resetChannel(ch);
     conn.reliability  = newReliableEndpoint(config);
+    // The window is transport state like everything else here: a recycled connection that kept the old
+    // one would start life with a stale bytesInFlight (and phase) from the session that just ended,
+    // and nothing would ever ack those bytes back out. resetTransportMetrics already did this.
+    conn.cwnd         = config.useCwndCongestion ? std::optional<CongestionWindow>(newCongestionWindow(config.mtu)) : std::nullopt;
     conn.congestion   = newCongestionController(config.sendRate, config.maxPacketRate, config.congestionBadLossThreshold,
                                                 config.congestionGoodRttThreshold, config.congestionRecoveryTimeMs);
     conn.bandwidthUp   = newBandwidthTracker(bandwidthWindowMs);

@@ -147,6 +147,12 @@ struct CongestionWindow {
     double                  cwnd                = 0.0;
     double                  ssthresh            = initialSsthresh;
     std::uint64_t           bytesInFlight       = 0;
+    // Reliable bytes ADMITTED this tick but not yet coalesced into a datagram. bytesInFlight only
+    // moves when the tick's wires are flushed, so without this every message in a tick tests the same
+    // pre-tick figure and the window bounds nothing: one tick could admit many times cwnd. Counting
+    // admitted-but-unflushed bytes is what makes the window bind within a tick. It returns to 0 every
+    // flush, since every admitted wire is flushed.
+    std::uint64_t           pendingBytes        = 0;
     int                     mtu                 = 0;
     std::optional<MonoTime> lastSendTime;
     double                  minInterPacketDelay = 0.0;   // milliseconds
@@ -202,13 +208,20 @@ inline void cwOnLoss(CongestionWindow& cw) {
     cw.phase    = CongestionPhase::Recovery;
 }
 
+// Reserve window space for a wire the moment it is admitted, before it has been coalesced into a
+// datagram. Paired with cwOnSend, which converts the reservation into real in-flight bytes at flush.
+inline void cwOnAdmit(CongestionWindow& cw, int bytes) noexcept {
+    cw.pendingBytes += static_cast<std::uint64_t>(bytes);
+}
+
 inline void cwOnSend(CongestionWindow& cw, int bytes, MonoTime now) {
     cw.bytesInFlight += static_cast<std::uint64_t>(bytes);
+    cw.pendingBytes  -= std::min<std::uint64_t>(static_cast<std::uint64_t>(bytes), cw.pendingBytes);   // reservation realized; saturates so it can never wrap
     cw.lastSendTime   = now;
 }
 
 inline bool cwCanSend(const CongestionWindow& cw, int packetBytes) {
-    return cw.bytesInFlight + static_cast<std::uint64_t>(packetBytes) <= static_cast<std::uint64_t>(cw.cwnd);
+    return cw.bytesInFlight + cw.pendingBytes + static_cast<std::uint64_t>(packetBytes) <= static_cast<std::uint64_t>(cw.cwnd);
 }
 
 inline void cwUpdatePacing(CongestionWindow& cw, double rttMs) {
