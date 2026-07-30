@@ -87,21 +87,37 @@ target_link_libraries(aether_bench PRIVATE aether)
 target_compile_options(aether_bench PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,$<$<NOT:$<CONFIG:Debug>>:/O2>,-O3>)
 add_test(NAME bench COMMAND aether_bench)   # smoke: the bench must actually run (catches a DCE/UB regression)
 
-# Opt-in comparison benchmark: aether vs zpp::bits. Fetches an external lib, so it is OFF by
-# default and never touches the library's zero-dependency build:
+# Opt-in comparison benchmark: aether vs zpp::bits vs bitsery. Fetches external libs, so it is OFF
+# by default and never touches the library's zero-dependency build:
 #   cmake -B build -DAETHER_BENCH_COMPARE=ON && cmake --build build --target aether_bench_compare
-option(AETHER_BENCH_COMPARE "Build the serializer comparison benchmark (fetches zpp::bits)" OFF)
+option(AETHER_BENCH_COMPARE "Build the serializer comparison benchmark (fetches zpp::bits + bitsery)" OFF)
 if(AETHER_BENCH_COMPARE)
     include(FetchContent)
     FetchContent_Declare(zpp_bits
         GIT_REPOSITORY https://github.com/eyalz800/zpp_bits.git
         GIT_TAG v4.4.24
         GIT_SHALLOW TRUE)
-    FetchContent_MakeAvailable(zpp_bits)
+    FetchContent_Declare(bitsery
+        GIT_REPOSITORY https://github.com/fraillt/bitsery.git
+        GIT_TAG v5.2.5
+        GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(zpp_bits bitsery)
     add_executable(aether_bench_compare bench/compare.cpp)
     target_link_libraries(aether_bench_compare PRIVATE aether)
-    target_include_directories(aether_bench_compare PRIVATE ${zpp_bits_SOURCE_DIR})
+    target_include_directories(aether_bench_compare PRIVATE ${zpp_bits_SOURCE_DIR} ${bitsery_SOURCE_DIR}/include)
     target_compile_options(aether_bench_compare PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,$<$<NOT:$<CONFIG:Debug>>:/O2>,-O3>)
+endif()
+
+# --- examples ---
+# The echo pair: real programs on the public API (run the server, then type at it through the
+# client). Default ON only when aether is the top-level build, same as the install rules, so a
+# parent project pulling aether in does not grow example binaries.
+option(AETHER_EXAMPLES "Build the example programs" ${PROJECT_IS_TOP_LEVEL})
+if(AETHER_EXAMPLES)
+    add_executable(aether_echo_server examples/echo_server.cpp)
+    add_executable(aether_echo_client examples/echo_client.cpp)
+    target_link_libraries(aether_echo_server PRIVATE aether)
+    target_link_libraries(aether_echo_client PRIVATE aether)
 endif()
 
 # --- install / export ---
