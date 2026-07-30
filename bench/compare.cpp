@@ -1,6 +1,8 @@
-// Comparison benchmark (opt-in: -DAETHER_BENCH_COMPARE=ON). aether vs zpp::bits on the same plain
-// struct. Both are zero-annotation, reflective, C++20. The headline difference is aether's
-// automatic delta -- only the changed fields hit the wire -- which zpp::bits has no analog for.
+// Comparison benchmark (opt-in: -DAETHER_BENCH_COMPARE=ON). aether vs zpp::bits vs bitsery on the
+// same plain struct. aether and zpp::bits are zero-annotation, reflective, C++20; bitsery wants a
+// hand-written per-field serialize function in exchange for explicit widths. The headline
+// difference is aether's automatic delta -- only the changed fields hit the wire -- which neither
+// of the others has an analog for.
 //
 // Measured as a full roundtrip (encode + decode) with the input varied every iteration, so the
 // optimizer cannot constant-fold the work away (a constant input makes zpp's trivial-copy memcpy
@@ -8,6 +10,9 @@
 // every format's wire size stays stable.
 #include "aether/aether.hpp"
 
+#include <bitsery/adapter/buffer.h>
+#include <bitsery/bitsery.h>
+#include <bitsery/traits/array.h>
 #include <zpp_bits.h>
 
 #include <array>
@@ -27,6 +32,23 @@ struct Entity {
     std::uint8_t  team{};
     bool          alive{};
 };
+
+// The per-field annotation bitsery requires (and the reflective libraries do not): every member
+// listed by hand, with its wire width. Constrained to archives that have bitsery's value4b
+// interface, because zpp::bits probes the SAME free-function name as its own customization point --
+// unconstrained, this would hijack zpp's reflective path and feed its archive to bitsery calls.
+template <typename S> requires requires(S& s, float f) { s.value4b(f); }
+void serialize(S& s, Entity& e) {
+    s.value4b(e.px); s.value4b(e.py); s.value4b(e.pz);
+    s.value4b(e.vx); s.value4b(e.vy); s.value4b(e.vz);
+    s.value4b(e.health);
+    s.value4b(e.mana);
+    s.value4b(e.flags);
+    s.value2b(e.typeId);
+    s.value1b(e.team);
+    s.value1b(e.alive);
+}
+using BitseryBuffer = std::array<std::uint8_t, 256>;
 
 template <class T> inline void sink(const T& v) {
 #if defined(_MSC_VER)
@@ -66,6 +88,8 @@ int main() {
     std::array<std::byte, 256> zb{};
     std::size_t zN = 0;
     { zpp::bits::out out{ zb }; out(e).or_throw(); zN = out.position(); }
+    BitseryBuffer bb{};
+    const std::size_t bN = bitsery::quickSerialization(bitsery::OutputBufferAdapter<BitseryBuffer>{ bb }, e);
 
     std::printf("entity: %zu fields, sizeof=%zu, %d roundtrips\n\n",
                 aether::fieldCount<Entity>(), sizeof(Entity), kIters);
@@ -107,6 +131,17 @@ int main() {
             zpp::bits::in in{ zb }; Entity o; in(o).or_throw(); sink(o);
         });
         std::printf("%-20s %14.2f %8zu\n", "zpp::bits", t, zN);
+    }
+    // bitsery: full fixed-width (hand-annotated serialize) -- no delta analog
+    {
+        const double t = nsPer([&](int i) {
+            e.px = static_cast<float>(i);
+            const std::size_t n = bitsery::quickSerialization(bitsery::OutputBufferAdapter<BitseryBuffer>{ bb }, e);
+            Entity o{};
+            const auto st = bitsery::quickDeserialization(bitsery::InputBufferAdapter<BitseryBuffer>{ bb.begin(), n }, o);
+            sink(st); sink(o);
+        });
+        std::printf("%-20s %14.2f %8zu\n", "bitsery", t, bN);
     }
 
     return 0;
