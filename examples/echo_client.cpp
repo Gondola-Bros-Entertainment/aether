@@ -24,11 +24,26 @@ aether::MonoTime monoNow() {
             std::chrono::steady_clock::now().time_since_epoch()).count()) };
 }
 
+// Hand-rolled dotted-quad parse (sscanf is a C4996 warnings-as-errors failure under MSVC).
 std::optional<aether::Address> parseIpv4(const char* s, std::uint16_t port) {
-    unsigned a{}, b{}, c{}, d{};
-    if (std::sscanf(s, "%u.%u.%u.%u", &a, &b, &c, &d) != 4 || a > 255 || b > 255 || c > 255 || d > 255)
-        return std::nullopt;
-    return aether::addrV4(static_cast<std::uint32_t>((a << 24) | (b << 16) | (c << 8) | d), port);
+    std::uint32_t ip = 0;
+    const char*   p  = s;
+    for (int octet = 0; octet < 4; ++octet) {
+        if (*p < '0' || *p > '9') return std::nullopt;
+        unsigned v = 0;
+        while (*p >= '0' && *p <= '9') {
+            v = v * 10 + static_cast<unsigned>(*p++ - '0');
+            if (v > 255) return std::nullopt;
+        }
+        ip = (ip << 8) | v;
+        if (octet < 3) {
+            if (*p != '.') return std::nullopt;
+            ++p;
+        } else if (*p != '\0') {
+            return std::nullopt;
+        }
+    }
+    return aether::addrV4(ip, port);
 }
 
 constexpr int tickMs = 16;
