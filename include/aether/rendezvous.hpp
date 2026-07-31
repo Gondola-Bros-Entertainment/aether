@@ -115,6 +115,14 @@ inline std::vector<std::pair<Address, Bytes>> rendezvousProcess(
             if (it == rv.waiting.end()) {
                 if (static_cast<int>(rv.waiting.size()) >= rv.maxRooms) evictOldestWaiting(rv);   // at the cap: shed the stalest waiter
                 rv.waiting[*room] = { src, now };                                 // first peer waits
+            } else if (addrEqual(src, it->second.first)) {
+                // The SAME peer registering again, not a partner arriving. hostTick re-sends Register
+                // every registerRetryMs until a Paired reply lands, so the first peer into a room
+                // reaches this on its own retry. Pairing here would hand that peer its own address,
+                // and it would stop retrying (a Paired reply clears pendingRoom), leaving the real
+                // partner to wait out the TTL against a room already marked paired. Refresh the
+                // waiter's TTL and stay silent.
+                it->second.second = now;
             } else {
                 const Address first = it->second.first;
                 rv.waiting.erase(it);
