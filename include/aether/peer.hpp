@@ -211,21 +211,17 @@ inline EncryptionKey deriveResumeKey(const X25519Key& master) {
     detail::hchacha20(master.data(), in, k.data());
     return k;
 }
-// Advance the master past a resume that has just been spent, so the chain is one-way.
+// Advance the master past a resume as it is spent, so the chain is one-way.
 //
-// A resume request is cleartext and carries no single-use marker, so nothing in the blob itself stops
-// it being presented twice. Accepting one used to leave the master unchanged, and every session that
-// times out re-arms resumableTokens with that same master (updateConnections) -- so a captured request
-// became valid again on each generation. Re-keying from an unchanged master reproduced the earlier
-// session's keystream EXACTLY, because a resumed connection is a fresh Connection whose nonce counter
-// restarts at 0: two ciphertexts under one (key, nonce) recover each other by XOR, and two Poly1305
-// tags under one one-time key recover the MAC key. Ratcheting means the value stored for the next
-// resume can no longer verify the MAC that was just spent, so a captured request dies on first use and
-// no two sessions ever key from the same secret. Both peers ratchet with the same salt, so the real
-// client stays in step.
+// A resume request is cleartext and carries no single-use marker, and every timeout re-arms
+// resumableTokens with whatever master the connection holds. Without the ratchet the same request
+// authenticates on every generation, and re-keying from an unchanged master reproduces the earlier
+// session's keystream exactly, since a resumed connection restarts its nonce at 0. Two ciphertexts
+// under one (key, nonce) recover each other; two Poly1305 tags under one one-time key recover the MAC
+// key. Ratcheting means the stored value can no longer verify the MAC just spent.
 //
-// This does not close the in-flight race -- an attacker replaying a captured resume BEFORE the real
-// client still wins it, which remains the documented 0-RTT trade-off. It closes the key reuse.
+// Both peers ratchet from the same salt, so they stay in step. This does not close the in-flight race
+// (a replay landing BEFORE the real client still wins) -- that is the documented 0-RTT trade-off.
 inline X25519Key ratchetResumeMaster(const X25519Key& master, std::uint64_t salt) {
     std::uint8_t in[16] = {};
     putU64(in, salt);
@@ -248,11 +244,10 @@ inline std::array<std::uint8_t, 16> resumeMac(const X25519Key& master, std::uint
 
 // --- stateless retry cookie (return routability before the server allocates anything) ---
 //
-// A ConnectionRequest used to buy a half-open slot and an X25519 keypair from an address that had
-// proven nothing. The challenge echo stops a spoofed source COMPLETING a handshake, but not from
-// making the server hold that slot until it times out. So the server now answers an uncookied
-// request with a cookie it does not remember, and only a request echoing a valid one reaches the
-// token check, the pending table, or the keygen.
+// The challenge echo stops a spoofed source COMPLETING a handshake, but not from making the server
+// hold a half-open slot and an X25519 keypair until it times out. So an uncookied request is answered
+// with a cookie the server does not remember, and only a request echoing a valid one reaches the token
+// check, the pending table, or the keygen.
 //
 // The cookie is an AEAD tag over (source address, time epoch) under a per-peer CSPRNG secret: only
 // this server could have minted it, it is useless from any other address, and it expires on its own.
@@ -350,18 +345,14 @@ inline std::optional<std::pair<SequenceNum, ByteSpan>> decodeChannelSeq(ByteSpan
 
 // --- path validation (prove a candidate address can RECEIVE, before anything is committed to it) ---
 //
-// Decrypting a packet proves the sender holds the session key. It does NOT prove the sender is at the
-// address the datagram claims: a source address is unverified attacker-controlled data, and a REPLAYED
-// genuine packet decrypts perfectly. Migration used to move a connection on that evidence alone, so an
-// attacker who captured one payload packet and raced its copy in ahead of the original took the
-// connection to an address of its choosing -- the victim was then blackholed for migrationCooldownMs
-// while the server sent it everything, repeatable forever at one captured packet per cooldown.
+// Decrypting proves the sender holds the session key. It does NOT prove the sender is at the address
+// the datagram claims: that address is unverified attacker-controlled data, and a replayed genuine
+// packet decrypts perfectly. Moving a connection on decryption alone therefore hands it to anyone who
+// captures one packet and races their copy in first.
 //
-// The fix is the standard one (QUIC's PATH_CHALLENGE): send fresh unpredictable bytes to the candidate
-// address, ENCRYPTED, and move nothing until they are echoed back from it. A replay attacker cannot
-// read the challenge, so it cannot answer; only a peer that both holds the key and actually receives at
-// that address can. The cost is one round trip before a migration completes, which is what path
-// validation costs everywhere it is done correctly.
+// So send fresh unpredictable bytes to the candidate, ENCRYPTED, and move nothing until they come back
+// from it (QUIC's PATH_CHALLENGE). A replayer cannot read the challenge, so it cannot answer. Costs one
+// round trip per migration.
 inline constexpr std::size_t pathChallengeBytes    = 8;
 inline constexpr double      pathValidationTimeoutMs = 3000.0;   // a challenge older than this is abandoned
 inline constexpr std::size_t maxPathValidations    = 64;         // bounded like every other attacker-reachable table
@@ -514,10 +505,9 @@ inline std::vector<PeerEvent> handleConnectionRequest(NetPeer& peer, const PeerI
         // No entry / expired / bad MAC falls through to a normal handshake. A bad MAC does NOT burn the
         // resumable, so a token-only observer cannot deny the real client its fast reconnect.
     }
-    // On a token-gated server, look at the token BEFORE minting a cookie. A 41-byte Retry answering a
-    // 14-byte request is ~3x amplification, and without this check a spoofed source got one for free --
-    // where previously it got only a 14-byte Denied, because the token was checked first. Reordering
-    // restores that: garbage now costs the attacker more than it costs us.
+    // On a token-gated server, look at the token BEFORE minting a cookie: a 41-byte Retry answering a
+    // 14-byte request is ~3x amplification, and a spoofed source must not get one for free. Rejecting
+    // garbage with a 14-byte Denied keeps the exchange costing the attacker more than it costs us.
     //
     // This is deliberately openConnectToken, not validateConnectToken: the full validation RECORDS the
     // token against replay, and doing that here would burn the real client's token on the uncookied

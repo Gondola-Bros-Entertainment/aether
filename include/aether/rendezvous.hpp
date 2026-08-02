@@ -126,12 +126,11 @@ inline std::vector<std::pair<Address, Bytes>> rendezvousProcess(
         // evicts every legitimate waiter through evictOldestWaiting.
         if (!rateLimiterAllow(rv.limiter, sockAddrToKey(src, rv.addrHashSeed), now)) { rv.rateLimitDrops += 1; continue; }
         if (const auto room = decodeRegister(data)) {
-            // A room with a LIVE relay session must not be re-pairable by a third party. Presenting a
-            // known room id used to fall through to the waiting branch, and the next registration then
-            // overwrote the pair -- silently killing an established relay for the two real peers, since
-            // their later Relay frames fail the membership test. Only an existing member may register
-            // again (a reconnect); anyone else must wait out the session TTL, exactly as for a new room.
-            // A member whose address changed is in the same position, which is the safe direction.
+            // A room with a LIVE relay session is not re-pairable by a third party: re-pairing replaces
+            // the stored pair, and the two real peers' Relay frames then fail the membership test, so
+            // anyone holding the room id could silently kill an established relay. Only an existing
+            // member may register again (a reconnect); anyone else waits out the session TTL as for a
+            // new room. A member whose own address changed is in the same position, the safe direction.
             if (const auto sit = rv.sessions.find(*room);
                 sit != rv.sessions.end() && !addrEqual(src, sit->second.a) && !addrEqual(src, sit->second.b)) continue;
             const auto it = rv.waiting.find(*room);

@@ -145,15 +145,13 @@ inline ReliableEndpoint newReliableEndpoint(const NetworkConfig& config) {
     return ep;
 }
 
-// Outgoing sequences start at 1: 0 is reserved so that "I have received nothing yet" is unambiguous.
-// getAckInfo has no way to say it -- before the first receive it reports the default remoteSeq 0 with
-// an empty bitfield, which is byte-for-byte a genuine acknowledgement of packet 0. The receive side
-// already guards this (onPacketsReceived refuses to advance from the default, and says why), but the
-// SEND side still emitted it: a peer that had heard nothing acked our packet 0, and if that packet
-// carried a reliable message that was lost, the sender marked it delivered and never retransmitted it
-// -- silent loss on a channel whose contract is no loss. Never sending 0 means no sent-ring record
-// exists for the sequence such a header names, so the false ack resolves to nothing. Wraparound
-// reaches 0 legitimately ~65k packets later, by which point both sides have long since received.
+// Outgoing sequences start at 1, because 0 is the wire form of "I have received nothing yet" and must
+// not also be a real packet. getAckInfo cannot express the difference: before its first receive it
+// reports the default remoteSeq 0 with an empty bitfield, which is byte-for-byte a genuine ack of
+// packet 0. (onPacketsReceived guards the receive side of this, and says so.) Never sending 0 means no
+// sent-ring record exists at the sequence such a header names, so it resolves to nothing rather than
+// falsely confirming a reliable message. Wraparound reaches 0 legitimately ~65k packets later, by
+// which point both sides have long since received.
 inline constexpr SequenceNum firstSequence{ 1 };
 
 inline Connection newConnection(const NetworkConfig& config, std::uint64_t clientSalt, MonoTime now) {
@@ -202,15 +200,12 @@ inline double              clockOffsetErrorMs(const Connection& c) noexcept { re
 
 // --- anti-amplification ---
 //
-// A 0-RTT resume is authenticated by a MAC over the ECDH master, which proves the sender holds the
-// master -- it does NOT prove the sender is at the source address, and that address is attacker
-// chosen. So a replayed resume spoofed to a victim's address made the server open a full connection
-// there and stream game traffic at it for the whole connection timeout: tens of bytes in, seconds of
-// outbound at a target of the attacker's choosing. Requiring a challenge first would cost the round
-// trip that 0-RTT resume exists to avoid, so instead the connection comes up UNVALIDATED and may only
-// send a small multiple of what it has received, until a packet decrypts from that address -- which
-// only a peer actually there can produce. The real client sends immediately, so it lifts the cap on
-// its first packet and never notices; a spoofed victim sends nothing, so nothing is amplified at it.
+// A resume MAC proves the sender holds the master, never that it is at the source address it claims.
+// A challenge would prove that, but costs the round trip 0-RTT resume exists to avoid. So the
+// connection comes up UNVALIDATED and may send only a small multiple of what it has received, until a
+// packet decrypts from that address -- which only a peer actually there can produce. The real client
+// sends immediately and lifts the cap on its first packet; a spoofed victim sends nothing, so nothing
+// is amplified at it.
 inline constexpr int amplificationFactor = 3;   // the usual anti-amplification ratio (QUIC uses 3x)
 
 inline bool amplificationAllowsSend(const Connection& c, int bytes) noexcept {
@@ -227,13 +222,11 @@ inline void markPathValidated(Connection& c) noexcept {
 }
 
 // --- header creation ---
-// EVERY header carries our current ack state, so building one discharges whatever ack was pending --
-// which is why pendingAck is cleared here rather than inferred at tick end from an empty send queue.
-// The queue cannot answer the question: a time-sync pong is queued while the incoming batch is still
-// being processed, so its header predates any packet that arrives later in that same batch. Testing
-// "did we queue anything" then suppressed the ack for a payload the pong could not have carried, and
-// the sender retransmitted it an RTO later. Clearing at the point the ack is actually snapshotted
-// ties the decision to ordering instead.
+// EVERY header carries our current ack state, so building one discharges whatever ack was pending.
+// Clear it HERE, at the point the ack is actually snapshotted, rather than inferring at tick end from
+// an empty send queue: a time-sync pong is queued while the incoming batch is still being processed,
+// so its header predates anything arriving later in that batch, and "did we queue something" would
+// suppress an ack that packet never carried.
 inline PacketHeader createHeaderInternal(Connection& conn) {
     const auto [ackSeq, ackBits64] = getAckInfo(conn.reliability);
     conn.pendingAck = false;
@@ -367,13 +360,11 @@ inline void maybeAdvertiseWindow(Connection& conn, MonoTime now) {
         // which validateConfig currently admits.
         changed = changed || (isR != wasR) || (delta >= (ch.config.maxReceiveBufferSize + 3) / 4);
     }
-    // Re-send while UNCONFIRMED, not merely while restricted. A WindowUpdate is not registered in the
-    // sent ring, so nothing retransmits it; the reopen that follows a drain is a single datagram, and
-    // once it is sent the receiver is unrestricted with a steady free count -- nothing left to trigger
-    // another. Losing that one datagram therefore left the sender at credit 0 with no way to ever hear
-    // otherwise, wedging the channel on a healthy link. Keying the persist timer off the peer's
-    // acknowledgement instead closes that: the reopen repeats every windowRefreshMs until a header
-    // covers it, which is the same proof-of-delivery an MTU probe uses.
+    // Re-send while UNCONFIRMED, not merely while restricted. A WindowUpdate is not in the sent ring,
+    // so nothing retransmits it, and the reopen after a drain is a single datagram: once it is sent the
+    // receiver is unrestricted with a steady free count, so nothing would ever trigger another. Losing
+    // it would strand the sender at credit 0 forever. Keying the timer off the peer's ack instead means
+    // the reopen repeats every windowRefreshMs until a header covers it, as an MTU probe does.
     const bool unconfirmed = !conn.windowUpdateAcked;
     if (!changed && !((restricted || unconfirmed) && elapsedMs(conn.lastWindowAdvertise, now) >= windowRefreshMs)) return;
 
@@ -637,17 +628,11 @@ inline void processIncomingAcks(Connection& conn, const PacketHeader& header, Mo
         // accounting must happen either way -- acked and newly-lost bytes have both left the
         // network -- but a header that signalled congestion must not also grow the window.
         //
-        // The congestion test is the lost-packet COUNT, not the fastRetransmit list: congestion is a
-        // property of the path, so any drop must shrink the window. Gating on fastRetransmit tied the
-        // window to RELIABLE loss alone, and an unreliable-only packet yields no fastRetransmit
-        // entries -- so on a stream of unreliable snapshots (what games mostly send) the window sat at
-        // its initial size through 40% loss while the AIMD controller correctly halved its rate.
-        //
-        // The ack side is symmetric, and gated on the packet COUNT for the same reason: growth itself is
-        // byte-driven (an unreliable packet's 0 bytes correctly grow nothing), but reaching cwOnAck is
-        // what ENDS fast recovery. Testing ackedBytes meant an unreliable-only ack never reached it, so
-        // one loss on a snapshot stream parked the window in Recovery until some reliable ack eventually
-        // arrived -- shrinking on all traffic while recovering on almost none.
+        // Both tests are packet COUNTS, not byte totals, because an unreliable-only packet is recorded
+        // with size 0. Congestion is a property of the path, so any drop must shrink the window; and
+        // reaching cwOnAck is what ENDS fast recovery, so a byte test would leave a snapshot stream
+        // (mostly unreliable, which is what games send) parked in Recovery after its first loss.
+        // Growth stays byte-driven inside cwOnAck, where 0 bytes correctly grow nothing.
         cwReleaseInFlight(*conn.cwnd, res.lostBytes);
         if (res.lostPackets > 0) {
             cwReleaseInFlight(*conn.cwnd, res.ackedBytes);

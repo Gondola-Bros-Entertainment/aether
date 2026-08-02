@@ -32,20 +32,14 @@ inline constexpr std::uint64_t fnvOffsetBasis = 14695981039346656037ull;
 inline constexpr std::uint64_t fnvPrime       = 1099511628211ull;
 inline std::uint64_t fnvMix(std::uint64_t h, std::uint64_t v) noexcept { return (h ^ v) * fnvPrime; }
 
-// Hash a remote address to a rate-limit key: the HOST, deliberately NOT the (host, port) pair.
+// Rate-limit key for a remote address: the HOST, never the (host, port) pair. Including the port
+// hands one machine a fresh budget per port it binds, and fills the tracked-source table so new
+// sources get shed. A port is not an identity.
 //
-// Hashing the whole sockaddr included the source port, so one ordinary unspoofed host got a fresh
-// budget for every port it bound: measured at ~1200x its cap from 5000 ports, which also filled the
-// tracked-source table and made the limiter shed every NEW source -- so a single machine could lock
-// legitimate clients out entirely. A port is not an identity; the host is what a per-source limit is
-// meant to bound.
-//
-// The sockaddr layout is fixed where it matters: both sockaddr_in and sockaddr_in6 keep the port at
-// bytes 2-3, with the address at 4..8 (v4) or 8..24 (v6). Reading those directly keeps this
-// allocation-free, which serializeAddr's canonical form would not be on a per-packet path.
-//
-// `seed` is a per-server random value: FNV-1a is trivially invertible, so an unseeded key let an
-// attacker with an address range compute one that collides with a victim's bucket and starve it.
+// Reads the sockaddr directly (port at bytes 2-3, address at 4..8 for v4 or 8..24 for v6, in both
+// sockaddr_in and sockaddr_in6) to stay allocation-free; serializeAddr's canonical form would not be
+// on a per-packet path. `seed` is per-server: FNV-1a inverts trivially, so an unseeded key lets an
+// attacker compute an address that lands in a victim's bucket and starve it.
 inline std::uint64_t sockAddrToKey(const Address& addr, std::uint64_t seed) noexcept {
     const bool          v6  = addr.len > 16;   // sockaddr_in is 16 bytes, sockaddr_in6 is 28
     const std::uint32_t off = v6 ? 8u : 4u;

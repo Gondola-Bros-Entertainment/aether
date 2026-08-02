@@ -200,42 +200,20 @@ Deliberate design decisions, and what they cost you.
   man-in-the-middle. Connect tokens add identity and access control, but a token is a bearer
   credential. Full MITM resistance needs a keys-in-token model, which is not a trade this library
   makes.
-- Connecting costs three round trips, because the stateless retry cookie always runs rather than
-  engaging only once the half-open table fills. A path that engages only under attack is a path that
-  is untested when the attack arrives. Reconnects are unaffected and stay 0-RTT.
-- A fast reconnect is a 0-RTT resume and inherits the usual 0-RTT cost: an attacker who captures a
-  live resume request can replay it and beat the real client to it. Closing that needs a challenge
-  round trip, which is what 0-RTT exists to avoid. The master ratchets on each accepted resume, so
-  captured bytes work at most once, and a resumed connection is amplification-capped until a packet
-  decrypts from its address.
-- Connection migration costs one round trip: a new address must echo an encrypted challenge before
-  the connection follows a peer there.
 - `maxMessageSize` is bounded by the fragment count, roughly 295KB at a 1200-byte MTU, and rejected
   at `validateConfig` rather than at send. Messages larger than one send-rate bucket are paced across
   ticks, so a big message costs latency and never a config rejection.
-- A reliable-ordered channel's ordering is bounded by `orderedBufferTimeout`. A gap that never fills
-  is eventually skipped rather than stalling the channel forever, and those sequences become a
-  permanent hole.
-- `config.mtu` (default 1200) is the floor everything is sized against; path-MTU discovery raises the
-  usable datagram size to `mtuProbeCeiling` (default 1500). That headroom feeds message coalescing
-  only, so a path that shrinks back can never strand a fragmented message.
-- A rendezvous room id is a bearer credential: anyone presenting it is paired into the room and
-  learns the other peer's public address, so mint them as unguessable secrets, not lobby numbers. A
-  room with a live session is closed until it expires, so a leaked id cannot evict a pair already
-  talking -- and a peer whose own address changes waits out that expiry too.
-- The serializer reflects `std::array`, `string`, `vector`, `optional` and nested aggregates. Raw
-  C-array members are not, which is a C++20 limitation; use `std::array<T, N>` instead. Misuse is a
-  compile error, not silent breakage.
-- Decoding is capped at `Reader::allocBudget` (8MB by default) of resident objects, because wire
-  length bounds how many elements a container claims but not what they cost in memory. Raise it for
-  genuinely large payloads, lower it to tighten the bound on untrusted input.
-- Clock sync uses Cristian's algorithm, which assumes symmetric one-way delays. An asymmetric path
-  biases the offset by half the difference: 5ms out and 145ms back reads exactly 70ms off. Check
-  `clockOffsetErrorMs` before lag compensation -- a large bound means the shared timeline is a guess.
 - Replication ships the codec, not the protocol. Numbering your snapshots and telling the sender
   which one the peer received stays yours, because only the application knows what a snapshot is.
 - `net.hpp` drains the socket once per tick with no dedicated receive thread, so inbound traffic sits
   in the kernel socket buffer between ticks and one core handles all packet processing.
-- `maxReceiveBufferSize` is a per-collection capacity, not a standing queue depth: `peerProcess`
-  hands every buffered message to the application each tick, so occupancy outlives a tick only if you
-  drive `Connection` directly and skip that collection.
+- The serializer reflects `std::array`, `string`, `vector`, `optional` and nested aggregates. Raw
+  C-array members are not, which is a C++20 limitation; use `std::array<T, N>` instead. Misuse is a
+  compile error, not silent breakage.
+- A rendezvous room id is a bearer credential: anyone presenting it is paired into the room and
+  learns the other peer's public address, so mint them as unguessable secrets, not lobby numbers.
+- Clock sync uses Cristian's algorithm, which assumes symmetric one-way delays. An asymmetric path
+  biases the offset by half the difference: 5ms out and 145ms back reads exactly 70ms off. Check
+  `clockOffsetErrorMs` before lag compensation -- a large bound means the shared timeline is a guess.
+
+Handshake, delivery, sizing and decoding behaviour in detail: [docs/behavior.md](docs/behavior.md).
