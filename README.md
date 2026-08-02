@@ -196,79 +196,49 @@ platform layer, `src/socket_posix.cpp` and `src/socket_win.cpp`; everything else
 
 Deliberate design decisions, and what they cost you.
 
-- The X25519 handshake is unauthenticated. It resists eavesdropping but not an active
-  man-in-the-middle. Connect tokens add identity, access control and a DoS gate, but a token is a
-  bearer credential. Full MITM resistance needs a keys-in-token model, which costs ephemeral keys
-  and forward secrecy, and that is not a trade this library makes.
-- Connecting costs three round trips, not two: the stateless retry cookie always runs, rather than
-  switching on only when the half-open table is filling up. One code path is worth more here than
-  one saved round trip on a once-per-session exchange, because the version that engages only under
-  attack is the version that is untested when the attack arrives. Reconnects are unaffected, since a
-  resume authenticates itself with a MAC over the ECDH master and stays 0-RTT.
-- A fast reconnect is a 0-RTT resume, and it inherits the usual 0-RTT cost. The request is
-  authenticated by a MAC over the ECDH master, so observing the cleartext session token is not enough
-  to forge one, and the master ratchets as each resume is accepted, so a captured request
-  authenticates at most once. Within that one window an attacker who captures a live request can
-  still replay it and beat the real client to it; closing that would need a challenge round trip,
-  which is what 0-RTT resume exists to avoid. A resumed connection is anti-amplification capped until
-  a packet decrypts from its address, sending at most three times what it has received, so a resume
-  replayed with a forged source address cannot aim the server's output at a third party. The real
-  client lifts the cap with its first packet.
-- Connection migration costs one round trip. A packet from a new address is delivered if it decrypts,
-  but the connection moves only once that address echoes an encrypted random challenge. Decryption
-  proves the sender holds the key; the echo is what proves it is reachable where it claims to be.
-- `maxMessageSize` is bounded by the fragment count: a message must fit 255 fragments, roughly
-  295KB at a 1200-byte MTU. This is checked at `validateConfig` rather than at send. A message
-  larger than one send-rate bucket is paced, with its fragments spread across as many ticks as the
-  budget needs, so big messages cost latency and never a config rejection.
-- A reliable-ordered channel's ordering guarantee is bounded by `orderedBufferTimeout`. If a gap
-  never fills, the channel eventually delivers what is behind it and moves on rather than stalling
-  forever, and the skipped sequences then become a permanent hole.
-- `config.mtu` (default 1200) is the floor everything is sized against. Probe-based path-MTU
-  discovery then raises the usable datagram size up to `mtuProbeCeiling` (default 1500). That
-  headroom feeds message coalescing only; fragmentation stays chunked at the floor, so a path that
-  shrinks back can never strand a fragmented message. Near-total loss above the floor collapses to
-  it immediately.
-- A rendezvous room id is a bearer credential. Anyone who presents the same 64-bit id is paired
-  into the room and learns the other peer's public address, so treat room ids as unguessable
-  secrets minted by your matchmaker, not as sequential lobby numbers. A room with a live relay
-  session is closed to newcomers until it expires, so presenting a leaked id cannot evict a pair
-  that is already talking, and a peer whose own address changes mid-session waits out that expiry
-  like anyone else.
+- The X25519 handshake is unauthenticated: it resists eavesdropping but not an active
+  man-in-the-middle. Connect tokens add identity and access control, but a token is a bearer
+  credential. Full MITM resistance needs a keys-in-token model, which is not a trade this library
+  makes.
+- Connecting costs three round trips, because the stateless retry cookie always runs rather than
+  engaging only once the half-open table fills. A path that engages only under attack is a path that
+  is untested when the attack arrives. Reconnects are unaffected and stay 0-RTT.
+- A fast reconnect is a 0-RTT resume and inherits the usual 0-RTT cost: an attacker who captures a
+  live resume request can replay it and beat the real client to it. Closing that needs a challenge
+  round trip, which is what 0-RTT exists to avoid. The master ratchets on each accepted resume, so
+  captured bytes work at most once, and a resumed connection is amplification-capped until a packet
+  decrypts from its address.
+- Connection migration costs one round trip: a new address must echo an encrypted challenge before
+  the connection follows a peer there.
+- `maxMessageSize` is bounded by the fragment count, roughly 295KB at a 1200-byte MTU, and rejected
+  at `validateConfig` rather than at send. Messages larger than one send-rate bucket are paced across
+  ticks, so a big message costs latency and never a config rejection.
+- A reliable-ordered channel's ordering is bounded by `orderedBufferTimeout`. A gap that never fills
+  is eventually skipped rather than stalling the channel forever, and those sequences become a
+  permanent hole.
+- `config.mtu` (default 1200) is the floor everything is sized against; path-MTU discovery raises the
+  usable datagram size to `mtuProbeCeiling` (default 1500). That headroom feeds message coalescing
+  only, so a path that shrinks back can never strand a fragmented message.
+- A rendezvous room id is a bearer credential: anyone presenting it is paired into the room and
+  learns the other peer's public address, so mint them as unguessable secrets, not lobby numbers. A
+  room with a live session is closed until it expires, so a leaked id cannot evict a pair already
+  talking -- and a peer whose own address changes waits out that expiry too.
 - The serializer reflects `std::array`, `string`, `vector`, `optional` and nested aggregates. Raw
-  C-array members are not auto-reflected, which is a C++20 limitation; use `std::array<T, N>`
-  instead. Misuse is a compile error rather than silent breakage: a `static_assert` naming the cause
-  when the field mis-count runs past the 32-field probe limit, and a structured-binding decomposition
-  error inside `tieFields` when it does not.
-- Decoding a struct from the wire is capped at `Reader::allocBudget` (8MB by default) of resident
-  objects. Wire length bounds how many elements a container can claim but not how much memory they
-  cost, since one wire byte can materialize an element of any size, so the budget is charged against
-  what a decode actually allocates. Raise it on the `Reader` for genuinely large payloads, or lower
-  it to tighten the bound on untrusted input.
-- Clock sync uses Cristian's algorithm, which assumes the two one-way delays are equal. On an
-  asymmetric path the offset is biased by half the difference between them: a route with 5ms out and
-  145ms back reads exactly 70ms off, where a symmetric path has no error at all. `clockOffsetErrorMs`
-  reports the bound on that error, which is half the recent-best round-trip. That best decays upward
-  toward the prevailing RTT rather than holding a lifetime minimum, so the bound stays honest as a
-  path changes instead of quoting a tightness a stale sample once had. Check it before doing lag
-  compensation: a large bound means the shared timeline is a guess.
-- Replication ships the codec, not the protocol. aether provides the delta encode and decode, the
-  sender's pending-snapshot tracking, and the receiver's baseline ring. Numbering your snapshots
-  and telling the sender which one the peer received stays yours, because only the application
-  knows what a snapshot is and the transport reports delivery per connection, not per message.
-- `net.hpp` drains the socket non-blocking once per tick, and there is no dedicated receive thread.
-  Inbound traffic is therefore absorbed by the kernel socket buffer between ticks, and one core
-  handles all packet processing.
-- The advertised receive window carries the receiver's absorption capacity: sent once as the
-  connection comes up, then again when that figure moves materially (a quarter of the buffer) or the
-  receiver becomes restricted, and repeated on a 250ms persist timer until a header acknowledges it.
-  A link whose receiver keeps up therefore costs one flow-control packet for the whole session, since
-  the first advertisement is acked and nothing after it changes. `maxReceiveBufferSize` is a
-  per-collection capacity rather than a standing queue depth, because `peerProcess` hands every
-  buffered message to the application on every tick; occupancy only outlives a tick if you drive
-  `Connection` directly and skip that collection.
-
-Known work lives in [issues](https://github.com/Gondola-Bros-Entertainment/aether/issues).
+  C-array members are not, which is a C++20 limitation; use `std::array<T, N>` instead. Misuse is a
+  compile error, not silent breakage.
+- Decoding is capped at `Reader::allocBudget` (8MB by default) of resident objects, because wire
+  length bounds how many elements a container claims but not what they cost in memory. Raise it for
+  genuinely large payloads, lower it to tighten the bound on untrusted input.
+- Clock sync uses Cristian's algorithm, which assumes symmetric one-way delays. An asymmetric path
+  biases the offset by half the difference: 5ms out and 145ms back reads exactly 70ms off. Check
+  `clockOffsetErrorMs` before lag compensation -- a large bound means the shared timeline is a guess.
+- Replication ships the codec, not the protocol. Numbering your snapshots and telling the sender
+  which one the peer received stays yours, because only the application knows what a snapshot is.
+- `net.hpp` drains the socket once per tick with no dedicated receive thread, so inbound traffic sits
+  in the kernel socket buffer between ticks and one core handles all packet processing.
+- `maxReceiveBufferSize` is a per-collection capacity, not a standing queue depth: `peerProcess`
+  hands every buffered message to the application each tick, so occupancy outlives a tick only if you
+  drive `Connection` directly and skip that collection.
 
 ## License
 
