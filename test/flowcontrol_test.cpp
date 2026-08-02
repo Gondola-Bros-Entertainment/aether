@@ -204,9 +204,11 @@ int main() {
         assert(srv.windowAdvertised);
         assert(srv.advertisedCredit[0] == 0);
 
-        // Deliver that advertisement to the sender.
-        const Bytes upd = encodeWindowUpdate(srv);
-        assert(applyWindowUpdate(cli, freshWindowHeader(cli), ByteSpan(upd.data(), upd.size())));
+        // Deliver that advertisement to the sender. Hoisted out of assert(): the call mutates credit,
+        // so under NDEBUG an assert would drop the delivery along with the check.
+        const Bytes upd       = encodeWindowUpdate(srv);
+        const bool  delivered = applyWindowUpdate(cli, freshWindowHeader(cli), ByteSpan(upd.data(), upd.size()));
+        assert(delivered);
         assert(cli.peerCredit[0] == 0);
 
         // With no credit the sender must admit nothing -- and must not lose it either. The messages
@@ -278,41 +280,53 @@ int main() {
         (void)now;
         Connection& cli = p.client.connections.at(p.sp);
 
+        // applyWindowUpdate mutates credit, so every call is hoisted out of assert(): inside one it
+        // would vanish under NDEBUG and take the state change with it.
         const PacketHeader h = freshWindowHeader(cli);   // framing is judged before freshness, so one header serves
-        assert(!applyWindowUpdate(cli, h, ByteSpan{}));                              // empty
-        const std::uint8_t tooMany[] = { maxChannelCount + 1 };
-        assert(!applyWindowUpdate(cli, h, ByteSpan(tooMany, sizeof tooMany)));       // count past the channel max
-        const std::uint8_t shortBuf[] = { 1, 0, 0 };
-        assert(!applyWindowUpdate(cli, h, ByteSpan(shortBuf, sizeof shortBuf)));     // count 1 needs 4 bytes
-        const std::uint8_t longBuf[] = { 1, 0, 0, 5, 9 };
-        assert(!applyWindowUpdate(cli, h, ByteSpan(longBuf, sizeof longBuf)));       // trailing byte: not what the encoder emits
+        const std::uint8_t tooMany[]    = { maxChannelCount + 1 };
+        const std::uint8_t shortBuf[]   = { 1, 0, 0 };
+        const std::uint8_t longBuf[]    = { 1, 0, 0, 5, 9 };
         const std::uint8_t badChannel[] = { 1, 7, 0, 5 };
-        assert(!applyWindowUpdate(cli, h, ByteSpan(badChannel, sizeof badChannel))); // channel 7, only 1 configured
+
+        const bool rejEmpty   = applyWindowUpdate(cli, h, ByteSpan{});
+        const bool rejCount   = applyWindowUpdate(cli, h, ByteSpan(tooMany, sizeof tooMany));
+        const bool rejShort   = applyWindowUpdate(cli, h, ByteSpan(shortBuf, sizeof shortBuf));
+        const bool rejLong    = applyWindowUpdate(cli, h, ByteSpan(longBuf, sizeof longBuf));
+        const bool rejChannel = applyWindowUpdate(cli, h, ByteSpan(badChannel, sizeof badChannel));
+        assert(!rejEmpty);     // empty
+        assert(!rejCount);     // count past the channel max
+        assert(!rejShort);     // count 1 needs 4 bytes
+        assert(!rejLong);      // trailing byte: not what the encoder emits
+        assert(!rejChannel);   // channel 7, only 1 configured
 
         // A rejected update must leave credit exactly as it was: a two-entry update whose SECOND entry
         // names a channel we do not have used to write the first before returning false, desyncing the
         // channels it reached against the ones it did not.
-        const std::uint16_t before = cli.peerCredit[0];
+        const std::uint16_t before    = cli.peerCredit[0];
         const std::uint8_t  halfBad[] = { 2, 0, 0x00, 0x05, 7, 0x00, 0x09 };
-        assert(!applyWindowUpdate(cli, h, ByteSpan(halfBad, sizeof halfBad)));
+        const bool          rejHalf   = applyWindowUpdate(cli, h, ByteSpan(halfBad, sizeof halfBad));
+        assert(!rejHalf);
         assert(cli.peerCredit[0] == before);   // untouched, not 5
 
-        const std::uint16_t was = cli.peerCredit[0];
-        const std::uint8_t  good[] = { 1, 0, 0x01, 0x2C };                        // channel 0 <- 300
-        assert(applyWindowUpdate(cli, h, ByteSpan(good, sizeof good)));
+        const std::uint16_t was     = cli.peerCredit[0];
+        const std::uint8_t  good[]  = { 1, 0, 0x01, 0x2C };                        // channel 0 <- 300
+        const bool          applied = applyWindowUpdate(cli, h, ByteSpan(good, sizeof good));
+        assert(applied);
         assert(cli.peerCredit[0] == 300);
         assert(was != 300);
 
         // Credit is absolute, so a REORDERED update must not overwrite a newer one. UDP delivering an
         // older "0 free" behind a newer "300 free" would otherwise shut the window with the receiver
         // already unrestricted and silent -- a permanent stall.
-        const std::uint8_t stale[] = { 1, 0, 0x00, 0x00 };
-        assert(!applyWindowUpdate(cli, windowHeader(static_cast<std::uint16_t>(h.sequence.value - 1)),
-                                  ByteSpan(stale, sizeof stale)));
+        const std::uint8_t stale[]   = { 1, 0, 0x00, 0x00 };
+        const bool         rejStale  = applyWindowUpdate(cli, windowHeader(static_cast<std::uint16_t>(h.sequence.value - 1)),
+                                                         ByteSpan(stale, sizeof stale));
+        assert(!rejStale);
         assert(cli.peerCredit[0] == 300);
         const std::uint8_t fresher[] = { 1, 0, 0x00, 0x07 };
-        assert(applyWindowUpdate(cli, windowHeader(static_cast<std::uint16_t>(h.sequence.value + 1)),
-                                 ByteSpan(fresher, sizeof fresher)));
+        const bool         appliedNewer = applyWindowUpdate(cli, windowHeader(static_cast<std::uint16_t>(h.sequence.value + 1)),
+                                                            ByteSpan(fresher, sizeof fresher));
+        assert(appliedNewer);
         assert(cli.peerCredit[0] == 7);     // a strictly newer sequence still lands
     }
 

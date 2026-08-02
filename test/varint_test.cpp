@@ -90,15 +90,24 @@ int main() {
     // The decode allocation budget bounds MEMORY, which a wire-length check cannot: one wire byte can
     // materialize an arbitrarily large element, so element count says nothing about resident size.
     {
+        // chargeAlloc mutates the budget, so the call is hoisted out of assert(): inside one it would
+        // vanish under NDEBUG and take the state change with it.
         aether::Reader r{ nullptr, 0, 0 };
         const std::size_t budget = r.allocBudget;
         assert(budget > 0);
-        assert(aether::chargeAlloc(r, 10, 8));                  // ordinary charge
+
+        const bool ordinary = aether::chargeAlloc(r, 10, 8);
+        assert(ordinary);
         assert(r.allocBudget == budget - 80);
-        assert(!aether::chargeAlloc(r, budget, 1024));          // would exceed -> refused
-        assert(r.allocBudget == budget - 80);                   // ...and refusing costs nothing
-        assert(!aether::chargeAlloc(r, ~std::uint64_t{ 0 }, 4096));   // the division form cannot overflow
-        assert(!aether::chargeAlloc(r, 1, 0));                  // a zero element size is nonsense, not free
+
+        const bool tooBig = aether::chargeAlloc(r, budget, 1024);
+        assert(!tooBig);
+        assert(r.allocBudget == budget - 80);                   // refusing costs nothing
+
+        const bool wouldOverflow = aether::chargeAlloc(r, ~std::uint64_t{ 0 }, 4096);
+        assert(!wouldOverflow);                                 // the division form cannot overflow
+        const bool zeroEach = aether::chargeAlloc(r, 1, 0);
+        assert(!zeroEach);                                      // a zero element size is nonsense, not free
     }
 
     std::printf("aether varint OK: overlong + non-canonical rejected, bit-63 edge + u64 range round-trip, zigzag exact\n");
