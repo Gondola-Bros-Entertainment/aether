@@ -239,9 +239,3 @@ Deliberate design decisions, and what they cost you.
 - `maxReceiveBufferSize` is a per-collection capacity, not a standing queue depth: `peerProcess`
   hands every buffered message to the application each tick, so occupancy outlives a tick only if you
   drive `Connection` directly and skip that collection.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
-
-Built by Devon Tomlin (Novavero AI Inc.).
