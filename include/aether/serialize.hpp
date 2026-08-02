@@ -36,8 +36,12 @@ struct Writer {
     bool          ok{true};
 };
 
+// Overflow-proof for the same reason has() is, and written the same way: w.pos <= w.cap is an
+// invariant (every advance is bounds-checked first), so the subtraction cannot underflow, while the
+// additive form `w.pos + n > w.cap` wraps for an n near SIZE_MAX and then falsely passes -- which
+// would hand that n straight to the memcpy in writeBytes.
 inline bool fits(Writer& w, std::size_t n) noexcept {
-    if (w.pos + n > w.cap) w.ok = false;
+    if (n > w.cap - w.pos) w.ok = false;
     return w.ok;
 }
 
@@ -51,12 +55,29 @@ inline void writeBytes(Writer& w, const std::uint8_t* p, std::size_t n) noexcept
     if (fits(w, n)) { std::memcpy(w.buf + w.pos, p, n); w.pos += n; }
 }
 
+// Resident bytes ONE decode may commit. Wire length bounds the element COUNT of a container but never
+// its memory: a `vector<optional<Pod>>` element is a single wire byte when disengaged yet costs
+// sizeof(Pod) resident, and a vector of zero-field aggregates consumes no wire bytes at all -- measured
+// at 519x and 4089x expansion out of a 1200-byte datagram, which no count-based check can catch.
+// Charging what a decode actually allocates is the only bound that holds whatever the element type is.
+// Generous by default so ordinary payloads never notice; lower it on the Reader for a tighter limit.
+inline constexpr std::size_t defaultDecodeAllocBudget = std::size_t{ 8 } * 1024 * 1024;
+
 // ---- read cursor: plain data; read<T> consumes it, nullopt past the end ----
 struct Reader {
     const std::uint8_t* buf{};
     std::size_t         len{};
     std::size_t         pos{};
+    std::size_t         allocBudget = defaultDecodeAllocBudget;
 };
+
+// Charge `count` elements of `each` bytes against this decode's budget. False (decode fails) if it
+// would exceed it. The division form cannot overflow the way `count * each` would for a hostile count.
+inline bool chargeAlloc(Reader& r, std::uint64_t count, std::size_t each) noexcept {
+    if (each == 0 || count > r.allocBudget / each) return false;
+    r.allocBudget -= static_cast<std::size_t>(count) * each;
+    return true;
+}
 
 // Overflow-proof: r.pos <= r.len is an invariant (every advance is bounds-checked first), so the
 // subtraction never underflows -- and `n <= remaining` cannot wrap the way `r.pos + n <= r.len`

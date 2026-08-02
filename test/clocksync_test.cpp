@@ -4,7 +4,9 @@
 #include <aether/clocksync.hpp>
 
 #include <cassert>
+#include <cmath>
 #include <cstdio>
+#include <limits>
 
 int main() {
     constexpr double eps = 1e-6;
@@ -76,6 +78,40 @@ int main() {
         assert(cs2.offsetMs > expect - eps && cs2.offsetMs < expect + eps);
     }
 
-    std::printf("aether clocksync edge OK: best rtt decays upward off a fluke low, negative rtt rejected, offset EMA converges\n");
+    // ---- the offset error bound actually bounds the error ----
+    //
+    // Cristian's algorithm assumes the two one-way delays match; when they do not, the estimate is
+    // off by exactly (forward - reverse)/2, which is at most rtt/2. Half the tightest round-trip is
+    // therefore a true bound, and the API has to expose it: an asymmetric path biases the offset
+    // silently, and an app doing lag compensation cannot tell a shared timeline from a guess.
+    {
+        aether::ClockSync fresh;
+        // No sample yet: infinite, so a caller comparing against a threshold fails closed rather
+        // than reading "0ms of error" off an estimate that does not exist.
+        assert(!fresh.hasSample);
+        assert(aether::clockOffsetErrorBoundMs(fresh) == std::numeric_limits<double>::infinity());
+
+        // Simulate a path with one-way delays f and r, true clock offset 0. The pong observes
+        // t0 = 0, remote = f (the reply is stamped on arrival at the peer), t2 = f + r.
+        const auto check = [](double f, double r) {
+            aether::ClockSync cs;
+            for (int i = 0; i < 50; ++i) aether::clockSyncObserve(cs, 0.0, f, f + r);
+            const double bound = aether::clockOffsetErrorBoundMs(cs);
+            const double error = cs.offsetMs;            // true offset is 0, so the estimate IS the error
+            assert(cs.hasSample);
+            assert(bound > 0.0);
+            assert(std::fabs(error) <= bound + 1e-9);    // the bound holds
+            return error;
+        };
+
+        assert(std::fabs(check(25.0, 25.0)) < 1e-9);     // symmetric: no error at all
+        // asymmetric: the error is real, tracks (f - r)/2, and stays inside rtt/2
+        const double e1 = check(10.0, 90.0);
+        assert(e1 < -1.0 && std::fabs(e1 - (10.0 - 90.0) / 2.0) < 1e-6);
+        const double e2 = check(145.0, 5.0);
+        assert(e2 > 1.0 && std::fabs(e2 - (145.0 - 5.0) / 2.0) < 1e-6);
+    }
+
+    std::printf("aether clocksync edge OK: best rtt decays upward off a fluke low, negative rtt rejected, offset EMA converges, asymmetric-path error stays inside the reported bound\n");
     return 0;
 }

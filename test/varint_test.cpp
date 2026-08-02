@@ -56,6 +56,51 @@ int main() {
         }
     }
 
+    // Overlong encodings are rejected, not just overflowing ones. `80 ... 00` decodes to 0 in ten
+    // bytes, so without this one value has many valid wire forms -- which matters the moment an encoded
+    // form is ever hashed, compared, or length-budgeted. The encoder never emits these, and a decoder of
+    // untrusted bytes should not accept what it would never produce.
+    {
+        const std::uint8_t overlong0[] = { 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00 };
+        aether::Reader r0{ overlong0, sizeof overlong0, 0 };
+        assert(!aether::readVarU(r0));
+
+        const std::uint8_t overlong1[] = { 0x81, 0x00 };   // 1, written in two bytes instead of one
+        aether::Reader r1{ overlong1, sizeof overlong1, 0 };
+        assert(!aether::readVarU(r1));
+
+        // The canonical forms of the same values still decode.
+        const std::uint8_t zero[] = { 0x00 };
+        aether::Reader rz{ zero, sizeof zero, 0 };
+        const auto vz = aether::readVarU(rz);
+        assert(vz && *vz == 0);
+
+        const std::uint8_t one[] = { 0x01 };
+        aether::Reader ro{ one, sizeof one, 0 };
+        const auto vo = aether::readVarU(ro);
+        assert(vo && *vo == 1);
+
+        // A multi-byte value whose final byte is legitimately non-zero is unaffected.
+        const std::uint8_t big[] = { 0x80, 0x01 };   // 128
+        aether::Reader rb{ big, sizeof big, 0 };
+        const auto vb = aether::readVarU(rb);
+        assert(vb && *vb == 128);
+    }
+
+    // The decode allocation budget bounds MEMORY, which a wire-length check cannot: one wire byte can
+    // materialize an arbitrarily large element, so element count says nothing about resident size.
+    {
+        aether::Reader r{ nullptr, 0, 0 };
+        const std::size_t budget = r.allocBudget;
+        assert(budget > 0);
+        assert(aether::chargeAlloc(r, 10, 8));                  // ordinary charge
+        assert(r.allocBudget == budget - 80);
+        assert(!aether::chargeAlloc(r, budget, 1024));          // would exceed -> refused
+        assert(r.allocBudget == budget - 80);                   // ...and refusing costs nothing
+        assert(!aether::chargeAlloc(r, ~std::uint64_t{ 0 }, 4096));   // the division form cannot overflow
+        assert(!aether::chargeAlloc(r, 1, 0));                  // a zero element size is nonsense, not free
+    }
+
     std::printf("aether varint OK: overlong + non-canonical rejected, bit-63 edge + u64 range round-trip, zigzag exact\n");
     return 0;
 }

@@ -83,10 +83,23 @@ struct FragmentBuffer {
 struct FragmentAssembler {
     std::map<MessageId, FragmentBuffer> buffers;
     double      timeoutMs{};
-    int         maxBufferSize{};   // cap on total buffered fragment bytes
+    int         maxBufferSize{};   // cap on total buffered fragment bytes (payload + per-fragment overhead)
     int         maxBuffers{};      // cap on concurrent in-flight messages (distinct message ids)
     std::size_t currentSize{};
 };
+
+// Bookkeeping charged for holding one fragment, on top of its payload: a map node, the Bytes header,
+// and its own heap block. Counting payload alone made maxReassemblyBufferSize describe something other
+// than memory -- a flood of 7-byte fragments measured 80x the accounted total actually resident, so the
+// byte cap never bound at all and the real ceiling was maxBuffers * 255 * this. Approximate by nature;
+// the point is that it is not zero.
+inline constexpr std::size_t fragmentOverheadBytes = 80;
+
+// What a buffer costs against the cap. totalSize stays pure payload because the assembled message is
+// sized from it; the overhead is derived from the fragment count so the two can never drift.
+inline std::size_t fragmentBufferCharge(const FragmentBuffer& b) noexcept {
+    return b.totalSize + b.fragments.size() * fragmentOverheadBytes;
+}
 inline FragmentAssembler newFragmentAssembler(double timeoutMs, int maxSize, int maxBuffers) {
     return { {}, timeoutMs, maxSize, maxBuffers, 0 };
 }
@@ -100,7 +113,7 @@ inline FragmentAssembler newFragmentAssembler(double timeoutMs, int maxSize, int
 inline void cleanupFragments(FragmentAssembler& a, MonoTime now) {
     for (auto it = a.buffers.begin(); it != a.buffers.end(); ) {
         if (elapsedMs(it->second.lastFragmentAt, now) >= a.timeoutMs) {
-            a.currentSize -= it->second.totalSize;
+            a.currentSize -= fragmentBufferCharge(it->second);
             it = a.buffers.erase(it);
         } else {
             ++it;
@@ -113,7 +126,7 @@ inline bool expireOldestFragment(FragmentAssembler& a) {
     for (auto it = a.buffers.begin(); it != a.buffers.end(); ++it)
         if (oldest == a.buffers.end() || it->second.lastFragmentAt.ns < oldest->second.lastFragmentAt.ns) oldest = it;
     if (oldest == a.buffers.end()) return false;
-    a.currentSize -= oldest->second.totalSize;
+    a.currentSize -= fragmentBufferCharge(oldest->second);
     a.buffers.erase(oldest);
     return true;
 }
@@ -135,9 +148,10 @@ inline std::optional<Bytes> processFragment(FragmentAssembler& a, const std::uin
     auto it = a.buffers.find(msgId);
     if (it != a.buffers.end() && it->second.count != hdr->count) return std::nullopt;   // count disagreement
 
-    const std::size_t cap = static_cast<std::size_t>(a.maxBufferSize);                 // maxBufferSize > 0 (validateConfig)
-    if (fragSize > cap) return std::nullopt;                                           // one fragment larger than the whole cap -> reject
-    while (a.currentSize + fragSize > cap && expireOldestFragment(a)) {}               // evict oldest until it fits (the cap is enforced, not advisory)
+    const std::size_t cap    = static_cast<std::size_t>(a.maxBufferSize);              // maxBufferSize > 0 (validateConfig)
+    const std::size_t charge = fragSize + fragmentOverheadBytes;                       // what holding it really costs
+    if (charge > cap) return std::nullopt;                                             // one fragment larger than the whole cap -> reject
+    while (a.currentSize + charge > cap && expireOldestFragment(a)) {}                 // evict oldest until it fits (the cap is enforced, not advisory)
 
     it = a.buffers.find(msgId);
     if (it == a.buffers.end()) {
@@ -152,7 +166,7 @@ inline std::optional<Bytes> processFragment(FragmentAssembler& a, const std::uin
     if (hdr->index < buf.count && buf.fragments.find(hdr->index) == buf.fragments.end()) {
         buf.fragments.emplace(hdr->index, Bytes(fragData, fragData + fragSize));
         buf.totalSize      += fragSize;
-        a.currentSize      += fragSize;
+        a.currentSize      += charge;   // matches fragmentBufferCharge, so the running total cannot drift
         buf.lastFragmentAt  = now;   // progress: the idle-expiry clock restarts
     }
 
@@ -160,7 +174,7 @@ inline std::optional<Bytes> processFragment(FragmentAssembler& a, const std::uin
         Bytes out;
         out.reserve(static_cast<std::size_t>(buf.totalSize));
         for (const auto& kv : buf.fragments) out.insert(out.end(), kv.second.begin(), kv.second.end());
-        a.currentSize -= buf.totalSize;
+        a.currentSize -= fragmentBufferCharge(buf);
         a.buffers.erase(it);
         return out;
     }

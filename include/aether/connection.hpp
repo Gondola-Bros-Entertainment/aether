@@ -34,6 +34,18 @@ inline constexpr int          timeSyncPingBytes       = 8;      // TimeSyncPing 
 inline constexpr int          timeSyncPongBytes       = 16;     // TimeSyncPong payload: [u64 echoed ns][u64 responder ns]
 inline constexpr std::uint8_t channelWireFragmentFlag = 0x80;   // channel byte high bit: this wire is a fragment
 inline constexpr std::uint8_t channelWireChannelMask  = 0x07;   // channel byte low 3 bits: channel id (<= 8 channels)
+// --- receiver flow control ---
+// Credit the peer has not advertised yet. A receiver that is keeping up never advertises at all, so
+// this is the steady state on a healthy link and it must never throttle: 0xFFFF is far above any
+// reachable unacked count (messageBufferSize caps that at a few hundred).
+inline constexpr std::uint16_t peerCreditUnknown = 0xFFFF;
+// At or below this many free slots a channel counts as restricted: the receiver starts advertising,
+// and keeps the figure fresh, so the sender throttles before the buffer is flat out rather than
+// slamming into a closed window.
+inline constexpr int    windowLowCredit = 8;
+// Re-advertise cadence WHILE restricted. UDP loses packets, and a lost "window reopened" update
+// would otherwise wedge the sender permanently; this is the receiver-side persist timer.
+inline constexpr double windowRefreshMs = 250.0;
 static_assert(maxChannelCount <= channelWireChannelMask + 1, "channel id must fit the low bits of the channel wire byte");
 // channelWireSeqBytes / packetWireOverhead / effectivePayloadBudget / maxFragmentChunk are single-sourced
 // in config.hpp (MTU-derived sizing; validateConfig uses them to reject an unfragmentable maxMessageSize).
@@ -103,10 +115,22 @@ struct Connection {
     NonceCounter                 sendNonce{};
     ReplayWindow                 recvReplay{};                // 64-bit sliding window (replayWindowBits, crypto.hpp)
     bool                         pendingAck        = false;
-    bool                         dataSentThisTick  = false;
     ClockSync                    clockSync{};                 // estimated offset to the peer's clock
     MonoTime                     lastTimeSyncTime{};          // last TimeSyncPing send time
     MtuDiscovery                 mtuDiscovery{};              // path-MTU search; plpmtu feeds the coalescing budget
+    // --- receiver flow control (see maybeAdvertiseWindow) ---
+    std::array<std::uint16_t, maxChannelCount> peerCredit{};        // free receive slots the PEER last advertised
+    std::array<std::uint16_t, maxChannelCount> advertisedCredit{};  // what WE last told the peer
+    MonoTime                                   lastWindowAdvertise{};
+    bool                                       windowAdvertised = false;   // false => advertisedCredit means nothing yet
+    SequenceNum                                windowUpdateSeq{};          // sequence of the last WindowUpdate we sent
+    bool                                       windowUpdateAcked = true;   // false while one is unconfirmed -> keep re-sending
+    SequenceNum                                windowUpdateAppliedSeq{};   // sequence of the last one we APPLIED
+    bool                                       windowUpdateApplied = false;
+    // --- anti-amplification (see amplificationAllowsSend) ---
+    bool          pathValidated        = true;   // false until this address proves it RECEIVES
+    std::uint64_t unvalidatedRecvBytes = 0;      // bytes accepted from it while unvalidated
+    std::uint64_t unvalidatedSentBytes = 0;      // bytes we have sent to it while unvalidated
 };
 
 // --- construction ---
@@ -121,6 +145,17 @@ inline ReliableEndpoint newReliableEndpoint(const NetworkConfig& config) {
     return ep;
 }
 
+// Outgoing sequences start at 1: 0 is reserved so that "I have received nothing yet" is unambiguous.
+// getAckInfo has no way to say it -- before the first receive it reports the default remoteSeq 0 with
+// an empty bitfield, which is byte-for-byte a genuine acknowledgement of packet 0. The receive side
+// already guards this (onPacketsReceived refuses to advance from the default, and says why), but the
+// SEND side still emitted it: a peer that had heard nothing acked our packet 0, and if that packet
+// carried a reliable message that was lost, the sender marked it delivered and never retransmitted it
+// -- silent loss on a channel whose contract is no loss. Never sending 0 means no sent-ring record
+// exists for the sequence such a header names, so the false ack resolves to nothing. Wraparound
+// reaches 0 legitimately ~65k packets later, by which point both sides have long since received.
+inline constexpr SequenceNum firstSequence{ 1 };
+
 inline Connection newConnection(const NetworkConfig& config, std::uint64_t clientSalt, MonoTime now) {
     Connection c;
     c.config       = config;
@@ -128,6 +163,7 @@ inline Connection newConnection(const NetworkConfig& config, std::uint64_t clien
     c.lastSendTime = now;
     c.lastRecvTime = now;
     c.reliability  = newReliableEndpoint(config);
+    c.localSeq     = firstSequence;
 
     const int numChannels = std::min(config.maxChannels, maxChannelCount);   // the 3-bit channel wire field caps here
     c.channels.reserve(static_cast<std::size_t>(numChannels));
@@ -148,6 +184,7 @@ inline Connection newConnection(const NetworkConfig& config, std::uint64_t clien
     c.bandwidthUp   = newBandwidthTracker(bandwidthWindowMs);
     c.bandwidthDown = newBandwidthTracker(bandwidthWindowMs);
     c.mtuDiscovery  = newMtuDiscovery(config.mtu, config.mtuProbeCeiling, config.enableMtuDiscovery);
+    c.peerCredit.fill(peerCreditUnknown);   // until the peer says otherwise, assume it can keep up
     return c;
 }
 
@@ -159,10 +196,47 @@ inline SequenceNum         connRemoteSeq(const Connection& c) noexcept { return 
 inline std::uint8_t        channelCount(const Connection& c) noexcept { return static_cast<std::uint8_t>(c.channels.size()); }
 inline bool                clockSynced(const Connection& c) noexcept { return c.clockSync.hasSample; }
 inline double              clockOffsetMs(const Connection& c) noexcept { return c.clockSync.offsetMs; }
+// Bound on how wrong clockOffsetMs can be (see clockOffsetErrorBoundMs): read it before trusting
+// the offset, because an asymmetric path biases it silently.
+inline double              clockOffsetErrorMs(const Connection& c) noexcept { return clockOffsetErrorBoundMs(c.clockSync); }
+
+// --- anti-amplification ---
+//
+// A 0-RTT resume is authenticated by a MAC over the ECDH master, which proves the sender holds the
+// master -- it does NOT prove the sender is at the source address, and that address is attacker
+// chosen. So a replayed resume spoofed to a victim's address made the server open a full connection
+// there and stream game traffic at it for the whole connection timeout: tens of bytes in, seconds of
+// outbound at a target of the attacker's choosing. Requiring a challenge first would cost the round
+// trip that 0-RTT resume exists to avoid, so instead the connection comes up UNVALIDATED and may only
+// send a small multiple of what it has received, until a packet decrypts from that address -- which
+// only a peer actually there can produce. The real client sends immediately, so it lifts the cap on
+// its first packet and never notices; a spoofed victim sends nothing, so nothing is amplified at it.
+inline constexpr int amplificationFactor = 3;   // the usual anti-amplification ratio (QUIC uses 3x)
+
+inline bool amplificationAllowsSend(const Connection& c, int bytes) noexcept {
+    if (c.pathValidated) return true;
+    return c.unvalidatedSentBytes + static_cast<std::uint64_t>(bytes)
+           <= c.unvalidatedRecvBytes * static_cast<std::uint64_t>(amplificationFactor);
+}
+// A packet that decrypted came from a peer holding the key AND arrived from this address, which is
+// exactly the proof the cap was waiting for.
+inline void markPathValidated(Connection& c) noexcept {
+    c.pathValidated        = true;
+    c.unvalidatedRecvBytes = 0;
+    c.unvalidatedSentBytes = 0;
+}
 
 // --- header creation ---
-inline PacketHeader createHeaderInternal(const Connection& conn) {
+// EVERY header carries our current ack state, so building one discharges whatever ack was pending --
+// which is why pendingAck is cleared here rather than inferred at tick end from an empty send queue.
+// The queue cannot answer the question: a time-sync pong is queued while the incoming batch is still
+// being processed, so its header predates any packet that arrives later in that same batch. Testing
+// "did we queue anything" then suppressed the ack for a payload the pong could not have carried, and
+// the sender retransmitted it an RTO later. Clearing at the point the ack is actually snapshotted
+// ties the decision to ordering instead.
+inline PacketHeader createHeaderInternal(Connection& conn) {
     const auto [ackSeq, ackBits64] = getAckInfo(conn.reliability);
+    conn.pendingAck = false;
     return PacketHeader{ PacketType::Payload, conn.localSeq, ackSeq, static_cast<std::uint32_t>(ackBits64) };
 }
 // --- send-queue helpers ---
@@ -209,6 +283,112 @@ inline void sendTimeSyncPong(Connection& conn, std::uint64_t echoNs, MonoTime no
     putU64(payload.data() + 8, now.ns);   // our timestamp
     conn.sendQueue.push_back(OutgoingPacket{ header, PacketType::TimeSyncPong, std::move(payload) });
     conn.localSeq = next(conn.localSeq);
+}
+
+// --- receiver flow control: advertise, apply, gate ---
+//
+// Backpressure alone (withhold the ack, let the sender retransmit) never loses data silently, but the
+// sender only discovers the receiver's limit by retransmitting into it, and a receiver that stops
+// draining entirely burns the message's retry budget until it is dropped. An advertised credit lets
+// the sender stop BEFORE that: it stays queued, channelSend reports BufferFull, and the application
+// feels the backpressure instead of the wire eating a message.
+//
+// Credit is per CHANNEL (a stalled channel must not throttle the others), carried in its own packet
+// (a header field would cost bytes on every datagram to report something that rarely changes), and is
+// a limit INDEPENDENT of the congestion gates: those bound what the path can carry, this bounds what
+// the receiver can hold. Only reliable channels are governed, because nothing retransmits an
+// unreliable message and a refused one is a drop by contract, not backpressure.
+
+// [count:1] then count x [channel:1][freeSlots:2 BE].
+inline Bytes encodeWindowUpdate(const Connection& conn) {
+    const std::uint8_t n = static_cast<std::uint8_t>(conn.channels.size());
+    Bytes p;
+    p.reserve(1 + static_cast<std::size_t>(n) * 3);
+    p.push_back(n);
+    for (std::uint8_t i = 0; i < n; ++i) {
+        const int free = channelFreeReceiveSlots(conn.channels[i]);
+        const std::uint16_t v = free > 0xFFFF ? 0xFFFF : static_cast<std::uint16_t>(free);
+        p.push_back(i);
+        p.push_back(static_cast<std::uint8_t>(v >> 8));
+        p.push_back(static_cast<std::uint8_t>(v & 0xFF));
+    }
+    return p;
+}
+// Untrusted bytes: accept only exactly what the encoder emits, and never index a channel we do not
+// have. Validated in full BEFORE anything is written, so a rejected update leaves credit exactly as
+// it was -- half-applying one desyncs the channels it did reach against the ones it did not.
+inline bool applyWindowUpdate(Connection& conn, const PacketHeader& header, ByteSpan p) {
+    if (p.empty()) return false;
+    const std::size_t n = p[0];
+    if (n > maxChannelCount || p.size() != 1 + n * 3) return false;
+    for (std::size_t k = 0; k < n; ++k)
+        if (p[1 + k * 3] >= conn.channels.size()) return false;
+    // Credit is an absolute figure, not a delta, so a REORDERED update must never land: UDP delivering
+    // last tick's "0 free" after this tick's "16 free" would leave the sender believing the window is
+    // shut, and the receiver -- already unrestricted and steady -- has nothing further to say. Applying
+    // only strictly newer updates makes a late one a no-op instead of a stall.
+    if (conn.windowUpdateApplied && !newer(header.sequence, conn.windowUpdateAppliedSeq)) return false;
+    conn.windowUpdateApplied    = true;
+    conn.windowUpdateAppliedSeq = header.sequence;
+    for (std::size_t k = 0; k < n; ++k)
+        conn.peerCredit[p[1 + k * 3]] = getU16BE(p.data() + 1 + k * 3 + 1);
+    return true;
+}
+inline bool windowRestricted(const Channel& ch) noexcept {
+    return channelFreeReceiveSlots(ch) <= windowLowCredit;
+}
+// Advertise the receiver's ABSORPTION CAPACITY, and call this AFTER the application has collected --
+// both parts matter, and getting either wrong costs an order of magnitude.
+//
+// Measured before the collection, the credit is the buffer's instantaneous trough: a receiver that
+// drains fully every tick reads as "0 free" the moment a tick's arrivals land, even though it is
+// about to empty completely. The sender then stop-and-goes against a credit oscillating between 0
+// and the cap. Measured after, the figure is what the receiver can actually absorb before the next
+// collection, which is the number the sender needs.
+//
+// The first advertisement is unconditional, because capacity is not something the sender can guess:
+// until it hears one it assumes no limit, and an unpaced sender overruns the buffer every tick and
+// spends the difference on refusals and retransmits. On a full drain the figure never changes after
+// that, so the steady state is exactly one packet per connection.
+inline void maybeAdvertiseWindow(Connection& conn, MonoTime now) {
+    bool restricted = false, changed = !conn.windowAdvertised;   // the sender must learn the capacity at least once
+    for (std::size_t i = 0; i < conn.channels.size(); ++i) {
+        if (!channelIsReliable(conn.channels[i])) continue;
+        const Channel& ch  = conn.channels[i];
+        const int      free = channelFreeReceiveSlots(ch);
+        const bool     isR  = windowRestricted(ch);
+        const bool     wasR = conn.windowAdvertised && conn.advertisedCredit[i] <= windowLowCredit;
+        restricted = restricted || isR;
+        // Re-advertise on a crossing of the restricted threshold, or a move big enough to matter.
+        // A small wobble is not worth a packet.
+        const int adv   = static_cast<int>(conn.advertisedCredit[i]);
+        const int delta = free > adv ? free - adv : adv - free;
+        // Ceiling form of (delta * 4 >= cap): the product overflows int for a cap above INT_MAX/4,
+        // which validateConfig currently admits.
+        changed = changed || (isR != wasR) || (delta >= (ch.config.maxReceiveBufferSize + 3) / 4);
+    }
+    // Re-send while UNCONFIRMED, not merely while restricted. A WindowUpdate is not registered in the
+    // sent ring, so nothing retransmits it; the reopen that follows a drain is a single datagram, and
+    // once it is sent the receiver is unrestricted with a steady free count -- nothing left to trigger
+    // another. Losing that one datagram therefore left the sender at credit 0 with no way to ever hear
+    // otherwise, wedging the channel on a healthy link. Keying the persist timer off the peer's
+    // acknowledgement instead closes that: the reopen repeats every windowRefreshMs until a header
+    // covers it, which is the same proof-of-delivery an MTU probe uses.
+    const bool unconfirmed = !conn.windowUpdateAcked;
+    if (!changed && !((restricted || unconfirmed) && elapsedMs(conn.lastWindowAdvertise, now) >= windowRefreshMs)) return;
+
+    PacketHeader header = createHeaderInternal(conn);
+    header.type = PacketType::WindowUpdate;
+    conn.sendQueue.push_back(OutgoingPacket{ header, PacketType::WindowUpdate, encodeWindowUpdate(conn) });
+    conn.windowUpdateSeq   = conn.localSeq;   // confirmed by any header acking it (see processIncomingAcks)
+    conn.windowUpdateAcked = false;
+    conn.localSeq = next(conn.localSeq);
+    for (std::size_t i = 0; i < conn.channels.size(); ++i) {
+        const int free = channelFreeReceiveSlots(conn.channels[i]);
+        conn.advertisedCredit[i] = free > 0xFFFF ? 0xFFFF : static_cast<std::uint16_t>(free);
+    }
+    conn.lastWindowAdvertise = now;
+    conn.windowAdvertised    = true;
 }
 
 // The inner wire of a channel message: [seqHi][seqLo][payload] -- the exact bytes the receiver's
@@ -362,8 +542,7 @@ inline void flushPendingWires(Connection& conn, MonoTime now) {
             // immediately -- and the victim may have carried reliable bytes even when this packet does not.
             cwReleaseInFlight(*conn.cwnd, evicted);
         }
-        conn.localSeq         = next(conn.localSeq);
-        conn.dataSentThisTick = true;
+        conn.localSeq = next(conn.localSeq);
         i += n;
     }
     conn.pendingWires.clear();
@@ -410,13 +589,26 @@ inline bool receiveIncomingPayload(Connection& conn, ChannelId channelId, Sequen
     return onMessageReceived(conn.channels[static_cast<std::size_t>(idx)], chSeq, std::move(payload), now);
 }
 
+// Does this packet type need an acknowledgement of its OWN, promptly? Only one carrying something
+// the sender is waiting on: channel data (which may be reliable) and an MTU probe (whose ack IS the
+// discovery signal). A bare Keepalive -- which is also the wire form of an ack-only -- carries
+// nothing to confirm, and treating it as needing an ack is what made two idle peers trade one every
+// tick forever: each side's ack was itself acked, ~28x the keepalive cadence, on a link with no
+// application traffic at all. A time-sync ping is answered by a pong, whose header carries the ack.
+inline constexpr bool needsPromptAck(PacketType t) noexcept {
+    return t == PacketType::Payload || t == PacketType::PayloadBatch || t == PacketType::MtuProbe;
+}
+
 // Record that a packet arrived, so our next header acknowledges it. Called only once its payload has
 // been accepted: acking a message a full buffer refused tells the sender it was delivered, and it is
 // never sent again. Separate from processIncomingAcks for exactly that reason.
+//
+// The sequence is recorded for EVERY packet, so the ack bitfield stays exact whatever arrived; only
+// whether to answer it this tick depends on the type.
 inline void recordReceivedPacket(Connection& conn, const PacketHeader& header) {
     const SequenceNum sn = header.sequence;
     onPacketsReceived(conn.reliability, &sn, 1);
-    conn.pendingAck = true;
+    if (needsPromptAck(header.type)) conn.pendingAck = true;
 }
 
 // Process the peer's acknowledgements from an incoming header: drive cwnd, sample RTT, resolve the
@@ -434,15 +626,33 @@ inline void processIncomingAcks(Connection& conn, const PacketHeader& header, Mo
     if (conn.mtuDiscovery.probeSeq && ackCovers(header.ack, ackBits64, *conn.mtuDiscovery.probeSeq))
         mtuOnProbeAcked(conn.mtuDiscovery, now);
 
+    // Same trick for the last WindowUpdate: it carries no reliable messages either, so the sent ring
+    // never sees it and the header is the only proof it landed. Until one covers it, maybeAdvertiseWindow
+    // keeps re-sending -- a missed ack costs a repeat, never a wedged channel.
+    if (!conn.windowUpdateAcked && ackCovers(header.ack, ackBits64, conn.windowUpdateSeq))
+        conn.windowUpdateAcked = true;
+
     if (conn.cwnd) {
         // One header can BOTH confirm packets and (via a triple-NACK) reveal losses. The byte
         // accounting must happen either way -- acked and newly-lost bytes have both left the
         // network -- but a header that signalled congestion must not also grow the window.
+        //
+        // The congestion test is the lost-packet COUNT, not the fastRetransmit list: congestion is a
+        // property of the path, so any drop must shrink the window. Gating on fastRetransmit tied the
+        // window to RELIABLE loss alone, and an unreliable-only packet yields no fastRetransmit
+        // entries -- so on a stream of unreliable snapshots (what games mostly send) the window sat at
+        // its initial size through 40% loss while the AIMD controller correctly halved its rate.
+        //
+        // The ack side is symmetric, and gated on the packet COUNT for the same reason: growth itself is
+        // byte-driven (an unreliable packet's 0 bytes correctly grow nothing), but reaching cwOnAck is
+        // what ENDS fast recovery. Testing ackedBytes meant an unreliable-only ack never reached it, so
+        // one loss on a snapshot stream parked the window in Recovery until some reliable ack eventually
+        // arrived -- shrinking on all traffic while recovering on almost none.
         cwReleaseInFlight(*conn.cwnd, res.lostBytes);
-        if (!res.fastRetransmit.empty()) {
+        if (res.lostPackets > 0) {
             cwReleaseInFlight(*conn.cwnd, res.ackedBytes);
             cwOnLoss(*conn.cwnd);
-        } else if (res.ackedBytes > 0) {
+        } else if (res.ackedPackets > 0) {
             cwOnAck(*conn.cwnd, res.ackedBytes);
         }
     }
@@ -497,7 +707,16 @@ inline bool emitPacedFragments(Connection& conn, Channel& channel, int chIdx, Se
 // --- per-tick channel output ---
 inline void processChannelMessages(Connection& conn, MonoTime now, int chIdx) {
     Channel& channel = conn.channels[static_cast<std::size_t>(chIdx)];
+    // Receiver credit, counted once per tick and then tracked locally as messages are admitted:
+    // recomputing the unacked count per message would make this loop quadratic in the send buffer.
+    const bool creditGates = channelIsReliable(channel);
+    const int  credit      = creditGates ? static_cast<int>(conn.peerCredit[static_cast<std::size_t>(chIdx)]) : 0;
+    int        unacked     = creditGates ? channelUnackedCount(channel) : 0;
     for (;;) {
+        // The receiver has no room for another message. Leave it queued: the send buffer fills and
+        // channelSend reports BufferFull, so the application throttles instead of the sender burning
+        // this message's retries against a buffer that cannot take it.
+        if (creditGates && unacked >= credit) break;
         const ChannelMessage* peek = peekOutgoingMessage(channel);
         if (!peek) break;
         const SequenceNum seq        = peek->sequence;
@@ -512,6 +731,7 @@ inline void processChannelMessages(Connection& conn, MonoTime now, int chIdx) {
             // never render would re-qualify as a retransmit candidate every tick forever.
             if (count == 0) { channel.sendBuffer.erase(seq); channel.totalDropped += 1; continue; }
             if (!emitPacedFragments(conn, channel, chIdx, seq, count, chunk, now)) break;   // budget spent mid-message
+            if (creditGates) ++unacked;   // fully emitted, so committed: it now holds one receiver slot
             continue;
         }
 
@@ -528,11 +748,11 @@ inline void processChannelMessages(Connection& conn, MonoTime now, int chIdx) {
         commitOutgoingMessage(channel, seq, now);
         ccDeductBudget(conn.congestion, size);
         enqueuePayload(conn, isReliable, chIdx, seq, 0, std::move(wire));
+        if (creditGates) ++unacked;   // one more message the receiver must find room for
     }
 }
 
 inline void processChannelOutput(Connection& conn, MonoTime now) {
-    conn.dataSentThisTick = false;
     for (const int chIdx : conn.channelPriority)
         if (chIdx >= 0 && chIdx < static_cast<int>(conn.channels.size()))
             processChannelMessages(conn, now, chIdx);
@@ -542,18 +762,35 @@ inline void processChannelOutput(Connection& conn, MonoTime now) {
 inline void processRetransmissions(Connection& conn, MonoTime now, double rto) {
     for (int chIdx = 0; chIdx < static_cast<int>(conn.channels.size()); ++chIdx) {
         Channel& channel = conn.channels[static_cast<std::size_t>(chIdx)];
+        // A receiver will refuse anything it has no room for, and every refused attempt spends a retry
+        // the message only has so many of -- burning them against a shut window is exactly the drop the
+        // advertised credit exists to prevent. Not sending keeps the retry count where it is
+        // (commitRetransmit only runs on admission), so nothing is lost while it waits; the receiver's
+        // re-advertise is what guarantees the reopen is heard.
+        //
+        // The bound is the credit itself, not merely "credit != 0". Gating only at zero meant a receiver
+        // advertising 1 free slot still had EVERY expired message retransmitted at it each RTO: one was
+        // accepted and the rest refused, each refusal burning a retry, so a receiver hovering at one or
+        // two free slots for ~10 RTOs destroyed reliable messages anyway. Sending at most `credit` of
+        // them -- getRetransmitMessages yields oldest-first, so these are the ones most worth the slot --
+        // keeps the pressure exactly at what the receiver said it can take.
+        const bool creditGates = channelIsReliable(channel);
+        int        budget      = creditGates ? static_cast<int>(conn.peerCredit[static_cast<std::size_t>(chIdx)]) : 0;
+        if (creditGates && budget == 0) continue;
         for (const ChannelMessage* msg : getRetransmitMessages(channel, now, rto)) {   // pointers into the send buffer, no payload copy
+            if (creditGates && budget <= 0) break;   // the receiver's stated room is spent for this tick
             MessageWires mw = buildMessageWires(conn.config, chIdx, *msg);   // fragmented: only the pieces still unacked
             if (!mw.ok || mw.wires.empty()) continue;   // nothing missing left to resend
             int totalSize = 0;
             for (const MessageWire& w : mw.wires) totalSize += static_cast<int>(w.data.size());
-            // Retransmits are budget-gated but never window-gated: they carry data the peer is already
-            // missing, so blocking them behind a full window is exactly how a stalled connection stays
-            // stalled. They are still charged at flush, so the window sees them.
+            // Retransmits are budget-gated but never congestion-WINDOW-gated: they carry data the peer
+            // is already missing, so blocking them behind a full window is exactly how a stalled
+            // connection stays stalled. They are still charged at flush, so the window sees them.
             if (!ccCanSend(conn.congestion, totalSize)) break;   // budget gone -> leave the rest for next tick, state intact
             ccDeductBudget(conn.congestion, totalSize);
             const SequenceNum seq = msg->sequence;
             commitRetransmit(channel, seq, now);                 // advance send state only now that it is admitted
+            if (creditGates) --budget;                           // this one is claiming a receiver slot
             for (MessageWire& w : mw.wires)
                 enqueuePayload(conn, true, chIdx, seq, w.fragIndex, std::move(w.data));
         }
@@ -564,7 +801,7 @@ inline void processRetransmissions(Connection& conn, MonoTime now, double rto) {
 inline void resetConnection(Connection& conn) {
     const NetworkConfig& config = conn.config;
     conn.startTime        = std::nullopt;
-    conn.localSeq         = SequenceNum{ 0 };
+    conn.localSeq         = firstSequence;   // 0 stays reserved on a recycled connection too
     conn.sendQueue.clear();
     conn.pendingWires.clear();
     conn.clockSync        = ClockSync{};
@@ -572,7 +809,14 @@ inline void resetConnection(Connection& conn) {
     conn.disconnectTime   = std::nullopt;
     conn.disconnectRetries = 0;
     conn.pendingAck       = false;
-    conn.dataSentThisTick = false;
+    conn.peerCredit.fill(peerCreditUnknown);   // a recycled connection must not inherit the old peer's credit
+    conn.advertisedCredit.fill(0);
+    conn.lastWindowAdvertise = MonoTime{};
+    conn.windowAdvertised    = false;
+    conn.windowUpdateSeq     = SequenceNum{};
+    conn.windowUpdateAcked   = true;    // nothing outstanding on a fresh connection
+    conn.windowUpdateAppliedSeq = SequenceNum{};
+    conn.windowUpdateApplied    = false;
     for (Channel& ch : conn.channels) resetChannel(ch);
     conn.reliability  = newReliableEndpoint(config);
     // The window is transport state like everything else here: a recycled connection that kept the old
@@ -615,7 +859,10 @@ inline void updateConnectedPure(Connection& conn, MonoTime now) {
     flushPendingWires(conn, now);
     for (Channel& ch : conn.channels) channelUpdate(ch, now);
 
-    if (conn.pendingAck && !conn.dataSentThisTick) sendAckOnly(conn);
+    // An ack rides in the header of EVERY packet, and createHeaderInternal clears pendingAck as it
+    // snapshots one -- so anything still pending here is an ack no packet built this tick could have
+    // carried, and it needs a wire of its own.
+    if (conn.pendingAck) sendAckOnly(conn);
 
     const CongestionLevel binaryLevel = ccCongestionLevel(conn.congestion);
     const CongestionLevel windowLevel = conn.cwnd ? cwCongestionLevel(*conn.cwnd) : CongestionLevel::None;
@@ -675,7 +922,7 @@ inline void touchSendTime(Connection& conn, MonoTime now) { conn.lastSendTime = 
 inline void markConnected(Connection& conn, MonoTime now) {
     conn.state     = ConnectionState::Connected;
     conn.startTime = now;
-    conn.localSeq  = SequenceNum{ 0 };
+    conn.localSeq  = firstSequence;   // the first keyed packet must not be sequence 0 (see firstSequence)
 }
 
 inline void recordBytesSent(Connection& conn, int bytes, MonoTime now) {

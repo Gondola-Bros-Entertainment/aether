@@ -5,6 +5,8 @@
 // struct mutated by free functions.
 #pragma once
 
+#include <limits>
+
 namespace aether {
 
 inline constexpr double clockSyncEmaAlpha = 0.1;   // weight for samples that are not a new best
@@ -35,6 +37,24 @@ inline void clockSyncObserve(ClockSync& cs, double localSendMs, double remoteMs,
         // minimum, so the offset keeps tracking real clock drift instead of anchoring to one old sample.
         cs.bestRttMs += clockSyncEmaAlpha * (rtt - cs.bestRttMs);
     }
+}
+
+// How far the offset could be wrong, in milliseconds. Cristian's algorithm assumes the two one-way
+// delays are equal; when they are not, the estimate is off by exactly (forward - reverse) / 2, and
+// since forward + reverse is the round-trip, that error is at most rtt / 2 in magnitude. Half the
+// round-trip is therefore a true bound rather than a heuristic: a 5ms-out / 145ms-back path reads
+// exactly 70ms off, inside the 75ms its 150ms round-trip allows.
+//
+// The rtt used is bestRttMs, which is the DECAYING recent best (see clockSyncObserve), not a lifetime
+// minimum. That keeps the bound honest as a path changes -- a fluke-low sample from minutes ago would
+// otherwise report a tightness the current path no longer has -- at the cost of the bound widening
+// toward the prevailing RTT once the low sample stops recurring.
+//
+// Asymmetric routing is ordinary on real paths, so check this before doing lag compensation against
+// the offset: a large bound means the shared timeline is a guess. Infinity until a sample exists, so
+// a caller comparing against a threshold fails closed.
+inline double clockOffsetErrorBoundMs(const ClockSync& cs) noexcept {
+    return cs.hasSample ? cs.bestRttMs / 2.0 : std::numeric_limits<double>::infinity();
 }
 
 // Convert between the two timelines once an offset is known.

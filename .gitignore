@@ -10,3 +10,7 @@ compile_commands.json
 
 # local working docs (not published)
 CLAUDE.md
+# .claude is private by default; only shared project tooling is allowed through
+.claude/*
+!.claude/settings.json
+!.claude/skills/

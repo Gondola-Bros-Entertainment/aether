@@ -153,6 +153,86 @@ int main() {
         assert(c.cwnd->pendingBytes == 0);
     }
 
+    // ---- the congestion WINDOW must react to loss of unreliable-only packets ----
+    //
+    // processIncomingAcks gated cwOnLoss on res.fastRetransmit being non-empty. An unreliable-only
+    // packet is registered in the sent ring with msgCount 0 and size 0, so a triple-NACK on one
+    // produced a loss SAMPLE (the AIMD arm reacted) but no fastRetransmit entries and no lostBytes:
+    // the window never shrank. On the traffic shape games actually send -- a stream of unreliable
+    // snapshots -- New Reno sat at its initial size through 40% loss. The signal is the lost-packet
+    // COUNT, because congestion is a property of the path, not of a delivery mode.
+    {
+        NetworkConfig cfg;
+        cfg.useCwndCongestion = true;
+        cfg.channelConfigs    = { unreliableChannel() };
+        cfg.maxChannels       = 1;
+
+        Pair     p;
+        MonoTime now = connectPair(p, cfg, MonoTime{ 0 });
+
+        const double cwnd0 = p.client.connections.at(p.sp).cwnd->cwnd;
+        assert(cwnd0 > 0.0);
+
+        TestLinkConfig bad;
+        bad.lossRate  = 0.40;
+        bad.latencyNs = 30000000;
+        testLinkImpair(p.link, bad);
+
+        const Bytes payload(200, 0xAB);
+        for (int t = 0; t < 400; ++t) {
+            now = MonoTime{ now.ns + tickNs };
+            peerSend(p.client, p.sp, ChannelId{ 0 }, payload, now);
+            testLinkStep(p.link, now);
+        }
+
+        const Connection& c = p.client.connections.at(p.sp);
+        assert(c.reliability.totalLost > 0);                 // packets really were declared lost
+        assert(c.cwnd->cwnd < cwnd0);                        // ...and the WINDOW responded to them
+        assert(c.cwnd->phase != CongestionPhase::SlowStart);  // it left slow start on the loss episode
+        // window accounting is still untouched by unreliable traffic: nothing acks it, so charging
+        // it would leak the window shut.
+        assert(c.cwnd->bytesInFlight == 0);
+        assert(c.cwnd->pendingBytes == 0);
+    }
+
+    // ---- an idle connection must not trade an ack-only every tick ----
+    //
+    // recordReceivedPacket set pendingAck for ANY packet, and a bare ack-only goes out as a
+    // Keepalive -- so each side's ack was itself treated as needing an ack and the two ping-ponged
+    // at tick rate forever. On an idle link with zero application traffic that measured ~0.91
+    // packets per tick per side, about 28x the keepalive cadence. Only a packet carrying something
+    // the sender waits on (channel data, or an MTU probe whose ack is the discovery signal) earns a
+    // prompt ack now; the sequence is still recorded either way, so the ack bitfield stays exact.
+    {
+        NetworkConfig cfg;   // defaults: 1000ms keepalive, 1000ms time-sync, 10000ms timeout
+        Pair     p;
+        MonoTime now = connectPair(p, cfg, MonoTime{ 0 });
+
+        const std::uint64_t sent0 = peerStats(p.client, p.sp)->packetsSent;
+        const int           ticks = 300;   // 5 seconds at ~60Hz, nothing sent by the application
+        for (int t = 0; t < ticks; ++t) {
+            now = MonoTime{ now.ns + tickNs };
+            testLinkStep(p.link, now);
+        }
+        const std::uint64_t sent = peerStats(p.client, p.sp)->packetsSent - sent0;
+
+        // 5s of keepalives + time-sync pings + their pongs is ~15 packets, plus a short MTU search.
+        // The bound that matters is that this is a function of the CADENCES, not of the tick rate.
+        assert(sent > 0);                                    // the link stays alive
+        assert(sent < static_cast<std::uint64_t>(ticks) / 4);   // and nowhere near one per tick
+        assert(peerIsConnected(p.client, p.sp));             // no timeout from the quieter link
+        assert(peerIsConnected(p.server, p.cp));
+
+        // a reliable message must still be acked PROMPTLY, not held until the next keepalive
+        const Bytes msg(64, 0x11);
+        now = MonoTime{ now.ns + tickNs };
+        peerSend(p.client, p.sp, ChannelId{ 0 }, msg, now);
+        for (int t = 0; t < 8; ++t) { now = MonoTime{ now.ns + tickNs }; testLinkStep(p.link, now); }
+        const Connection& c = p.client.connections.at(p.sp);
+        assert(c.reliability.totalAcked > 0);                // the ack came back inside a few ticks
+        assert(c.channels[0].sendBuffer.empty());            // ...and retired the message
+    }
+
     // A reservation must never wrap the counter, and must survive a connection reset.
     {
         CongestionWindow cw = newCongestionWindow(1200);
@@ -163,6 +243,40 @@ int main() {
         cwOnSend(cw, 900, MonoTime{ 2 });            // flushed more than was reserved
         assert(cw.pendingBytes == 0);                // saturates at 0 rather than wrapping
         assert(cw.bytesInFlight == 1400);
+    }
+
+    // ---- a peer that has received nothing must not acknowledge anything ----
+    //
+    // getAckInfo cannot express "nothing received yet": before its first receive it reports the default
+    // remoteSeq 0 with an empty bitfield, which on the wire is a genuine ack of packet 0. So a peer that
+    // had heard nothing acked our packet 0 -- and if that packet carried a reliable message that was
+    // lost, the sender marked it delivered and never sent it again. Reserving sequence 0 (firstSequence)
+    // is what makes the two cases distinguishable: no record ever exists at the sequence such a header
+    // names.
+    {
+        NetworkConfig cfg;
+        const MonoTime now{ 0 };
+
+        Connection c = newConnection(cfg, 1234, now);
+        markConnected(c, now);
+        assert(c.localSeq != SequenceNum{ 0 });   // ...both on a fresh connection and on connect
+        resetConnection(c);
+        assert(c.localSeq != SequenceNum{ 0 });   // ...and on a recycled one
+
+        // Register a reliable packet at the first sequence we would actually send.
+        markConnected(c, now);
+        const SequenceNum first = c.localSeq;
+        assert(first == firstSequence);
+        onPacketSent(c.reliability, first, now, ChannelId{ 0 }, SequenceNum{ 0 }, 200);
+        assert(isInFlight(c.reliability, first));
+
+        // Now the peer's very first header, sent before it had received anything: ack = 0, bits = 0.
+        PacketHeader virgin{};
+        virgin.type    = PacketType::Keepalive;
+        virgin.ack     = SequenceNum{ 0 };
+        virgin.ackBits = 0;
+        processIncomingAcks(c, virgin, now);
+        assert(isInFlight(c.reliability, first));   // still in flight: nothing was falsely confirmed
     }
 
     std::printf("transport_stats_test: all assertions passed\n");

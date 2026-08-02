@@ -78,17 +78,21 @@ int main() {
         const aether::Address addrS = aether::addrLocalhost(50010);
         aether::NetPeer S = aether::newPeerState(addrS, cfg, aether::MonoTime{ 0 });
         const aether::PeerId attacker{ aether::addrLocalhost(40000) };
+        // Well-formed but uncookied: the reply is now a stateless retry cookie rather than a
+        // challenge, which is the reflection surface the rate gate has to bound.
         const aether::Packet req{ aether::PacketHeader{ aether::PacketType::ConnectionRequest,
-                                                        aether::SequenceNum{ 0 }, aether::SequenceNum{ 0 }, 0 }, {} };
+                                                        aether::SequenceNum{ 0 }, aether::SequenceNum{ 0 }, 0 },
+                                  aether::encodeConnectionRequest({}, {}) };
         const aether::MonoTime now{ 1000000 };
         const int floods = 100;
         for (int i = 0; i < floods; ++i) (void) aether::handleConnectionRequest(S, attacker, req, now);   // all at one instant
 
-        const std::size_t challenges = S.sendQueue.size();   // each queued reply is one challenge datagram
-        assert(challenges >= 1);     // the gate still lets legit requests through up to the rate
-        assert(challenges < 20);     // ...but bounds the flood -- not one reply per request (~100)
+        const std::size_t replies = S.sendQueue.size();   // each queued reply is one datagram back to the (spoofable) source
+        assert(replies >= 1);        // the gate still lets legit requests through up to the rate
+        assert(replies < 20);        // ...but bounds the flood -- not one reply per request (~100)
         assert(S.rateLimitDrops >= 60);
-        std::printf("aether connect-reflection OK: %zu challenges from %d spoofed requests (rate-gated)\n", challenges, floods);
+        assert(S.pending.empty());   // and a flood without a valid cookie allocates nothing at all
+        std::printf("aether connect-reflection OK: %zu retries from %d spoofed requests (rate-gated, 0 pending)\n", replies, floods);
     }
 
     std::printf("aether security tests OK\n");

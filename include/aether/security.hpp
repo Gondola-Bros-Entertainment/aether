@@ -75,6 +75,9 @@ inline std::optional<Bytes> validateAndStripCrc32(const Bytes& data) {
 
 // --- rate limiter (per-source connection-request throttle, self-cleaning) ---
 inline constexpr double cleanupIntervalMs     = 5000.0;
+// Minimum gap between the extra prunes taken when the table is AT capacity. Short enough to reclaim
+// space promptly under a flood, long enough that the prune cannot run once per arriving packet.
+inline constexpr double capacityPruneIntervalMs = 100.0;
 inline constexpr int    rateLimiterMaxSources = 4096;   // hard cap on tracked sources (spoof-flood memory shield)
 
 struct RateLimiter {
@@ -113,7 +116,12 @@ inline bool rateLimiterAllow(RateLimiter& rl, std::uint64_t addrKey, MonoTime no
     maybeCleanup(rl, now);
     auto it = rl.requests.find(addrKey);
     if (it == rl.requests.end() && static_cast<int>(rl.requests.size()) >= rl.maxTrackedSources) {
-        pruneRateLimiter(rl, now);   // at the cap: drop stale sources now, ignoring the 5s interval
+        // At the cap: drop stale sources rather than wait out the 5s interval -- but not on every
+        // packet. A flood from random sources reaches this branch with EVERY datagram, and an
+        // unconditional prune made each one pay a full O(maxTrackedSources) walk before any rate
+        // decision was taken, which is the flood doing more work per packet than the attacker does.
+        // One prune per capacityPruneIntervalMs recovers the space just as well and bounds the cost.
+        if (elapsedMs(rl.lastCleanup, now) >= capacityPruneIntervalMs) pruneRateLimiter(rl, now);
         if (static_cast<int>(rl.requests.size()) >= rl.maxTrackedSources) return false;   // still full -> shed
         // addrKey is new, so prune did not create it -- it stays end(), and the filter below is skipped
     }

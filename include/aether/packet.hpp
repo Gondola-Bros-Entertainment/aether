@@ -27,8 +27,12 @@ enum class PacketType : std::uint8_t {
     TimeSyncPing        = 9,   // clock sync: [u64 sender ns]
     TimeSyncPong        = 10,  // clock sync reply: [u64 echoed ns][u64 responder ns]
     MtuProbe            = 11,  // path-MTU probe: padding to a target datagram size, no app data (mtu.hpp)
+    ConnectionRetry     = 12,  // server -> client: echo this stateless cookie to prove routability (peer.hpp)
+    WindowUpdate        = 13,  // receiver -> sender: per-channel free receive slots (flow control)
+    PathChallenge       = 14,  // prove a candidate address can RECEIVE: [random:8], encrypted (peer.hpp)
+    PathResponse        = 15,  // echo of a PathChallenge: [random:8], encrypted
 };
-inline constexpr std::uint8_t packetTypeMax = 11;
+inline constexpr std::uint8_t packetTypeMax = 15;
 
 // The header fields, unpacked. Just data.
 struct PacketHeader {

@@ -71,6 +71,8 @@ struct PendingConnection {
     bool                         isReconnect   = false;   // this pending is a token reconnect, not a fresh handshake
     bool                         ephemeralReady = false;  // generate the keypair once (retransmit-stable)
     Bytes                        connectToken;            // client: the sealed token to present (and retransmit)
+    Bytes                        retryCookie;             // client: the stateless cookie to echo (empty until the server issues one)
+    int                          cookieHandoffs = 0;      // cookies accepted; bounded separately from retryCount
     std::uint64_t                playerId = 0;            // server: the verified identity from the client's token
 };
 
@@ -155,18 +157,26 @@ inline void genEphemeralKeypair(X25519Key& priv, X25519Key& pub) {
     x25519Base(pub, priv);
 }
 // The raw X25519 shared secret (a curve point); fed to the KDF below, never used as a key directly.
-// We deliberately skip RFC 7748's optional all-zero (low-order point) check: keys are ephemeral and
-// single-use, so the contributory-behaviour check buys nothing here (it matters for static keys),
-// and HChaCha20 mixes the secret before it ever keys a cipher.
-inline X25519Key x25519Shared(const X25519Key& priv, const X25519Key& peerPub) {
+//
+// RFC 7748 section 6.1's all-zero check IS performed, and nullopt means the handshake dies. All seven
+// low-order points produce an all-zero shared secret, so without it a peer could force the master to a
+// constant every party can compute -- and since resumeMaster caches that master, the resume MAC key
+// derived from it would be globally computable too, letting anyone mint a resume for such a session.
+// Cheap (one comparison) against a failure that is total, so this fails closed rather than reasoning
+// about whether ephemeral keys make it survivable.
+inline std::optional<X25519Key> x25519Shared(const X25519Key& priv, const X25519Key& peerPub) {
     X25519Key shared{};
     x25519(shared, priv, peerPub);
+    std::uint8_t acc = 0;
+    for (const std::uint8_t b : shared) acc = static_cast<std::uint8_t>(acc | b);   // branch-free: no timing signal
+    if (acc == 0) return std::nullopt;
     return shared;
 }
 // Split one shared secret into two independent directional keys via HChaCha20, domain-separated by
 // a direction byte and bound to a per-session salt. Distinct keys per direction mean the two halves
-// of the connection never share a (key, nonce); a fresh salt per session (every reconnect included)
-// means a resumed session never replays the original session's keystream.
+// of the connection never share a (key, nonce). A fresh salt per session separates reconnects from
+// the original -- but the salt alone is not what guarantees it, because the salt travels in cleartext
+// and can be replayed verbatim; ratchetResumeMaster is what makes the (secret, salt) pair unrepeatable.
 struct DirectionalKeys { EncryptionKey clientToServer{}; EncryptionKey serverToClient{}; };
 inline DirectionalKeys deriveDirectionalKeys(const X25519Key& shared, std::uint64_t salt) {
     const auto sub = [&](std::uint8_t dir) {
@@ -201,6 +211,29 @@ inline EncryptionKey deriveResumeKey(const X25519Key& master) {
     detail::hchacha20(master.data(), in, k.data());
     return k;
 }
+// Advance the master past a resume that has just been spent, so the chain is one-way.
+//
+// A resume request is cleartext and carries no single-use marker, so nothing in the blob itself stops
+// it being presented twice. Accepting one used to leave the master unchanged, and every session that
+// times out re-arms resumableTokens with that same master (updateConnections) -- so a captured request
+// became valid again on each generation. Re-keying from an unchanged master reproduced the earlier
+// session's keystream EXACTLY, because a resumed connection is a fresh Connection whose nonce counter
+// restarts at 0: two ciphertexts under one (key, nonce) recover each other by XOR, and two Poly1305
+// tags under one one-time key recover the MAC key. Ratcheting means the value stored for the next
+// resume can no longer verify the MAC that was just spent, so a captured request dies on first use and
+// no two sessions ever key from the same secret. Both peers ratchet with the same salt, so the real
+// client stays in step.
+//
+// This does not close the in-flight race -- an attacker replaying a captured resume BEFORE the real
+// client still wins it, which remains the documented 0-RTT trade-off. It closes the key reuse.
+inline X25519Key ratchetResumeMaster(const X25519Key& master, std::uint64_t salt) {
+    std::uint8_t in[16] = {};
+    putU64(in, salt);
+    in[8] = 3;   // 0/1 are the directional keys, 2 is the resume MAC key
+    X25519Key next{};
+    detail::hchacha20(master.data(), in, next.data());
+    return next;
+}
 inline std::array<std::uint8_t, 16> resumeMac(const X25519Key& master, std::uint64_t token, std::uint64_t freshSalt) {
     const EncryptionKey k = deriveResumeKey(master);
     std::uint8_t nonce[12] = {};
@@ -211,6 +244,85 @@ inline std::array<std::uint8_t, 16> resumeMac(const X25519Key& master, std::uint
     std::array<std::uint8_t, 16> tag{};
     aeadSeal(k.data(), nonce, aad, sizeof aad, nullptr, 0, nullptr, tag.data());   // empty plaintext: the tag is a MAC over (token, freshSalt)
     return tag;
+}
+
+// --- stateless retry cookie (return routability before the server allocates anything) ---
+//
+// A ConnectionRequest used to buy a half-open slot and an X25519 keypair from an address that had
+// proven nothing. The challenge echo stops a spoofed source COMPLETING a handshake, but not from
+// making the server hold that slot until it times out. So the server now answers an uncookied
+// request with a cookie it does not remember, and only a request echoing a valid one reaches the
+// token check, the pending table, or the keygen.
+//
+// The cookie is an AEAD tag over (source address, time epoch) under a per-peer CSPRNG secret: only
+// this server could have minted it, it is useless from any other address, and it expires on its own.
+// The nonce is a fresh random draw carried NEXT TO the tag rather than derived from the address,
+// because the tag is a Poly1305 one-time MAC -- sealing two different addresses under one (key,
+// nonce) pair would leak the MAC key and let anyone mint a cookie for any address.
+inline constexpr std::uint64_t cookieEpochNs   = 10ull * 1000000000ull;   // accepted in its own epoch or the one before, so a cookie lives 10-20s
+inline constexpr std::size_t   retryCookieSize = connectTokenNonceBytes + 16;   // [nonce:12][tag:16]
+
+inline std::uint64_t cookieEpochAt(MonoTime now) noexcept { return now.ns / cookieEpochNs; }
+
+// AAD = the raw source address bytes || the epoch. Binding the address is what makes a cookie
+// unusable from anywhere else; binding the epoch is what expires it.
+inline std::size_t buildCookieAad(const Address& addr, std::uint64_t epoch, std::uint8_t* out) noexcept {
+    const std::size_t n = addr.len <= addrStorageSize ? addr.len : addrStorageSize;
+    std::memcpy(out, addr.storage, n);
+    putU64(out + n, epoch);
+    return n + saltBytes;
+}
+
+inline Bytes makeRetryCookie(const EncryptionKey& secret, const Address& addr, MonoTime now) {
+    Bytes cookie(retryCookieSize);
+    secureRandomBytes(cookie.data(), connectTokenNonceBytes);   // unique per cookie: never reuse a (key, nonce)
+    std::uint8_t      aad[addrStorageSize + saltBytes];
+    const std::size_t aadLen = buildCookieAad(addr, cookieEpochAt(now), aad);
+    aeadSeal(secret.data(), cookie.data(), aad, aadLen, nullptr, 0, nullptr, cookie.data() + connectTokenNonceBytes);
+    return cookie;
+}
+
+inline bool retryCookieValid(const EncryptionKey& secret, const Address& addr, const Bytes& cookie, MonoTime now) {
+    if (cookie.size() != retryCookieSize) return false;
+    const std::uint64_t epoch = cookieEpochAt(now);
+    for (std::uint64_t back = 0; back < 2; ++back) {   // the previous epoch too, so a cookie does not die at a boundary
+        if (back > epoch) break;
+        std::uint8_t      aad[addrStorageSize + saltBytes];
+        const std::size_t aadLen = buildCookieAad(addr, epoch - back, aad);
+        std::uint8_t      tag[16];
+        aeadSeal(secret.data(), cookie.data(), aad, aadLen, nullptr, 0, nullptr, tag);
+        if (detail::constTimeEq(tag, cookie.data() + connectTokenNonceBytes, 16)) return true;
+    }
+    return false;
+}
+
+// ConnectionRequest payload framing: [cookieLen:1][cookie][body]. The body is what it always was --
+// empty, a sealed connect token, or a resume blob -- and a cookieLen of 0 means the client has not
+// been issued a cookie yet. The explicit length is what keeps those three body shapes tellable apart
+// now that something precedes them.
+inline Bytes encodeConnectionRequest(const Bytes& cookie, const Bytes& body) {
+    Bytes b;
+    b.reserve(1 + cookie.size() + body.size());
+    b.push_back(static_cast<std::uint8_t>(cookie.size()));
+    b.insert(b.end(), cookie.begin(), cookie.end());
+    b.insert(b.end(), body.begin(), body.end());
+    return b;
+}
+// What a ConnectionRequest carries besides the cookie: a resume blob for a reconnect, otherwise the
+// sealed connect token (empty when auth is off). Single-sourced so the first request and every retry
+// present exactly the same body -- the handshake is retransmit-stable by design.
+inline Bytes pendingRequestBody(const PendingConnection& p) {
+    return p.isReconnect ? encodeResume(p.clientSalt, p.reconnectSalt, p.resumeMac) : p.connectToken;
+}
+
+struct ConnectionRequestPayload { Bytes cookie; Bytes body; };
+inline std::optional<ConnectionRequestPayload> decodeConnectionRequest(const Bytes& p) {
+    if (p.empty()) return std::nullopt;
+    const std::size_t n = p[0];
+    if (n != 0 && n != retryCookieSize) return std::nullopt;   // only the two lengths the encoder ever emits
+    if (p.size() < 1 + n) return std::nullopt;
+    return ConnectionRequestPayload{ Bytes(p.begin() + 1, p.begin() + 1 + static_cast<std::ptrdiff_t>(n)),
+                                     Bytes(p.begin() + 1 + static_cast<std::ptrdiff_t>(n), p.end()) };
 }
 
 enum class DenyReason : std::uint8_t { ServerFull = 1, InvalidChallenge = 2, InvalidToken = 3 };
@@ -236,15 +348,30 @@ inline std::optional<std::pair<SequenceNum, ByteSpan>> decodeChannelSeq(ByteSpan
     return std::pair<SequenceNum, ByteSpan>{ chSeq, b.subspan(2) };
 }
 
-inline constexpr std::uint64_t fnvOffsetBasis = 14695981039346656037ull;
-inline constexpr std::uint64_t fnvPrime       = 1099511628211ull;
-inline std::uint64_t fnvMix(std::uint64_t h, std::uint64_t v) noexcept { return (h ^ v) * fnvPrime; }
-// Hash a remote address to a rate-limit key (FNV-1a over the raw address bytes).
-inline std::uint64_t sockAddrToKey(const Address& addr) noexcept {
-    std::uint64_t h = fnvOffsetBasis;
-    for (std::uint32_t i = 0; i < addr.len; ++i) h = fnvMix(h, addr.storage[i]);
-    return h;
-}
+// --- path validation (prove a candidate address can RECEIVE, before anything is committed to it) ---
+//
+// Decrypting a packet proves the sender holds the session key. It does NOT prove the sender is at the
+// address the datagram claims: a source address is unverified attacker-controlled data, and a REPLAYED
+// genuine packet decrypts perfectly. Migration used to move a connection on that evidence alone, so an
+// attacker who captured one payload packet and raced its copy in ahead of the original took the
+// connection to an address of its choosing -- the victim was then blackholed for migrationCooldownMs
+// while the server sent it everything, repeatable forever at one captured packet per cooldown.
+//
+// The fix is the standard one (QUIC's PATH_CHALLENGE): send fresh unpredictable bytes to the candidate
+// address, ENCRYPTED, and move nothing until they are echoed back from it. A replay attacker cannot
+// read the challenge, so it cannot answer; only a peer that both holds the key and actually receives at
+// that address can. The cost is one round trip before a migration completes, which is what path
+// validation costs everywhere it is done correctly.
+inline constexpr std::size_t pathChallengeBytes    = 8;
+inline constexpr double      pathValidationTimeoutMs = 3000.0;   // a challenge older than this is abandoned
+inline constexpr std::size_t maxPathValidations    = 64;         // bounded like every other attacker-reachable table
+
+struct PendingPathValidation {
+    PeerId                                     current{};      // where the connection lives while we validate
+    std::array<std::uint8_t, pathChallengeBytes> challenge{};   // CSPRNG, never reused
+    std::uint64_t                              token = 0;      // migration candidate token, for the cooldown
+    MonoTime                                   sentAt{};
+};
 
 // --- peer state ---
 inline constexpr double migrationCooldownMs       = 5000.0;
@@ -273,6 +400,9 @@ struct NetPeer {
     std::vector<RawPacket>               sendQueue;
     std::uint64_t                        rateLimitDrops = 0;
     TokenValidator                       tokenValidator{};   // connect-token replay defense (server side)
+    EncryptionKey                        cookieSecret{};     // per-peer secret behind the stateless retry cookie
+    std::uint64_t                        addrHashSeed = 0;   // per-peer seed so rate-limit buckets cannot be targeted
+    std::map<PeerId, PendingPathValidation> pathValidations; // candidate address -> outstanding challenge
 };
 
 inline NetPeer newPeerState(const Address& localAddr, const NetworkConfig& config, MonoTime now) {
@@ -281,15 +411,19 @@ inline NetPeer newPeerState(const Address& localAddr, const NetworkConfig& confi
     peer.config         = config;
     peer.rateLimiter    = newRateLimiter(config.rateLimitPerSecond, now);
     peer.tokenValidator = newTokenValidator(tokenReplayLifetimeMs, tokenReplayMaxTracked);
+    secureRandomBytes(peer.cookieSecret.data(), peer.cookieSecret.size());   // CSPRNG: a guessable secret would let anyone forge routability
+    peer.addrHashSeed = secureRandom64();   // unpredictable, so bucket collisions cannot be computed
     return peer;
 }
 
 // --- internal helpers ---
 inline void cleanupPeer(NetPeer& peer, const PeerId& pid)   { peer.fragmentAssemblers.erase(pid); }
 inline void removePending(NetPeer& peer, const PeerId& pid) { peer.pending.erase(pid); }
-inline bool isPostHandshake(PacketType t) noexcept { return t == PacketType::Payload || t == PacketType::PayloadBatch || t == PacketType::Keepalive || t == PacketType::Disconnect || t == PacketType::TimeSyncPing || t == PacketType::TimeSyncPong || t == PacketType::MtuProbe; }
+inline bool isPostHandshake(PacketType t) noexcept { return t == PacketType::Payload || t == PacketType::PayloadBatch || t == PacketType::Keepalive || t == PacketType::Disconnect || t == PacketType::TimeSyncPing || t == PacketType::TimeSyncPong || t == PacketType::MtuProbe || t == PacketType::WindowUpdate || t == PacketType::PathChallenge || t == PacketType::PathResponse; }
 
 inline Bytes frameCleartextDatagram(const PacketHeader& header, const Bytes& payload);
+inline Bytes sealDatagram(const EncryptionKey& key, NonceCounter counter, std::uint32_t protocolId,
+                          const PacketHeader& header, const Bytes& payload);
 
 // Handshake and control packets are cleartext by definition (there is no session key yet).
 inline void queueControlPacket(NetPeer& peer, PacketType ptype, const Bytes& payload, const PeerId& pid) {
@@ -298,13 +432,14 @@ inline void queueControlPacket(NetPeer& peer, PacketType ptype, const Bytes& pay
 }
 
 // --- handshake handlers ---
-inline std::vector<PeerEvent> handleNewConnectionRequest(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
-    // The per-source rate gate already ran in handleConnectionRequest (the sole caller); here the order
-    // is token-validate -> half-open cap -> client cap -> X25519 keygen, cheapest security check first
-    // so a flood without a valid token never reaches the keygen.
+inline std::vector<PeerEvent> handleNewConnectionRequest(NetPeer& peer, const PeerId& pid, const Bytes& body, MonoTime now) {
+    // The per-source rate gate and the retry-cookie check already ran in handleConnectionRequest (the
+    // sole caller), so the source address is proven reachable by the time anything here allocates.
+    // The order is token-validate -> half-open cap -> client cap -> X25519 keygen, cheapest security
+    // check first so a flood without a valid token never reaches the keygen.
     std::uint64_t playerId = 0;
     if (peer.config.tokenKey) {   // auth on: a valid sealed token gates everything below (incl. keygen) -- the DoS shield
-        const auto tr = validateConnectToken(*peer.config.tokenKey, peer.tokenValidator, pkt.payload, now);
+        const auto tr = validateConnectToken(*peer.config.tokenKey, peer.tokenValidator, body, now);
         if (tr.error) { queueControlPacket(peer, PacketType::ConnectionDenied, encodeDenyReason(DenyReason::InvalidToken), pid); return {}; }
         playerId = tr.playerId;
     }
@@ -330,13 +465,18 @@ inline std::vector<PeerEvent> handleConnectionRequest(NetPeer& peer, const PeerI
     // resume Accepted, the challenge resend, and a fresh request via handleNewConnectionRequest, its
     // sole caller, which trusts this gate) -- so a spoofed source cannot bounce an amplified stream off
     // the server.
-    if (!rateLimiterAllow(peer.rateLimiter, sockAddrToKey(pid.addr), now)) { peer.rateLimitDrops += 1; return {}; }
-    if (peer.connections.count(pid)) { queueControlPacket(peer, PacketType::ConnectionAccepted, {}, pid); return {}; }
+    if (!rateLimiterAllow(peer.rateLimiter, sockAddrToKey(pid.addr, peer.addrHashSeed), now)) { peer.rateLimitDrops += 1; return {}; }
+    const auto req = decodeConnectionRequest(pkt.payload);
+    if (!req) return {};   // malformed framing: not something a retry would fix
     // reconnect: a request carrying a recently-dropped session token re-establishes that session
     // fast, skipping the challenge -- the token (the original clientSalt) is the credential. The
     // token is a resumption ticket: it also restores the key the session negotiated, so a resume
     // stays encrypted and skips the key exchange too -- true QUIC-style 0-RTT resume.
-    if (const auto resume = decodeResume(pkt.payload)) {
+    //
+    // A resume needs no cookie: its MAC is over the ECDH master, which an off-path spoofer cannot
+    // produce, so it authenticates itself. Requiring a cookie round-trip here would defeat the whole
+    // point of a 0-RTT resume. A resume that fails the MAC falls through to the cookie gate below.
+    if (const auto resume = decodeResume(req->body)) {
         const auto rit = peer.resumableTokens.find(resume->token);
         if (rit != peer.resumableTokens.end() && rit->second.master && elapsedMs(rit->second.at, now) < resumeGraceMs
             && detail::constTimeEq(resumeMac(*rit->second.master, resume->token, resume->freshSalt).data(), resume->mac.data(), 16)) {
@@ -346,7 +486,10 @@ inline std::vector<PeerEvent> handleConnectionRequest(NetPeer& peer, const PeerI
                 queueControlPacket(peer, PacketType::ConnectionDenied, encodeDenyReason(DenyReason::ServerFull), pid);
                 return {};
             }
-            const X25519Key     master   = *rit->second.master;
+            // Ratchet as the resume is spent: this session keys from the ADVANCED master, and the
+            // advanced value is what a later timeout re-arms, so replaying these bytes can never
+            // reproduce this session's keys (see ratchetResumeMaster).
+            const X25519Key     master   = ratchetResumeMaster(*rit->second.master, resume->freshSalt);
             // The resume MAC proves possession of the ECDH master, which only the peer that completed
             // the original (token-validated) handshake holds -- so the identity that handshake verified
             // carries over. Without this a resumed session came up anonymous on a token-gated server.
@@ -355,6 +498,12 @@ inline std::vector<PeerEvent> handleConnectionRequest(NetPeer& peer, const PeerI
             peer.pending.erase(pid);
             Connection conn = newConnection(peer.config, resume->token, now);
             conn.playerId = playerId;
+            // The resume MAC proves master possession, never that this address receives -- a replayed
+            // resume spoofed at a victim would otherwise buy the attacker seconds of our outbound at a
+            // target it chose. Come up capped until a packet decrypts from here (see amplificationAllowsSend);
+            // the real client lifts it with its very first packet, so 0-RTT is preserved.
+            conn.pathValidated        = false;
+            conn.unvalidatedRecvBytes = static_cast<std::uint64_t>(pkt.payload.size()) + packetHeaderBytes;
             applySessionKeys(conn, master, resume->freshSalt, /*isServer=*/true);   // re-key from the client's fresh salt
             touchRecvTime(conn, now);
             markConnected(conn, now);
@@ -365,11 +514,60 @@ inline std::vector<PeerEvent> handleConnectionRequest(NetPeer& peer, const PeerI
         // No entry / expired / bad MAC falls through to a normal handshake. A bad MAC does NOT burn the
         // resumable, so a token-only observer cannot deny the real client its fast reconnect.
     }
+    // On a token-gated server, look at the token BEFORE minting a cookie. A 41-byte Retry answering a
+    // 14-byte request is ~3x amplification, and without this check a spoofed source got one for free --
+    // where previously it got only a 14-byte Denied, because the token was checked first. Reordering
+    // restores that: garbage now costs the attacker more than it costs us.
+    //
+    // This is deliberately openConnectToken, not validateConnectToken: the full validation RECORDS the
+    // token against replay, and doing that here would burn the real client's token on the uncookied
+    // first request, so its cookied retry would then be rejected as a replay. Opening the AEAD proves
+    // the token is ours and unexpired without consuming anything; the recording validation still runs
+    // once, past the cookie gate, in handleNewConnectionRequest.
+    if (peer.config.tokenKey && !decodeResume(req->body) && !openConnectToken(*peer.config.tokenKey, req->body, now)) {
+        queueControlPacket(peer, PacketType::ConnectionDenied, encodeDenyReason(DenyReason::InvalidToken), pid);
+        return {};
+    }
+    // Return-routability gate. Everything past this point either commits server state (a pending slot
+    // plus an X25519 keypair) or emits a reply several times the size of the request, so none of it
+    // happens for an address that has not echoed a cookie only this server could have minted. Minting
+    // one costs a single AEAD tag and remembers nothing.
+    if (!retryCookieValid(peer.cookieSecret, pid.addr, req->cookie, now)) {
+        queueControlPacket(peer, PacketType::ConnectionRetry, makeRetryCookie(peer.cookieSecret, pid.addr, now), pid);
+        return {};
+    }
+    if (peer.connections.count(pid)) { queueControlPacket(peer, PacketType::ConnectionAccepted, {}, pid); return {}; }
     if (const auto it = peer.pending.find(pid); it != peer.pending.end()) {
         queueControlPacket(peer, PacketType::ConnectionChallenge, encodeSaltAndKey(it->second.serverSalt, it->second.ephemeralPub), pid);
         return {};
     }
-    return handleNewConnectionRequest(peer, pid, pkt, now);
+    return handleNewConnectionRequest(peer, pid, req->body, now);
+}
+
+// Client side: the server handed us a cookie instead of a challenge. Store it and re-send the same
+// request carrying it.
+//
+// This must NOT spend the retransmission budget. A ConnectionRetry is unauthenticated (it necessarily
+// precedes any key), so an off-path attacker spoofing the server's address could send
+// connectionRequestMaxRetries of them, exhaust retryCount, and kill the connect attempt outright --
+// retryPendingConnections would never fire again and the client would report a timeout. A cookie
+// handoff is a protocol step, not a retransmission, so it gets its own small bound: enough for the
+// server to rotate its cookie secret across an epoch boundary, nowhere near enough to loop. Repeating
+// a cookie we already hold is ignored, so a replayed Retry costs nothing at all.
+inline constexpr int maxCookieHandoffs = 3;
+
+inline std::vector<PeerEvent> handleConnectionRetry(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
+    const auto it = peer.pending.find(pid);
+    if (it == peer.pending.end() || it->second.direction != ConnectionDirection::Outbound) return {};
+    if (pkt.payload.size() != retryCookieSize) return {};
+    if (it->second.cookieHandoffs >= maxCookieHandoffs) return {};
+    if (it->second.retryCookie == pkt.payload) return {};   // same cookie again -> nothing new to present
+    it->second.retryCookie = pkt.payload;
+    it->second.cookieHandoffs += 1;
+    it->second.lastRetry   = now;
+    queueControlPacket(peer, PacketType::ConnectionRequest,
+                       encodeConnectionRequest(it->second.retryCookie, pendingRequestBody(it->second)), pid);
+    return {};
 }
 inline std::vector<PeerEvent> handleConnectionChallenge(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime) {
     const auto it = peer.pending.find(pid);
@@ -380,6 +578,9 @@ inline std::vector<PeerEvent> handleConnectionChallenge(NetPeer& peer, const Pee
     if (!it->second.ephemeralReady) {   // generate our keypair once + capture the shared secret
         genEphemeralKeypair(it->second.ephemeralPriv, it->second.ephemeralPub);
         it->second.sessionShared  = x25519Shared(it->second.ephemeralPriv, sk->second);
+        // The shared secret is captured; the private scalar has no further use, so do not leave it
+        // sitting in the pending table (which lives until the handshake completes or times out).
+        detail::secureZero(it->second.ephemeralPriv.data(), it->second.ephemeralPriv.size());
         it->second.ephemeralReady = true;
     }
     queueControlPacket(peer, PacketType::ConnectionResponse,
@@ -411,10 +612,14 @@ inline std::vector<PeerEvent> handleConnectionResponse(NetPeer& peer, const Peer
         queueControlPacket(peer, PacketType::ConnectionDenied, encodeDenyReason(DenyReason::ServerFull), pid);
         return {};
     }
+    // Fail closed on a degenerate public key: a low-order point yields an all-zero shared secret that
+    // anyone can compute, so there is no session to bring up. Drop the pending rather than key from it.
+    const auto shared = x25519Shared(it->second.ephemeralPriv, resp->pub);
+    detail::secureZero(it->second.ephemeralPriv.data(), it->second.ephemeralPriv.size());   // used once, done
+    if (!shared) { removePending(peer, pid); return {}; }
     Connection conn = newConnection(peer.config, clientSalt, now);
     conn.playerId = it->second.playerId;   // the identity validated from the client's connect token (0 if auth off)
-    const X25519Key shared = x25519Shared(it->second.ephemeralPriv, resp->pub);
-    applySessionKeys(conn, shared, clientSalt, /*isServer=*/true);   // salt = the client's fresh salt
+    applySessionKeys(conn, *shared, clientSalt, /*isServer=*/true);   // salt = the client's fresh salt
     touchRecvTime(conn, now);
     markConnected(conn, now);
     const std::uint64_t playerId = conn.playerId;
@@ -431,7 +636,10 @@ inline std::vector<PeerEvent> handleConnectionAccepted(NetPeer& peer, const Peer
         applySessionKeys(conn, *it->second.sessionShared, it->second.clientSalt, /*isServer=*/false);
     } else if (const auto rit = peer.resumableTokens.find(it->second.clientSalt);
                rit != peer.resumableTokens.end() && rit->second.master) {
-        applySessionKeys(conn, *rit->second.master, it->second.reconnectSalt, /*isServer=*/false);   // re-key the resume
+        // Ratchet with the same salt the server used (the one we minted and sent), so both ends land
+        // on the identical advanced master and the resumed session keys match.
+        applySessionKeys(conn, ratchetResumeMaster(*rit->second.master, it->second.reconnectSalt),
+                         it->second.reconnectSalt, /*isServer=*/false);   // re-key the resume
         peer.resumableTokens.erase(rit);
     }
     // Fail closed: never bring up an unkeyed connection. This is reachable only when a reconnect
@@ -524,7 +732,7 @@ inline std::vector<PeerEvent> handleMigration(NetPeer& peer, const PeerId& newPi
     // must not be able to force an O(connections) scan + an AEAD-open per spoofed payload, and the
     // maxTrackedSources cap bounds the total even under a spoofed-source flood. A real migrating client
     // needs exactly one accepted attempt (it is keyed by the new address the moment it migrates).
-    if (!rateLimiterAllow(peer.rateLimiter, sockAddrToKey(newPid.addr), now)) { peer.rateLimitDrops += 1; return {}; }
+    if (!rateLimiterAllow(peer.rateLimiter, sockAddrToKey(newPid.addr, peer.addrHashSeed), now)) { peer.rateLimitDrops += 1; return {}; }
     const auto cand = findMigrationCandidate(peer, pkt, now);
     if (!cand) return {};
     if (const auto it = peer.migrationCooldowns.find(cand->token);
@@ -532,41 +740,100 @@ inline std::vector<PeerEvent> handleMigration(NetPeer& peer, const PeerId& newPi
     const auto connIt = peer.connections.find(cand->oldPeer);
     if (connIt == peer.connections.end() || !connIt->second.recvKey) return {};
 
-    // Path validation: only a peer that holds the session key may move a connection to a new address.
-    // Authenticate by decrypting with the candidate's key (an off-path attacker cannot forge a valid
-    // tag); the sequence match above is only a hint for WHICH connection to test, never the proof.
+    // KEY authentication: decrypting proves the sender holds the session key, so an off-path attacker
+    // cannot forge this. It is necessary but NOT sufficient to move the connection -- a replayed genuine
+    // packet decrypts just as well, and the source address is still unverified. The sequence match above
+    // is only a hint for WHICH connection to test, never the proof.
     std::uint8_t hdr[packetHeaderBytes];
     { Writer w{ hdr, sizeof hdr, 0, true }; writeHeader(w, pkt.header); }
     const auto dec = decrypt(*connIt->second.recvKey, peer.config.protocolId, hdr, packetHeaderBytes,
                              pkt.payload.data(), pkt.payload.size());
     if (!dec || !replayAccept(connIt->second.recvReplay, dec->counter.value)) return {};
 
+    // The payload is authentic, so deliver it on the connection where it already lives. Nothing about
+    // this packet justifies moving that connection, so nothing moves: the reply path is unchanged until
+    // the candidate address answers a challenge.
+    Connection& conn = connIt->second;
+    processIncomingAcks(conn, pkt.header, now);
+    touchRecvTime(conn, now);
+    const ByteSpan mpayload(dec->plaintext.data(), dec->plaintext.size());
+    if (routeDecryptedPayload(peer, cand->oldPeer, conn, pkt.header.type, mpayload, now))
+        recordReceivedPacket(conn, pkt.header);   // ack only what the channels took
+
+    // Probe the candidate. One outstanding challenge per address, refreshed once it expires, and the
+    // table is capped -- an attacker that can drive this path is already through the rate limiter, and
+    // must not be able to grow it without bound.
+    if (const auto ex = peer.pathValidations.find(newPid); ex != peer.pathValidations.end()) {
+        if (elapsedMs(ex->second.sentAt, now) < pathValidationTimeoutMs) return {};   // one in flight already
+        peer.pathValidations.erase(ex);
+    }
+    if (peer.pathValidations.size() >= maxPathValidations) return {};
+    if (!conn.sendKey || conn.sendNonce.value == UINT64_MAX) return {};   // fail closed: never send unencrypted
+
+    PendingPathValidation pv;
+    pv.current = cand->oldPeer;
+    pv.token   = cand->token;
+    pv.sentAt  = now;
+    secureRandomBytes(pv.challenge.data(), pv.challenge.size());   // unpredictable: the whole proof rests on this
+
+    PacketHeader ch = createHeaderInternal(conn);
+    ch.type = PacketType::PathChallenge;
+    const NonceCounter nonce = conn.sendNonce;
+    conn.sendNonce = NonceCounter{ nonce.value + 1 };
+    conn.localSeq  = next(conn.localSeq);
+    peer.sendQueue.push_back(RawPacket{ newPid,
+        sealDatagram(*conn.sendKey, nonce, peer.config.protocolId, ch,
+                     Bytes(pv.challenge.begin(), pv.challenge.end())) });
+    peer.pathValidations[newPid] = pv;
+    return {};   // no migration yet -- handlePathResponse completes it
+}
+
+// The candidate address echoed the challenge, so it demonstrably RECEIVES there and holds the key.
+// That is the full proof migration needs, and only now does anything move.
+inline std::vector<PeerEvent> handlePathResponse(NetPeer& peer, const PeerId& newPid, const Packet& pkt, MonoTime now) {
+    const auto pv = peer.pathValidations.find(newPid);
+    if (pv == peer.pathValidations.end()) return {};
+    if (elapsedMs(pv->second.sentAt, now) >= pathValidationTimeoutMs) { peer.pathValidations.erase(pv); return {}; }
+    const auto connIt = peer.connections.find(pv->second.current);
+    if (connIt == peer.connections.end() || !connIt->second.recvKey) { peer.pathValidations.erase(pv); return {}; }
+
+    std::uint8_t hdr[packetHeaderBytes];
+    { Writer w{ hdr, sizeof hdr, 0, true }; writeHeader(w, pkt.header); }
+    const auto dec = decrypt(*connIt->second.recvKey, peer.config.protocolId, hdr, packetHeaderBytes,
+                             pkt.payload.data(), pkt.payload.size());
+    if (!dec || !replayAccept(connIt->second.recvReplay, dec->counter.value)) return {};
+    if (dec->plaintext.size() != pathChallengeBytes) return {};
+    if (!detail::constTimeEq(dec->plaintext.data(), pv->second.challenge.data(), pathChallengeBytes)) return {};
+
+    const PeerId oldPid = pv->second.current;
+    const std::uint64_t token = pv->second.token;
+    peer.pathValidations.erase(pv);
+
     Connection migrated = std::move(connIt->second);
     peer.connections.erase(connIt);
     resetTransportMetrics(migrated, now);
     peer.connections[newPid] = std::move(migrated);
-    peer.migrationCooldowns[cand->token] = now;
-    if (const auto fa = peer.fragmentAssemblers.find(cand->oldPeer); fa != peer.fragmentAssemblers.end()) {
+    peer.migrationCooldowns[token] = now;
+    if (const auto fa = peer.fragmentAssemblers.find(oldPid); fa != peer.fragmentAssemblers.end()) {
         peer.fragmentAssemblers[newPid] = std::move(fa->second);
         peer.fragmentAssemblers.erase(fa);
     }
-    // Route the now-decrypted payload on the migrated connection -- same span path as the keyed receive.
     Connection& mconn = peer.connections[newPid];
     processIncomingAcks(mconn, pkt.header, now);
     touchRecvTime(mconn, now);
-    const ByteSpan mpayload(dec->plaintext.data(), dec->plaintext.size());
-    if (routeDecryptedPayload(peer, newPid, mconn, pkt.header.type, mpayload, now))
-        recordReceivedPacket(mconn, pkt.header);   // ack only what the channels took
-    return { evMigrated(cand->oldPeer, newPid) };
+    recordReceivedPacket(mconn, pkt.header);
+    return { evMigrated(oldPid, newPid) };
 }
 
 // Cold-path dispatch: control/handshake packets (cleartext) plus post-handshake packets from a peer we
 // have no keyed connection for. A keyed connection's post-handshake traffic is decrypted and routed in
-// handlePacket and never reaches here -- so Payload/PayloadBatch here is always a migration probe (path-
-// validated by decryption inside handleMigration), and TimeSync/Keepalive without a connection are noise.
+// handlePacket and never reaches here -- so Payload/PayloadBatch here is always a migration probe (which
+// handleMigration authenticates by decryption and then answers with a path challenge), PathResponse is
+// that challenge coming back, and TimeSync/Keepalive without a connection are noise.
 inline std::vector<PeerEvent> handlePacketByType(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now, PacketType ptype) {
     switch (ptype) {
         case PacketType::ConnectionRequest:   return handleConnectionRequest(peer, pid, pkt, now);
+        case PacketType::ConnectionRetry:     return handleConnectionRetry(peer, pid, pkt, now);
         case PacketType::ConnectionChallenge: return handleConnectionChallenge(peer, pid, pkt, now);
         case PacketType::ConnectionResponse:  return handleConnectionResponse(peer, pid, pkt, now);
         case PacketType::ConnectionAccepted:  return handleConnectionAccepted(peer, pid, now);
@@ -579,9 +846,14 @@ inline std::vector<PeerEvent> handlePacketByType(NetPeer& peer, const PeerId& pi
         case PacketType::Disconnect:    return handleDisconnect(peer, pid);
         case PacketType::Payload:
         case PacketType::PayloadBatch:  return handleMigration(peer, pid, pkt, now);
+        // The one packet type that is MEANT to arrive from an address we have no connection for: it is
+        // the candidate answering our challenge, and it is what completes a migration.
+        case PacketType::PathResponse:  return handlePathResponse(peer, pid, pkt, now);
         case PacketType::TimeSyncPing:
         case PacketType::TimeSyncPong:
         case PacketType::Keepalive:
+        case PacketType::WindowUpdate:
+        case PacketType::PathChallenge:
         case PacketType::MtuProbe:      return {};   // only meaningful on a keyed connection -> handled in handlePacket
     }
     return {};
@@ -615,6 +887,9 @@ inline std::vector<PeerEvent> handlePacket(NetPeer& peer, const PeerId& pid, con
                                       enc, encLen, scratch.data());
         if (!info) { conn.stats.decryptionFailures += 1; return {}; }
         if (!replayAccept(conn.recvReplay, info->counter.value)) return {};   // replayed or outside the window
+        // This packet decrypted AND arrived from this address, which is the proof an unvalidated path
+        // (a 0-RTT resume) was waiting for: only a peer actually there could have produced it.
+        if (!conn.pathValidated) markPathValidated(conn);
         const ByteSpan payload(scratch.data(), info->length);
 
         if (ptype == PacketType::Disconnect) {   // erases conn -- read the reason, then stop touching it
@@ -640,6 +915,23 @@ inline std::vector<PeerEvent> handlePacket(NetPeer& peer, const PeerId& pid, con
                     clockSyncObserve(conn.clockSync, static_cast<double>(getU64(payload.data())) / nsPerMs,
                                      static_cast<double>(getU64(payload.data() + 8)) / nsPerMs, static_cast<double>(now.ns) / nsPerMs);
                 break;
+            case PacketType::WindowUpdate:
+                applyWindowUpdate(conn, *header, payload);   // malformed or reordered is ignored; the peer re-sends until acked
+                break;
+            case PacketType::PathChallenge:
+                // Echo it straight back, encrypted. Answering proves we receive at this address; the
+                // challenge is unpredictable, so no observer can answer on our behalf. It rides the
+                // ordinary send queue because our view of the peer's address has not changed.
+                if (payload.size() == pathChallengeBytes) {
+                    PacketHeader resp = createHeaderInternal(conn);
+                    resp.type = PacketType::PathResponse;
+                    conn.sendQueue.push_back(OutgoingPacket{ resp, PacketType::PathResponse,
+                                                             Bytes(payload.begin(), payload.end()) });
+                    conn.localSeq = next(conn.localSeq);
+                }
+                break;
+            case PacketType::PathResponse:
+                break;   // a response on an ALREADY-current address proves nothing new; nothing to do
             default: break;   // Keepalive / MtuProbe: the header processing above is all they need
                               // (a probe's padding means nothing; ACKING it below is the discovery signal)
         }
@@ -721,9 +1013,17 @@ inline void drainAllConnectionQueues(NetPeer& peer, MonoTime now) {
         const std::vector<OutgoingPacket> connPackets = drainSendQueue(conn);
         std::vector<RawPacket>            raws        = encryptOutgoing(peer, pid, conn, connPackets);
         int bytesSent = 0;
-        for (const RawPacket& r : raws) bytesSent += static_cast<int>(r.data.size());
+        for (RawPacket& r : raws) {
+            const int n = static_cast<int>(r.data.size());
+            // Until the address proves it receives, hold to the anti-amplification ratio. Dropping here
+            // rather than at enqueue keeps the decision in one place: reliable data is still in the send
+            // buffer and retransmits once the cap lifts, and unreliable data is droppable by contract.
+            if (!amplificationAllowsSend(conn, n)) break;
+            if (!conn.pathValidated) conn.unvalidatedSentBytes += static_cast<std::uint64_t>(n);
+            bytesSent += n;
+            peer.sendQueue.push_back(std::move(r));
+        }
         if (bytesSent > 0) recordBytesSent(conn, bytesSent, now);   // zero would reset the keepalive timer
-        for (RawPacket& r : raws) peer.sendQueue.push_back(std::move(r));
     }
 }
 
@@ -744,6 +1044,10 @@ inline std::vector<PeerEvent> updateConnections(NetPeer& peer, MonoTime now) {
             for (std::uint8_t ch = 0; ch < numCh; ++ch)
                 for (Bytes& m : receiveMessage(conn, static_cast<ChannelId>(ch)))
                     events.push_back(evMessage(pid, static_cast<ChannelId>(ch), std::move(m)));
+            // Credit is advertised HERE, after the collection above, so it reports what the receiver
+            // can absorb before the next one rather than the trough it sits at mid-tick. The packet
+            // goes out with the rest of this tick's queue in drainAllConnectionQueues below.
+            maybeAdvertiseWindow(conn, now);
         }
     }
     for (const PeerId& pid : disconnected) { peer.connections.erase(pid); cleanupPeer(peer, pid); }
@@ -753,6 +1057,11 @@ inline std::vector<PeerEvent> updateConnections(NetPeer& peer, MonoTime now) {
     for (auto it = peer.resumableTokens.begin(); it != peer.resumableTokens.end();)
         if (elapsedMs(it->second.at, now) >= resumeGraceMs) it = peer.resumableTokens.erase(it);
         else                                             ++it;
+    // An unanswered path challenge is a candidate that never proved it receives -- drop it, so the table
+    // holds only live probes and a spoofed-source burst cannot pin entries until the connection ends.
+    for (auto it = peer.pathValidations.begin(); it != peer.pathValidations.end();)
+        if (elapsedMs(it->second.sentAt, now) >= pathValidationTimeoutMs) it = peer.pathValidations.erase(it);
+        else                                                              ++it;
     return events;
 }
 inline void retryPendingConnections(NetPeer& peer, MonoTime now) {
@@ -763,8 +1072,8 @@ inline void retryPendingConnections(NetPeer& peer, MonoTime now) {
         if (elapsedMs(pending.lastRetry, now) > retryInterval && pending.retryCount < cfg.connectionRequestMaxRetries) {
             pending.retryCount += 1;
             pending.lastRetry   = now;
-            const Bytes payload = pending.isReconnect ? encodeResume(pending.clientSalt, pending.reconnectSalt, pending.resumeMac) : pending.connectToken;
-            queueControlPacket(peer, PacketType::ConnectionRequest, payload, pid);
+            queueControlPacket(peer, PacketType::ConnectionRequest,
+                               encodeConnectionRequest(pending.retryCookie, pendingRequestBody(pending)), pid);
         }
     }
 }
@@ -813,7 +1122,7 @@ inline void peerConnect(NetPeer& peer, const PeerId& pid, MonoTime now) {
     pend.createdAt  = now;
     pend.lastRetry  = now;
     peer.pending[pid] = pend;
-    queueControlPacket(peer, PacketType::ConnectionRequest, {}, pid);
+    queueControlPacket(peer, PacketType::ConnectionRequest, encodeConnectionRequest({}, {}), pid);   // no cookie yet: the server answers with one
 }
 // Connect presenting a sealed connect token (minted by your auth backend). The server validates it
 // before doing any work; the verified playerId arrives on the server-side Connected event.
@@ -826,7 +1135,7 @@ inline void peerConnectWithToken(NetPeer& peer, const PeerId& pid, const Bytes& 
     pend.createdAt    = now;
     pend.lastRetry    = now;
     peer.pending[pid] = pend;
-    queueControlPacket(peer, PacketType::ConnectionRequest, token, pid);
+    queueControlPacket(peer, PacketType::ConnectionRequest, encodeConnectionRequest({}, token), pid);
 }
 // Reconnect a dropped session: present the token (captured while connected via peerSessionToken).
 // The server fast-paths it if still within the resume grace window; otherwise it is a normal connect.
@@ -845,7 +1154,8 @@ inline void peerReconnect(NetPeer& peer, const PeerId& pid, std::uint64_t token,
     pend.createdAt     = now;
     pend.lastRetry     = now;
     peer.pending[pid] = pend;
-    queueControlPacket(peer, PacketType::ConnectionRequest, encodeResume(token, freshSalt, mac), pid);
+    queueControlPacket(peer, PacketType::ConnectionRequest,
+                       encodeConnectionRequest({}, encodeResume(token, freshSalt, mac)), pid);   // a resume self-authenticates, so it needs no cookie
 }
 // Disconnect a peer, telling it why. The reason travels on the wire and arrives as the remote's
 // Disconnected event, so a server can distinguish a kick from an ordinary close (default Requested).

@@ -1128,14 +1128,35 @@ int main() {
         std::vector<aether::IncomingPacket> fromNew;
         for (const auto& p : ra.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) fromNew.push_back(aether::IncomingPacket{ idA2, *s });
 
+        // Decrypting proves KEY possession, not that the sender receives at the address it claims -- a
+        // replayed genuine packet decrypts too. So this authentic packet is delivered on the connection
+        // where it already lives, and the new address gets a challenge; nothing moves yet.
         const auto rb = aether::peerProcess(B, aether::MonoTime{ t }, fromNew);
         bool migrated = false, gotMsg = false;
         for (const auto& e : rb.events) {
             if (e.kind == aether::PeerEvent::Migrated)                                      migrated = true;
             if (e.kind == aether::PeerEvent::Message && e.data == aether::Bytes{ 9, 8, 7 }) gotMsg   = true;
         }
-        assert(migrated && gotMsg);
+        assert(gotMsg);                                   // the payload is authentic, so it is delivered
+        assert(!migrated);                                // ...but the path is still unproven
+        assert(aether::peerIsConnected(B, idA) && !aether::peerIsConnected(B, idA2));
+        assert(B.pathValidations.count(idA2) == 1);       // a challenge is outstanding to the candidate
+
+        // Deliver B's challenge to A (A's view of B is unchanged, so it arrives from idB), and carry A's
+        // answer back tagged from the new address. Only that echo completes the move.
+        std::vector<aether::IncomingPacket> toA2;
+        for (const auto& p : rb.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toA2.push_back(aether::IncomingPacket{ idB, *s });
+        t += 1000000;
+        const auto ra2 = aether::peerProcess(A, aether::MonoTime{ t }, toA2);
+        std::vector<aether::IncomingPacket> answer;
+        for (const auto& p : ra2.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) answer.push_back(aether::IncomingPacket{ idA2, *s });
+
+        t += 1000000;
+        const auto rb2 = aether::peerProcess(B, aether::MonoTime{ t }, answer);
+        for (const auto& e : rb2.events) if (e.kind == aether::PeerEvent::Migrated) migrated = true;
+        assert(migrated);
         assert(aether::peerIsConnected(B, idA2) && !aether::peerIsConnected(B, idA));   // moved to the new address
+        assert(B.pathValidations.empty());                                              // and the probe is retired
 
         // a spoofed Payload from a stranger (valid header/seq, undecryptable body), past the migration
         // cooldown so the decrypt is the actual gate -- must NOT migrate the connection.
@@ -1143,10 +1164,61 @@ int main() {
         const aether::PeerId idX{ aether::addrLocalhost(7009) };
         const aether::PacketHeader sh{ aether::PacketType::Payload, aether::connRemoteSeq(B.connections.at(idA2)), aether::SequenceNum{ 0 }, 0 };
         const aether::Bytes spoof = aether::serializePacket(aether::Packet{ sh, aether::Bytes(40, 0x5A) });
-        const auto rb2 = aether::peerProcess(B, aether::MonoTime{ t }, { aether::IncomingPacket{ idX, spoof } });
-        for (const auto& e : rb2.events) assert(e.kind != aether::PeerEvent::Migrated);
+        const auto rbSpoof = aether::peerProcess(B, aether::MonoTime{ t }, { aether::IncomingPacket{ idX, spoof } });
+        for (const auto& e : rbSpoof.events) assert(e.kind != aether::PeerEvent::Migrated);
+        assert(B.pathValidations.count(idX) == 0);   // undecryptable: not even worth a challenge
         assert(!aether::peerIsConnected(B, idX) && aether::peerIsConnected(B, idA2));
-        std::printf("aether migration OK: encrypted packet from a new address migrates; spoof does not\n");
+
+        std::printf("aether migration OK: path-validated move; undecryptable spoof refused\n");
+    }
+
+    // The real hijack: a CAPTURED GENUINE packet, replayed from the attacker's address ahead of the
+    // original. It decrypts perfectly and passes the replay window (the attacker's copy is the one that
+    // arrives first), so key possession alone would have moved the connection to the attacker -- the
+    // victim then blackholed for the whole migration cooldown while the server sent it everything,
+    // repeatable at one captured packet per cooldown. Only the challenge stops it: the attacker cannot
+    // read fresh encrypted bytes, so it can never echo them.
+    {
+        const aether::NetworkConfig cfg;
+        const aether::PeerId idA{ aether::addrLocalhost(7020) }, idB{ aether::addrLocalhost(7021) },
+                             idEvil{ aether::addrLocalhost(7022) };
+        aether::NetPeer A = aether::newPeerState(idA.addr, cfg, aether::MonoTime{ 0 });
+        aether::NetPeer B = aether::newPeerState(idB.addr, cfg, aether::MonoTime{ 0 });
+        aether::peerConnect(A, idB, aether::MonoTime{ 0 });
+
+        std::vector<aether::IncomingPacket> toA, toB;
+        std::uint64_t t = 0;
+        for (int k = 0; k < 12 && !(aether::peerIsConnected(A, idB) && aether::peerIsConnected(B, idA)); ++k) {
+            t += 1000000;
+            const auto ra = aether::peerProcess(A, aether::MonoTime{ t }, toA); toA.clear();
+            const auto rb = aether::peerProcess(B, aether::MonoTime{ t }, toB); toB.clear();
+            for (const auto& p : ra.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toB.push_back(aether::IncomingPacket{ idA, *s });
+            for (const auto& p : rb.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) toA.push_back(aether::IncomingPacket{ idB, *s });
+        }
+        assert(aether::peerIsConnected(A, idB) && aether::peerIsConnected(B, idA));
+
+        aether::peerSend(A, idB, aether::ChannelId{ 0 }, aether::Bytes{ 4, 4, 4 }, aether::MonoTime{ t });
+        t += 1000000;
+        const auto raCap = aether::peerProcess(A, aether::MonoTime{ t }, {});
+        std::vector<aether::IncomingPacket> replayed;
+        for (const auto& p : raCap.outgoing) if (auto s = aether::validateAndStripCrc32(p.data)) replayed.push_back(aether::IncomingPacket{ idEvil, *s });
+        assert(!replayed.empty());
+
+        t += 1000000;
+        const auto rbEvil = aether::peerProcess(B, aether::MonoTime{ t }, replayed);
+        for (const auto& e : rbEvil.events) assert(e.kind != aether::PeerEvent::Migrated);
+        assert(aether::peerIsConnected(B, idA) && !aether::peerIsConnected(B, idEvil));
+
+        // The attacker is challenged but cannot answer, so the probe expires and the connection never
+        // moves. Only B ticks here: the point is that no answer ever arrives.
+        for (int k = 0; k < 6; ++k) {
+            t += 1000ull * 1000000;
+            const auto rbIdle = aether::peerProcess(B, aether::MonoTime{ t }, {});
+            for (const auto& e : rbIdle.events) assert(e.kind != aether::PeerEvent::Migrated);
+        }
+        assert(!aether::peerIsConnected(B, idEvil));
+        assert(B.pathValidations.empty());   // the unanswered probe was swept, not left pinned
+        std::printf("aether migration OK: a replayed genuine packet cannot hijack the path\n");
     }
 
     // connect-token auth: a server with a token key requires a valid sealed token. A client that
@@ -1632,7 +1704,7 @@ int main() {
         std::array<std::uint8_t, 16> badMac{};   // all-zero: not a valid tag
         const aether::Bytes forged = aether::serializePacket(aether::Packet{
             aether::PacketHeader{ aether::PacketType::ConnectionRequest, aether::SequenceNum{ 0 }, aether::SequenceNum{ 0 }, 0 },
-            aether::encodeResume(*token, 0x1234u, badMac) });
+            aether::encodeConnectionRequest({}, aether::encodeResume(*token, 0x1234u, badMac)) });
         t += 1000000;
         const auto rf = aether::peerProcess(B, aether::MonoTime{ t }, { aether::IncomingPacket{ idF, forged } });
         for (const auto& e : rf.events) assert(e.kind != aether::PeerEvent::Reconnected);
@@ -1658,11 +1730,23 @@ int main() {
         cfg.maxPending = 3;
         cfg.maxClients = 64;                                          // deliberately != maxPending, to prove which one caps pending
         aether::NetPeer S = aether::newPeerState(aether::addrAny(7200), cfg, aether::MonoTime{ 0 });
-        for (int i = 0; i < 10; ++i) {                                // 10 distinct sources, one ConnectionRequest each
+        const auto rawRequest = [](const aether::Bytes& payload) {
+            return aether::serializePacket(aether::Packet{
+                aether::PacketHeader{ aether::PacketType::ConnectionRequest, aether::SequenceNum{ 0 }, aether::SequenceNum{ 0 }, 0 }, payload });
+        };
+        for (int i = 0; i < 10; ++i) {                                // 10 distinct sources, each walking the retry-cookie exchange
             const aether::PeerId from{ aether::addrV4(0x0B000000u + static_cast<std::uint32_t>(i), 5000) };
-            const aether::Bytes req = aether::serializePacket(aether::Packet{
-                aether::PacketHeader{ aether::PacketType::ConnectionRequest, aether::SequenceNum{ 0 }, aether::SequenceNum{ 0 }, 0 }, {} });
-            aether::peerProcess(S, aether::MonoTime{ 1000000 }, { aether::IncomingPacket{ from, req } });
+            // uncookied first: earns a cookie and commits nothing
+            const auto r = aether::peerProcess(S, aether::MonoTime{ 1000000 },
+                { aether::IncomingPacket{ from, rawRequest(aether::encodeConnectionRequest({}, {})) } });
+            assert(r.outgoing.size() == 1);
+            const auto stripped = aether::validateAndStripCrc32(r.outgoing[0].data);
+            assert(stripped);
+            const auto retry = aether::deserializePacket(*stripped);
+            assert(retry && retry->header.type == aether::PacketType::ConnectionRetry);
+            // ...then echo it, which is what actually opens a pending
+            aether::peerProcess(S, aether::MonoTime{ 1000000 },
+                { aether::IncomingPacket{ from, rawRequest(aether::encodeConnectionRequest(retry->payload, {})) } });
         }
         assert(static_cast<int>(S.pending.size()) == cfg.maxPending);   // capped at maxPending (3), not maxClients (64)
         std::printf("aether maxPending OK: half-open table capped at %d (distinct from maxClients)\n", cfg.maxPending);

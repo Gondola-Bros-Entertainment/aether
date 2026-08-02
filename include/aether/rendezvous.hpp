@@ -5,6 +5,8 @@
 // normal aether handshake completes over the direct path. Data-first: plain structs + free functions.
 #pragma once
 
+#include "aether/random.hpp"
+#include "aether/security.hpp"
 #include "aether/serialize.hpp"
 #include "aether/socket.hpp"
 #include "aether/types.hpp"
@@ -77,10 +79,18 @@ inline constexpr double rendezvousTtlMs    = 300000.0;   // drop a waiting peer 
 inline constexpr int    rendezvousMaxRooms = 4096;       // hard cap on each room table (waiting + sessions): a Register-flood memory shield
 
 struct RendezvousSession { Address a; Address b; MonoTime at; };   // the paired peers + last activity
+// A rendezvous is a PUBLIC host by definition, so every frame it accepts is attacker-reachable and
+// must be rate limited per source. Seeded from the CSPRNG at construction for the same reason the peer
+// limiter is: an unseeded FNV key can be inverted to compute an address that shares a victim's bucket.
+inline constexpr int rendezvousMaxRequestsPerSecond = 10;
+
 struct RendezvousServer {
     std::map<std::uint64_t, std::pair<Address, MonoTime>> waiting;    // roomId -> (first peer, when it registered)
     std::map<std::uint64_t, RendezvousSession>            sessions;   // roomId -> the paired peers, for relaying
     int                                                   maxRooms = rendezvousMaxRooms;   // hard cap on each table (flood shield)
+    RateLimiter   limiter        = newRateLimiter(rendezvousMaxRequestsPerSecond, MonoTime{});
+    std::uint64_t addrHashSeed   = secureRandom64();
+    std::uint64_t rateLimitDrops = 0;
 };
 
 // Evict the stalest entry of a table at the room cap -- a count-based flood shield complementing the
@@ -110,7 +120,20 @@ inline std::vector<std::pair<Address, Bytes>> rendezvousProcess(
 
     std::vector<std::pair<Address, Bytes>> out;
     for (const auto& [src, data] : incoming) {
+        // Rate limit BEFORE parsing anything. Unlimited, this server is a free reflector: two spoofed
+        // 9-byte Registers for one room make it send two ~20-byte Paired replies to addresses of the
+        // attacker's choosing (and leak each victim's address to the other), and a Register flood
+        // evicts every legitimate waiter through evictOldestWaiting.
+        if (!rateLimiterAllow(rv.limiter, sockAddrToKey(src, rv.addrHashSeed), now)) { rv.rateLimitDrops += 1; continue; }
         if (const auto room = decodeRegister(data)) {
+            // A room with a LIVE relay session must not be re-pairable by a third party. Presenting a
+            // known room id used to fall through to the waiting branch, and the next registration then
+            // overwrote the pair -- silently killing an established relay for the two real peers, since
+            // their later Relay frames fail the membership test. Only an existing member may register
+            // again (a reconnect); anyone else must wait out the session TTL, exactly as for a new room.
+            // A member whose address changed is in the same position, which is the safe direction.
+            if (const auto sit = rv.sessions.find(*room);
+                sit != rv.sessions.end() && !addrEqual(src, sit->second.a) && !addrEqual(src, sit->second.b)) continue;
             const auto it = rv.waiting.find(*room);
             if (it == rv.waiting.end()) {
                 if (static_cast<int>(rv.waiting.size()) >= rv.maxRooms) evictOldestWaiting(rv);   // at the cap: shed the stalest waiter

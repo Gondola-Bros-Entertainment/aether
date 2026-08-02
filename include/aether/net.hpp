@@ -52,8 +52,9 @@ inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<Chan
         Address   from{};
         const int n = recvFrom(h.socket, std::span<std::uint8_t>(scratch.data(), scratch.size()), from);
         if (n < 0) break;   // -1 == no more data (or a hard socket error); a 0-byte datagram returns 0 and is drained (CRC-rejected) so it cannot stall the queue
-        Bytes raw(scratch.begin(), scratch.begin() + n);
+        const std::size_t len = static_cast<std::size_t>(n);
         if (h.rendezvousAddr && addrEqual(from, *h.rendezvousAddr)) {
+            const Bytes raw(scratch.begin(), scratch.begin() + n);   // rendezvous frames are rare (pairing + relay), so the owned copy costs nothing here
             if (const auto paired = decodePaired(raw)) {   // a pairing reply from the rendezvous
                 if (h.pendingRoom) h.roomId = *h.pendingRoom;   // the room we joined -- used to wrap relayed packets
                 h.pendingRoom = std::nullopt;                   // paired -- stop re-registering
@@ -66,11 +67,19 @@ inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<Chan
             }
             // not a pairing reply -- a peer packet the rendezvous relayed to us; attribute it to the partner.
             if (h.relaying && h.partnerAddr) {
-                if (auto v = validateAndStripCrc32(raw)) incoming.push_back(IncomingPacket{ PeerId{ *h.partnerAddr }, std::move(*v) });
+                if (const auto payloadLen = crc32StrippedLen(raw.data(), raw.size()))
+                    incoming.push_back(IncomingPacket{ PeerId{ *h.partnerAddr },
+                                                       Bytes(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(*payloadLen)) });
             }
             continue;
         }
-        if (auto v = validateAndStripCrc32(raw)) incoming.push_back(IncomingPacket{ PeerId{ from }, std::move(*v) });
+        // Ordinary peer traffic, the hot path: check the CRC in place on the scratch and materialize
+        // the payload exactly once. Copying the datagram and then copying again to strip four
+        // trailing bytes cost two allocations per datagram, which is what crc32StrippedLen exists
+        // to avoid -- so the zero-copy receive path now starts at the socket, not at the peer layer.
+        if (const auto payloadLen = crc32StrippedLen(scratch.data(), len))
+            incoming.push_back(IncomingPacket{ PeerId{ from },
+                                               Bytes(scratch.begin(), scratch.begin() + static_cast<std::ptrdiff_t>(*payloadLen)) });
     }
 
     for (const auto& [ch, msg] : messages) peerBroadcast(h.peer, ch, msg, std::nullopt, now);

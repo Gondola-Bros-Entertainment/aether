@@ -27,6 +27,26 @@ IncomingPacket control(const PeerId& from, PacketType type, const Bytes& payload
     return IncomingPacket{ from, serializePacket(Packet{ header, payload }) };
 }
 
+// The stateless retry cookie the server mints for `from`. A raw-protocol test has to walk the same
+// exchange a real client does: an uncookied request buys nothing but a cookie, and the server
+// allocates no pending and no keypair until that cookie comes back.
+Bytes retryCookieFor(NetPeer& S, const PeerId& from, MonoTime now) {
+    std::vector<IncomingPacket> in{ control(from, PacketType::ConnectionRequest, encodeConnectionRequest({}, {})) };
+    const auto r = peerProcess(S, now, in);
+    assert(r.outgoing.size() == 1);
+    assert(S.pending.count(from) == 0);   // nothing committed for an unproven address
+    const auto stripped = validateAndStripCrc32(r.outgoing[0].data);
+    assert(stripped);
+    const auto pkt = deserializePacket(*stripped);
+    assert(pkt && pkt->header.type == PacketType::ConnectionRetry);
+    return pkt->payload;
+}
+// A ConnectionRequest carrying a freshly-earned cookie: the packet that actually reaches the keygen.
+IncomingPacket cookiedRequest(NetPeer& S, const PeerId& from, const Bytes& body, MonoTime now) {
+    const Bytes cookie = retryCookieFor(S, from, now);
+    return control(from, PacketType::ConnectionRequest, encodeConnectionRequest(cookie, body));
+}
+
 // The serverSalt the server put in the challenge it queued for `pid`.
 std::uint64_t challengeSaltFor(const NetPeer& peer, const PeerId& pid) {
     const auto it = peer.pending.find(pid);
@@ -39,13 +59,77 @@ constexpr std::uint64_t tickNs = 1000000;   // 1ms
 } // namespace
 
 int main() {
+    // --- 0. the stateless retry cookie: nothing is allocated for an unproven address ---
+    //
+    // A ConnectionRequest used to buy a half-open slot and an X25519 keypair from an address that had
+    // proven nothing. The cookie moves both behind a round trip the server keeps no state for: it is
+    // an AEAD tag over (source address, time epoch) under a per-peer secret, so it is unforgeable,
+    // useless from any other address, and expires on its own.
+    {
+        const Address addrS = addrLocalhost(9301);
+        NetPeer S = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
+        const PeerId idA{ addrLocalhost(9302) }, idB{ addrLocalhost(9303) };
+
+        // an uncookied request allocates nothing and yields only a cookie (asserted inside the helper)
+        const Bytes cookie = retryCookieFor(S, idA, MonoTime{ 1000000 });
+        assert(cookie.size() == retryCookieSize);
+        assert(S.pending.empty());
+
+        // the SAME cookie presented from a different source address is worthless: it is bound to the
+        // address it was minted for, which is the whole point of proving routability
+        {
+            NetPeer S2 = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
+            const Bytes forA = retryCookieFor(S2, idA, MonoTime{ 1000000 });
+            std::vector<IncomingPacket> in{ control(idB, PacketType::ConnectionRequest, encodeConnectionRequest(forA, {})) };
+            peerProcess(S2, MonoTime{ 2000000 }, in);
+            assert(S2.pending.count(idB) == 0);   // no pending, no keygen: it just earned idB its own cookie
+        }
+
+        // a garbage cookie of the right length is rejected too (it is a MAC, not a length check)
+        {
+            NetPeer S3 = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
+            const Bytes junk(retryCookieSize, 0xAB);
+            std::vector<IncomingPacket> in{ control(idA, PacketType::ConnectionRequest, encodeConnectionRequest(junk, {})) };
+            peerProcess(S3, MonoTime{ 2000000 }, in);
+            assert(S3.pending.count(idA) == 0);
+        }
+
+        // the real cookie, from the address it was minted for, is what opens the pending
+        {
+            std::vector<IncomingPacket> in{ control(idA, PacketType::ConnectionRequest, encodeConnectionRequest(cookie, {})) };
+            const auto r = peerProcess(S, MonoTime{ 2000000 }, in);
+            assert(S.pending.count(idA) == 1);
+            assert(r.outgoing.size() == 1);   // ...and now the challenge goes out
+        }
+
+        // and it expires: past two epochs the same cookie no longer validates
+        {
+            NetPeer S4 = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
+            const Bytes old = retryCookieFor(S4, idA, MonoTime{ 1000000 });
+            const MonoTime later{ 1000000 + cookieEpochNs * 3 };
+            assert(!retryCookieValid(S4.cookieSecret, idA.addr, old, later));
+            assert(retryCookieValid(S4.cookieSecret, idA.addr, old, MonoTime{ 1000000 }));       // still good in its own epoch
+            assert(retryCookieValid(S4.cookieSecret, idA.addr, old, MonoTime{ 1000000 + cookieEpochNs }));   // and the next one
+        }
+
+        // a malformed request framing earns nothing at all -- not even a cookie to reflect
+        {
+            NetPeer S5 = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
+            std::vector<IncomingPacket> in{ control(idA, PacketType::ConnectionRequest, Bytes{}) };
+            const auto r = peerProcess(S5, MonoTime{ 1000000 }, in);
+            assert(r.outgoing.empty());
+            assert(S5.pending.empty());
+        }
+        std::printf("aether retry-cookie OK: no pending or keygen until a valid, address-bound cookie comes back\n");
+    }
+
     // --- 1a. a response that never saw the challenge is rejected, and does NOT burn the pending ---
     {
         const Address addrS = addrLocalhost(9401), addrA = addrLocalhost(9402);
         const PeerId  idA{ addrA };
         NetPeer S = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
 
-        std::vector<IncomingPacket> in{ control(idA, PacketType::ConnectionRequest, {}) };
+        std::vector<IncomingPacket> in{ cookiedRequest(S, idA, {}, MonoTime{ 500000 }) };
         const auto challenge = peerProcess(S, MonoTime{ 1000000 }, in);
         assert(challenge.outgoing.size() == 1);          // the server answered with a challenge
         assert(S.pending.count(idA) == 1);               // ...and opened a pending for it
@@ -117,7 +201,7 @@ int main() {
         NetPeer S = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
         const PeerId ghost{ addrLocalhost(9442) };
 
-        std::vector<IncomingPacket> in{ control(ghost, PacketType::ConnectionRequest, {}) };
+        std::vector<IncomingPacket> in{ cookiedRequest(S, ghost, {}, MonoTime{ tickNs / 2 }) };
         peerProcess(S, MonoTime{ tickNs }, in);
         assert(S.pending.count(ghost) == 1);
 
@@ -152,11 +236,14 @@ int main() {
         std::vector<X25519Key> pubs;        pubs.reserve(clients);
         std::vector<IncomingPacket> requests; requests.reserve(clients);
         for (int i = 0; i < clients; ++i) {
-            ids.push_back(PeerId{ addrLocalhost(static_cast<std::uint16_t>(9460 + i)) });
+            // Distinct HOSTS, not distinct ports on one host: the per-source rate limit keys on the
+            // address alone, so six ports off 127.0.0.1 would share a single bucket and the later ones
+            // would be shed before they ever reached the admission cap this case is about.
+            ids.push_back(PeerId{ addrV4(0x0A000001u + static_cast<std::uint32_t>(i), 9460) });
             X25519Key priv{}, pub{};
             genEphemeralKeypair(priv, pub);
             pubs.push_back(pub);
-            requests.push_back(control(ids.back(), PacketType::ConnectionRequest, {}));
+            requests.push_back(cookiedRequest(S, ids.back(), {}, MonoTime{ tickNs / 2 }));
         }
         peerProcess(S, MonoTime{ tickNs }, requests);            // all challenged in one tick: 6 pendings, 0 connections
         assert(S.pending.size() == clients);
@@ -199,6 +286,7 @@ int main() {
         assert(peerPlayerId(S, idC) == player);
         const auto sessionToken = peerSessionToken(C, idS);
         assert(sessionToken.has_value());
+        const X25519Key masterBefore = *S.connections.at(idC).resumeMaster;
 
         // Blackhole the link so both ends time out and stash a resumable session.
         for (int k = 0; k < 30; ++k) {
@@ -219,8 +307,113 @@ int main() {
         assert(resumed);                                  // it took the 0-RTT resume path, not a full handshake
         assert(reconnectedAs == player);                  // ...and the event carries the identity
         assert(peerPlayerId(S, idC) == player);           // ...as does the connection itself
+
+        // The resumed session must NOT key from the master the previous one used. Every timeout re-arms
+        // the resumable with whatever the connection holds, so leaving it unchanged made a captured
+        // resume request valid again on the next generation -- and re-keying from it reproduced the
+        // earlier session's keystream exactly, since a resumed connection restarts its nonce at 0.
+        const X25519Key masterAfter = *S.connections.at(idC).resumeMaster;
+        assert(masterAfter != masterBefore);              // the chain advanced, end to end
+
+        // A resume authenticates the SENDER, never the address it claims to be at. So the resumed
+        // connection comes up anti-amplification capped: a resume replayed with a victim's source
+        // address must not buy the attacker seconds of our outbound aimed at that victim.
+        assert(!S.connections.at(idC).pathValidated);
+        assert(S.connections.at(idC).unvalidatedRecvBytes > 0);
+        // The real client is genuinely there, so its first encrypted packet lifts the cap and 0-RTT is
+        // unaffected -- it never waits for a round trip it would have had to pay for otherwise.
+        testLinkRun(link, t, tickNs, 12, [&](const TestLinkStep&) {
+            return S.connections.count(idC) && S.connections.at(idC).pathValidated;
+        });
+        assert(S.connections.at(idC).pathValidated);
         std::printf("handshake_test: connect-token identity %llu survives the fast reconnect\n",
                     static_cast<unsigned long long>(player));
+    }
+
+    // --- 2b. the anti-amplification cap itself ---
+    {
+        NetworkConfig cfg;
+        Connection    c = newConnection(cfg, 7, MonoTime{ 0 });
+
+        // A normally-handshaked connection is validated already: the cookie and the challenge echo both
+        // proved routability before it existed, so the cap must never throttle it.
+        assert(c.pathValidated);
+        assert(amplificationAllowsSend(c, 1 << 20));
+
+        // Unvalidated, the budget is a small multiple of what actually arrived -- and zero received
+        // means zero sent, which is the spoofed-victim case.
+        c.pathValidated        = false;
+        c.unvalidatedRecvBytes = 0;
+        c.unvalidatedSentBytes = 0;
+        assert(!amplificationAllowsSend(c, 1));
+
+        c.unvalidatedRecvBytes = 100;
+        assert(amplificationAllowsSend(c, 300));          // exactly 3x is allowed
+        assert(!amplificationAllowsSend(c, 301));         // past it is not
+        c.unvalidatedSentBytes = 300;
+        assert(!amplificationAllowsSend(c, 1));           // budget spent
+
+        markPathValidated(c);                             // proof arrived -> uncapped again
+        assert(c.pathValidated);
+        assert(amplificationAllowsSend(c, 1 << 20));
+        std::printf("handshake_test: unvalidated paths are amplification-capped\n");
+    }
+
+    // --- 3. a spent resume cannot be replayed into a second session ---
+    {
+        X25519Key master{};
+        secureRandomBytes(master.data(), master.size());
+        constexpr std::uint64_t token = 0xA1B2C3D4E5F60718ull;
+        constexpr std::uint64_t salt  = 0x0011223344556677ull;
+
+        const auto captured = resumeMac(master, token, salt);   // what an observer records off the wire
+        assert(detail::constTimeEq(resumeMac(master, token, salt).data(), captured.data(), 16));
+
+        // Accepting the resume advances the master, and the advanced value is what a later timeout
+        // re-arms the resumable with.
+        const X25519Key next = ratchetResumeMaster(master, salt);
+        assert(next != master);
+
+        // So presenting the captured bytes a second time no longer authenticates.
+        assert(!detail::constTimeEq(resumeMac(next, token, salt).data(), captured.data(), 16));
+
+        // And even if it somehow did, it could not reproduce the keystream: the session keys derive
+        // from the advanced secret, so no two sessions share a (key, nonce) pair. That reuse is what
+        // turned a replay into a two-time pad -- XOR of the two ciphertexts recovered the plaintext.
+        const DirectionalKeys k1 = deriveDirectionalKeys(master, salt);
+        const DirectionalKeys k2 = deriveDirectionalKeys(next, salt);
+        assert(k1.serverToClient != k2.serverToClient);
+        assert(k1.clientToServer != k2.clientToServer);
+
+        // The ratchet is deterministic and salt-bound: both peers must land on the same value from the
+        // same salt, or the resumed session would fail to decrypt.
+        assert(ratchetResumeMaster(master, salt) == next);
+        assert(ratchetResumeMaster(master, salt + 1) != next);
+        std::printf("handshake_test: a spent resume cannot be replayed; the master ratchets\n");
+    }
+
+    // --- 4. the per-source rate limit keys on the HOST, not the (host, port) pair ---
+    {
+        NetPeer P = newPeerState(addrLocalhost(9500), NetworkConfig{}, MonoTime{ 0 });
+
+        // One host, many source ports, one bucket. Hashing the port too minted a fresh budget for every
+        // port an ordinary host bound: ~1200x its cap from 5000 ports, which also filled the tracked-
+        // source table so that every NEW address was shed -- a single machine could stop anyone else
+        // from connecting without spoofing anything.
+        const std::uint64_t k1 = sockAddrToKey(addrV4(0x0A000001u, 1000), P.addrHashSeed);
+        for (std::uint16_t port = 1001; port < 1064; ++port)
+            assert(sockAddrToKey(addrV4(0x0A000001u, port), P.addrHashSeed) == k1);
+
+        // Distinct hosts still get distinct buckets, or the limit would be global.
+        assert(sockAddrToKey(addrV4(0x0A000002u, 1000), P.addrHashSeed) != k1);
+        assert(sockAddrToKey(addrV4(0x0B000001u, 1000), P.addrHashSeed) != k1);
+
+        // The seed is per-peer and drawn from the CSPRNG, so an attacker cannot compute an address
+        // that lands in a victim's bucket and starve it -- FNV-1a alone is trivially invertible.
+        NetPeer Q = newPeerState(addrLocalhost(9501), NetworkConfig{}, MonoTime{ 0 });
+        assert(Q.addrHashSeed != P.addrHashSeed);
+        assert(sockAddrToKey(addrV4(0x0A000001u, 1000), Q.addrHashSeed) != k1);
+        std::printf("handshake_test: rate-limit key is per-host and seeded\n");
     }
 
     std::printf("handshake_test: return-routability, impaired-link handshake, quiet pending expiry, "

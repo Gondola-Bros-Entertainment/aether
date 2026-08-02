@@ -10,6 +10,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <tuple>
 #include <type_traits>
@@ -71,13 +72,20 @@ template <class T> bool unpackValue(Reader& r, T& v) {
         return true;
     } else if constexpr (detail::isStdString<T>) {
         const auto n = readVarU(r);
-        if (!n || !has(r, static_cast<std::size_t>(*n))) return false;
+        // A varint length can exceed SIZE_MAX on a 32-bit target; truncating it would silently decode a
+        // DIFFERENT string than the 64-bit peer encoded, so reject rather than narrow.
+        if (!n || *n > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) return false;
+        if (!has(r, static_cast<std::size_t>(*n))) return false;
+        if (!chargeAlloc(r, *n, 1)) return false;
         v.assign(reinterpret_cast<const char*>(r.buf + r.pos), static_cast<std::size_t>(*n));
         r.pos += static_cast<std::size_t>(*n);
         return true;
     } else if constexpr (detail::isStdVector<T>) {
         const auto n = readVarU(r);
-        if (!n || *n > r.len - r.pos) return false;   // each element is >= 1 byte, so count <= remaining bytes
+        // Count <= remaining bytes bounds the LOOP; charging sizeof(element) bounds the MEMORY, which
+        // the byte count alone does not once one wire byte can materialize an arbitrarily large element.
+        if (!n || *n > r.len - r.pos) return false;
+        if (!chargeAlloc(r, *n, sizeof(typename T::value_type))) return false;
         v.clear();
         v.reserve(detail::decodeReserveCount<typename T::value_type>(*n));   // bounded up-front alloc; grow as elements parse
         for (std::uint64_t k = 0; k < *n; ++k) { typename T::value_type e{}; if (!unpackValue(r, e)) return false; v.push_back(std::move(e)); }

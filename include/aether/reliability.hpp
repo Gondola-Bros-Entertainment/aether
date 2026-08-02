@@ -134,6 +134,18 @@ struct AckResult {
     int                     ackedBytes = 0;
     // Bytes of packets newly DECLARED lost this call. They leave flight but must not grow the window.
     int                     lostBytes  = 0;
+    // COUNT of packets newly acknowledged, whatever they carried. The mirror of lostPackets, and for
+    // the same reason: an unreliable-only packet is recorded with size 0, so ackedBytes stays 0 when one
+    // is confirmed. Growth is byte-driven and correctly ignores it, but ENTERING cwOnAck at all is what
+    // ends fast recovery -- gating that on bytes left a mostly-unreliable stream stuck in Recovery from
+    // its first loss until whenever the next reliable ack happened to arrive.
+    int                     ackedPackets = 0;
+    // COUNT of packets newly declared lost, whatever they carried. This is the congestion signal;
+    // the two fields above are byte accounting and neither can stand in for it. A packet carrying
+    // only unreliable wires is a real drop on the path, but its `size` is 0 (see SentPacketRecord)
+    // and it contributes no fastRetransmit entries, so both would read as "nothing was lost" for
+    // the exact traffic shape -- a stream of unreliable snapshots -- that games send most of.
+    int                     lostPackets = 0;
 };
 
 // Outgoing sequence numbers are owned by the Connection (conn.localSeq), which stamps the header and
@@ -256,6 +268,7 @@ inline AckResult processAcks(ReliableEndpoint& ep, SequenceNum ackSeq, std::uint
             if (!rec->countedLost) {          // a packet already declared lost released its bytes and took its
                 bAcked += static_cast<std::uint64_t>(rec->size);   // loss sample back then; a late ack must not
                 recordLossSample(ep, false);                       // release or sample it a second time
+                result.ackedPackets += 1;
             }
             spbDelete(ep.sent, seq);
         } else {
@@ -264,6 +277,7 @@ inline AckResult processAcks(ReliableEndpoint& ep, SequenceNum ackSeq, std::uint
                 recordLossSample(ep, true);                    // ...so packetLossFraction actually moves off zero
                 rec->countedLost = true;
                 ep.totalLost += 1;
+                result.lostPackets += 1;
                 bLost += static_cast<std::uint64_t>(rec->size);
                 for (std::uint8_t k = 0; k < rec->msgCount; ++k) result.fastRetransmit.push_back(rec->msgs[k]);
             }

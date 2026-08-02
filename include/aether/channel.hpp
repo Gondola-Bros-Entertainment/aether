@@ -270,6 +270,23 @@ inline void flushOrderedBuffer(Channel& ch) {
     }
 }
 
+// --- flow control ---
+// Free slots in the receive buffer: the credit this channel advertises to its sender. Counted in
+// MESSAGES, because that is the unit maxReceiveBufferSize caps.
+inline int channelFreeReceiveSlots(const Channel& ch) noexcept {
+    const int used = static_cast<int>(ch.receiveBuffer.size());
+    return used >= ch.config.maxReceiveBufferSize ? 0 : ch.config.maxReceiveBufferSize - used;
+}
+// Reliable messages sent and not yet acked. Each one may still need a slot at the receiver, so this
+// is what the peer's advertised credit is spent against. Unsent messages (retryCount 0) are still
+// queued locally and have cost the receiver nothing yet.
+inline int channelUnackedCount(const Channel& ch) noexcept {
+    int n = 0;
+    for (const auto& kv : ch.sendBuffer)
+        if (!kv.second.acked && kv.second.retryCount > 0) ++n;
+    return n;
+}
+
 // Has this fragment been acked? Only meaningful for a message the sender recorded as fragmented; the
 // send path reads it to retransmit just the fragments still missing.
 inline bool fragmentAcked(const ChannelMessage& msg, std::uint8_t fragIndex) noexcept {

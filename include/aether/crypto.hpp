@@ -244,10 +244,21 @@ inline void poly1305(const std::uint8_t key[32], const std::uint8_t* msg, std::s
     poly1305Finish(st, tag);
 }
 
+// Accumulate through a volatile so the comparison cannot be turned into an early-exit memcmp. No
+// compiler is known to do that to this shape today, but "known" is not a guarantee, and a secret
+// compared in variable time leaks it a byte at a time.
 inline bool constTimeEq(const std::uint8_t* a, const std::uint8_t* b, std::size_t n) noexcept {
-    std::uint8_t diff = 0;
+    volatile std::uint8_t diff = 0;
     for (std::size_t i = 0; i < n; ++i) diff = std::uint8_t(diff | (a[i] ^ b[i]));
     return diff == 0;
+}
+
+// Wipe key material so it does not outlive its use in freed heap, a stack frame, or a core dump.
+// Writes through a volatile pointer: a plain memset to storage that is never read again is exactly
+// what dead-store elimination removes, which is the whole reason a dedicated helper exists.
+inline void secureZero(void* p, std::size_t n) noexcept {
+    volatile std::uint8_t* q = static_cast<volatile std::uint8_t*>(p);
+    while (n--) *q++ = 0;
 }
 
 // Absorb the RFC 8439 AEAD MAC input streaming: aad || pad16 || ct || pad16 || le64(aadLen) ||
@@ -277,6 +288,7 @@ inline void aeadSeal(const std::uint8_t key[32], const std::uint8_t nonce[12],
     detail::chacha20Block(key, 0, nonce, polyKey);
     detail::chacha20Xor(key, 1, nonce, pt, ct, ptLen);
     detail::poly1305Tag(polyKey, aad, aadLen, ct, ptLen, tag);
+    detail::secureZero(polyKey, sizeof polyKey);   // a one-time MAC key: recovering it forges tags
 }
 
 // Verify the tag and decrypt ct -> out (out holds ctLen bytes; out may alias ct for true in-place).
@@ -290,7 +302,9 @@ inline bool aeadOpenInto(const std::uint8_t key[32], const std::uint8_t nonce[12
     detail::chacha20Block(key, 0, nonce, polyKey);
     std::uint8_t computed[16];
     detail::poly1305Tag(polyKey, aad, aadLen, ct, ctLen, computed);
-    if (!detail::constTimeEq(computed, tag, 16)) return false;
+    const bool ok = detail::constTimeEq(computed, tag, 16);
+    detail::secureZero(polyKey, sizeof polyKey);   // wiped on BOTH paths, including the rejection
+    if (!ok) return false;
     detail::chacha20Xor(key, 1, nonce, ct, out, ctLen);
     return true;
 }

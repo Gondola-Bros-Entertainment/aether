@@ -80,6 +80,46 @@ int main() {
         assert(rv.sessions.count(1) == 1);
     }
 
+    // A third party presenting a known room id must not be able to terminate a LIVE relay session.
+    // Registering for a paired room used to fall through to the waiting branch, and the next
+    // registration then overwrote the pair -- the two real peers' Relay frames failed the membership
+    // test from then on, so anyone who learned a room id could silently kill the relay.
+    {
+        RendezvousServer rv;
+        const Address    evil = addrV4(0xC0A800FF, 9999);
+        assert(registerFrom(rv, a, 42, atSec(0)).empty());               // a waits
+        assert(registerFrom(rv, b, 42, atSec(0.1)).size() == 2);         // b pairs with it
+        assert(rv.sessions.count(42) == 1);
+        const RendezvousSession before = rv.sessions.at(42);
+
+        assert(registerFrom(rv, evil, 42, atSec(0.2)).empty());          // stranger: ignored outright
+        assert(rv.waiting.count(42) == 0);                               // ...and it did not become a waiter
+        assert(registerFrom(rv, evil, 42, atSec(0.3)).empty());
+        assert(rv.sessions.count(42) == 1);
+        assert(addrEqual(rv.sessions.at(42).a, before.a));               // the live pair is intact
+        assert(addrEqual(rv.sessions.at(42).b, before.b));
+
+        // A relay from a real member still works, so the session was not merely frozen.
+        const Bytes inner{ 1, 2, 3 };
+        const std::vector<std::pair<Address, Bytes>> relay = { { a, encodeRelay(42, inner.data(), inner.size()) } };
+        const auto fwd = rendezvousProcess(rv, relay, atSec(0.4));
+        assert(fwd.size() == 1 && addrEqual(fwd[0].first, before.b));
+    }
+
+    // The rendezvous is a public host, so every frame it accepts is attacker-reachable. Unlimited, two
+    // spoofed Registers make it send two Paired replies to addresses of the attacker's choosing.
+    {
+        RendezvousServer rv;
+        const Address    flood = addrV4(0xC0A80010, 1234);
+        int              accepted = 0;
+        for (std::uint64_t k = 0; k < 200; ++k) {
+            registerFrom(rv, flood, 1000 + k, atSec(0.001 * static_cast<double>(k)));
+            accepted = static_cast<int>(rv.waiting.size());
+        }
+        assert(rv.rateLimitDrops > 0);                                   // the limiter actually engaged
+        assert(accepted <= rendezvousMaxRequestsPerSecond);              // ...and bounded what one host could claim
+    }
+
     std::printf("rendezvous_test: all assertions passed\n");
     return 0;
 }
