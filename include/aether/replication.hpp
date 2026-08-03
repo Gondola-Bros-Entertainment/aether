@@ -1,7 +1,7 @@
 // aether - delta-compressed state replication. DeltaTracker (sender) encodes a snapshot as a
 // delta against the last ack-confirmed baseline; BaselineManager (receiver) keeps a ring of
 // confirmed snapshots to decode against. The diff/apply uses the automatic reflection delta from
-// delta.hpp -- define a plain struct and replication just works.
+// delta.hpp, so a plain aggregate needs no annotation to replicate.
 #pragma once
 
 #include "aether/delta.hpp"

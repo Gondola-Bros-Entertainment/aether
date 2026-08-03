@@ -271,8 +271,8 @@ inline CongestionLevel cwCongestionLevel(const CongestionWindow& cw) {
 // A bucket slot holds the absolute bucket number it was written for, so a slot the ring has cycled past
 // is recognized as stale rather than counted. That is what makes the rate DECAY on its own: the reader
 // only sums buckets inside the window ending at `now`, so a connection that stops sending reports its
-// throughput falling to zero without anything having to sweep it. (The previous design pruned on record,
-// which meant an idle connection reported its last burst forever, since nothing was being recorded.)
+// throughput falling to zero with nothing having to sweep it. Pruning on record instead would never
+// fire on an idle connection, which reports its last burst forever.
 inline constexpr int bandwidthBucketCount = 64;
 
 struct BandwidthTracker {
