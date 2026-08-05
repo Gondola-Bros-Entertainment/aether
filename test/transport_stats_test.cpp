@@ -134,8 +134,10 @@ int main() {
         c.cwnd->bytesInFlight       = 0;
         c.cwnd->pendingBytes        = 0;
         c.cwnd->minInterPacketDelay = 0.0;
+        c.reliability.rto           = 10000.0;   // hold off the idle slow-start restart and the retransmit clock
 
         const Bytes payload(400, 0x5A);   // each wire is well past smallReliableThreshold, so the window gates it
+        constexpr std::uint64_t wireBytes = 403;   // [channel byte][seq:2][payload]
         for (int i = 0; i < 40; ++i) peerSend(p.client, p.sp, ChannelId{ 0 }, payload, now);
 
         now = MonoTime{ now.ns + tickNs };
@@ -145,8 +147,18 @@ int main() {
         assert(c.cwnd->bytesInFlight > 0);                                           // ...without stalling the sender
         assert(c.cwnd->pendingBytes == 0);   // every reservation was realized at flush; none leaked
 
+        // Pacing spreads a window over an RTT, so filling one can take more than a single tick. What
+        // must hold on EVERY tick is that nothing is admitted past the window.
+        for (int t = 0; t < 4 && c.cwnd->bytesInFlight + wireBytes <= static_cast<std::uint64_t>(c.cwnd->cwnd); ++t) {
+            now = MonoTime{ now.ns + tickNs };
+            updateConnectedPure(c, now);
+            assert(c.cwnd->bytesInFlight <= static_cast<std::uint64_t>(c.cwnd->cwnd));
+            assert(c.cwnd->pendingBytes == 0);
+        }
+
         // and a full window blocks the next tick rather than admitting more
         const std::uint64_t inFlight = c.cwnd->bytesInFlight;
+        assert(inFlight + wireBytes > static_cast<std::uint64_t>(c.cwnd->cwnd));   // it really is full
         now = MonoTime{ now.ns + tickNs };
         updateConnectedPure(c, now);
         assert(c.cwnd->bytesInFlight == inFlight);
@@ -193,6 +205,139 @@ int main() {
         // it would leak the window shut.
         assert(c.cwnd->bytesInFlight == 0);
         assert(c.cwnd->pendingBytes == 0);
+    }
+
+    // ---- ONE window reduction per loss episode, through the real header path ----
+    //
+    // Two packets of one flight cross their triple-NACK threshold in different headers, and a header
+    // that acks with no loss lands between them. That one ends fast recovery, so the second drop is
+    // judged with the phase already back in avoidance and a phase-based guard halves the window a
+    // second time for a single congestion signal (four spread drops reach the cwnd floor).
+    {
+        NetworkConfig cfg;
+        cfg.useCwndCongestion = true;
+        cfg.channelConfigs    = { unreliableChannel() };
+        cfg.maxChannels       = 1;
+
+        const MonoTime now{ 0 };
+        Connection c = newConnection(cfg, 7, now);
+        markConnected(c, now);
+        c.cwnd->phase = CongestionPhase::Avoidance;
+        c.cwnd->cwnd  = 48000.0;
+
+        for (std::uint16_t s = 1; s <= 10; ++s)   // ten in flight; the peer never receives 2 or 6
+            onPacketSent(c.reliability, SequenceNum{ s }, now, ChannelId{ 0 }, SequenceNum{ s }, 1200);
+
+        ReliableEndpoint peer{};
+        const auto deliver = [&](std::uint16_t arrived) {   // one arrival -> the header the peer would send
+            const SequenceNum sn{ arrived };
+            onPacketsReceived(peer, &sn, 1);
+            const auto [ackSeq, bits] = getAckInfo(peer);
+            PacketHeader h{};
+            h.type    = PacketType::Keepalive;
+            h.ack     = ackSeq;
+            h.ackBits = static_cast<std::uint32_t>(bits);
+            processIncomingAcks(c, h, now);
+        };
+
+        deliver(1);
+        deliver(3);
+        deliver(4);
+        const double cwndAtLoss = c.cwnd->cwnd;
+        deliver(5);                                          // seq 2 crosses the threshold: ONE reduction
+        assert(c.cwnd->phase == CongestionPhase::Recovery);
+        const double afterFirst = c.cwnd->ssthresh;
+        assert(afterFirst == cwndAtLoss / 2.0);
+
+        deliver(7);                                          // acks with no loss: fast recovery ends here
+        assert(c.cwnd->phase == CongestionPhase::Avoidance);
+        deliver(8);
+        deliver(9);                                          // seq 6, same flight -> no second reduction
+        assert(c.reliability.totalLost == 2);
+        assert(c.cwnd->ssthresh == afterFirst);
+    }
+
+    // ---- a path that goes totally DARK must degrade the signal, not freeze it ----
+    //
+    // Every loss signal is ack-driven, so a total outage produces none at all: the loss window keeps
+    // reporting its last healthy value, the rate controller reads good conditions and additively
+    // increases INTO the dead path, quality still grades Excellent, and the MTU black-hole rule -- which
+    // needs a near-total loss fraction -- can never fire. Unresolved packets are written off by timeout.
+    {
+        NetworkConfig cfg;
+        cfg.channelConfigs = { unreliableChannel() };
+        cfg.maxChannels    = 1;
+
+        Pair     p;
+        MonoTime now = connectPair(p, cfg, MonoTime{ 0 });
+
+        const Bytes payload(200, 0xAB);
+        for (int t = 0; t < 120; ++t) {   // a clean stretch first, so there is a healthy reading to freeze
+            now = MonoTime{ now.ns + tickNs };
+            peerSend(p.client, p.sp, ChannelId{ 0 }, payload, now);
+            testLinkStep(p.link, now);
+        }
+        const Connection& c = p.client.connections.at(p.sp);
+        assert(c.stats.connectionQuality == ConnectionQuality::Excellent);
+        assert(c.stats.packetLoss == 0.0);
+        const double rateBefore = c.congestion.currentSendRate;
+        assert(rateBefore > minSendRate);
+
+        TestLinkConfig dark;
+        dark.lossRate = 1.0;   // nothing gets through, in either direction
+        testLinkImpair(p.link, dark);
+
+        for (int t = 0; t < 240; ++t) {   // ~4s: well inside the 10s connection timeout
+            now = MonoTime{ now.ns + tickNs };
+            peerSend(p.client, p.sp, ChannelId{ 0 }, payload, now);
+            testLinkStep(p.link, now);
+        }
+        assert(peerIsConnected(p.client, p.sp));                          // still Connected, as before...
+        assert(c.stats.packetLoss > 0.9);                                 // ...but the loss signal MOVED
+        assert(c.stats.connectionQuality == ConnectionQuality::Bad);      // ...and so did the grade
+        assert(c.congestion.mode == CongestionMode::Bad);
+        assert(c.congestion.currentSendRate < rateBefore);                // the controller backed OFF
+        assert(c.reliability.totalLost > 0);
+    }
+
+    // ---- a fragmented retransmit is priced PER FRAGMENT, exactly as its first send is ----
+    //
+    // A fragmented message is several datagrams and its total can exceed the whole token bucket.
+    // Summing every unacked fragment and testing the total against a bucket sized in single datagrams
+    // admits it NEVER: it does not retransmit, does not advance its retry count, and so never reaches
+    // the retry-limit disposal either -- and breaking out of the pass froze everything queued behind it.
+    {
+        NetworkConfig cfg;
+        cfg.sendRate       = 2.0;    // bucket capacity == 2 * mtu == 2400 bytes, well under the message below
+        cfg.maxPacketRate  = 8.0;
+        cfg.channelConfigs = { reliableOrderedChannel() };
+        cfg.channelConfigs[0].maxMessageSize     = 16384;
+        cfg.channelConfigs[0].maxReliableRetries = 3;   // a short budget, so disposal is reachable in sim time
+        cfg.maxChannels    = 1;
+        assert(!validateConfig(cfg));
+
+        MonoTime   now{ 0 };
+        Connection c = newConnection(cfg, 1, now);
+        markConnected(c, now);
+        c.peerCredit[0] = 64;   // the receiver is not the constraint under test here
+
+        assert(!sendMessage(c, ChannelId{ 0 }, Bytes(4000, 0x7E), now));   // ~4 fragments: over one bucket
+        assert(!sendMessage(c, ChannelId{ 0 }, Bytes(40, 0x11), now));     // a small one queued BEHIND it
+
+        // Nothing is ever acked, so both keep qualifying for retransmit until their budgets run out.
+        const std::uint64_t tick = 16000000;
+        int ticks = 0;
+        for (; ticks < 12000 && !c.channels[0].sendBuffer.empty(); ++ticks) {
+            now = MonoTime{ now.ns + tick };
+            updateConnectedPure(c, now);
+            drainSendQueue(c);   // the wire goes nowhere: only the send-side accounting is under test
+        }
+        const Channel& ch = c.channels[0];
+        assert(ticks < 12000);                    // it terminated rather than spinning forever
+        assert(ch.totalRetransmits > 0);          // the over-budget message DOES retransmit...
+        assert(ch.sendBuffer.empty());            // ...and the retry limit finally disposes of both
+        assert(ch.totalReliableDropped == 2);     // including the small one, which was never frozen behind it
+        assert(c.stats.reliableDropped == 2);     // ...and the application can SEE the broken guarantee
     }
 
     // ---- an idle connection must not trade an ack-only every tick ----

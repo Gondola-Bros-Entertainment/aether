@@ -123,9 +123,12 @@ inline long maxFragmentableMessage(const NetworkConfig& c) noexcept {
 // A channel's caps must be positive: a non-positive maxMessageSize / messageBufferSize /
 // maxOrderedBufferSize otherwise passes setup but silently dead-ends or perma-stalls the channel
 // (every send rejected, or every out-of-order message dropped), instead of failing loudly here.
+// messageBufferSize also has a CEILING: the send buffer is walked in wraparound sequence order and the
+// unacked count is advertised as a 16-bit credit, and both need it well inside the sequence space
+// (see maxMessageBufferSize).
 inline bool channelConfigValid(const ChannelConfig& c) noexcept {
-    return c.maxMessageSize > 0 && c.messageBufferSize > 0 && c.maxOrderedBufferSize > 0
-        && c.maxReliableRetries >= 0 && c.maxReceiveBufferSize > 0;
+    return c.maxMessageSize > 0 && c.messageBufferSize > 0 && c.messageBufferSize <= maxMessageBufferSize
+        && c.maxOrderedBufferSize > 0 && c.maxReliableRetries >= 0 && c.maxReceiveBufferSize > 0;
 }
 
 // Validate a config; nullopt means valid.

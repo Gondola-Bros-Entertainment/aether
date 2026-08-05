@@ -9,6 +9,11 @@ Connecting costs three round trips. The stateless retry cookie always runs rathe
 once the half-open table fills, because a path that engages only under attack is untested when the
 attack arrives. Reconnects skip it and stay 0-RTT.
 
+A connection request datagram is zero-padded to at least the size of the retry it draws, so the reply
+is never larger than the request. A shorter request gets no reply at all: the server would otherwise
+be a bandwidth multiplier pointed at whatever source address the request claimed. Clients pad
+automatically, so this only matters to another implementation of the wire format.
+
 A fast reconnect is a 0-RTT resume and inherits the usual 0-RTT cost: an attacker who captures a live
 resume request can replay it and beat the real client to it. Closing that needs a challenge round
 trip, which is what 0-RTT exists to avoid. Two things bound it. The session master ratchets on each

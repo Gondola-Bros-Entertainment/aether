@@ -273,6 +273,71 @@ int main() {
         assert(p.client.connections.at(p.sp).channels[0].totalDropped == 0);
     }
 
+    // ---- a full REORDER buffer closes the advertised window ----
+    //
+    // A gap holds every later message in the reorder buffer, bufferOrdered refuses at
+    // maxOrderedBufferSize, and a refused packet is left unacked so the sender retransmits. The credit
+    // counted only the receive buffer, so it advertised thousands of free slots while the reorder
+    // buffer sat at its cap: the sender kept pushing into a buffer that stays full until
+    // orderedBufferTimeout -- an order of magnitude longer than a retry budget lasts -- and the run of
+    // messages behind the gap was destroyed rather than delayed.
+    {
+        NetworkConfig cfg;
+        ChannelConfig cc        = reliableOrderedChannel();
+        cc.maxOrderedBufferSize = 4;
+        cc.maxReceiveBufferSize = 8192;
+        cfg.channelConfigs      = { cc };
+        cfg.maxChannels         = 1;
+
+        Pair     p;
+        MonoTime now = connectPair(p, cfg, MonoTime{ 0 });
+        Connection& srv = p.server.connections.at(p.cp);
+        Connection& cli = p.client.connections.at(p.sp);
+        for (int t = 0; t < 5; ++t) { now = MonoTime{ now.ns + tickNs }; testLinkStep(p.link, now); }
+        assert(srv.advertisedCredit[0] == 8192);   // no gap yet: the receive buffer is the only limit
+
+        // seq 0 is lost; 1..4 arrive and fill the reorder buffer, so the 5th has nowhere to go.
+        for (std::uint16_t s = 1; s <= 4; ++s)
+            onMessageReceived(srv.channels[0], SequenceNum{ s }, Bytes{ 0x01 }, now);
+        const bool refused = onMessageReceived(srv.channels[0], SequenceNum{ 5 }, Bytes{ 0x01 }, now);
+        assert(!refused);
+        assert(srv.channels[0].totalRefused == 1);
+        assert(channelFreeReceiveSlots(srv.channels[0]) == 1);   // the credit SEES the reorder buffer
+
+        now = MonoTime{ now.ns + tickNs };
+        const std::size_t before = srv.sendQueue.size();
+        maybeAdvertiseWindow(srv, now);
+        assert(queuedWindowUpdateSince(srv, before));            // ...and the receiver reports it
+        assert(srv.advertisedCredit[0] == 1);
+
+        // Deliver it. Hoisted out of assert(): applyWindowUpdate mutates credit.
+        const Bytes upd       = encodeWindowUpdate(srv);
+        const bool  delivered = applyWindowUpdate(cli, freshWindowHeader(cli), ByteSpan(upd.data(), upd.size()));
+        assert(delivered);
+        assert(cli.peerCredit[0] == 1);
+
+        // The sender now stops at that one slot instead of pushing a run of messages into a buffer
+        // that cannot take any of them -- and nothing is dropped to make it so.
+        for (int i = 0; i < 8; ++i) {
+            const auto err = sendMessage(cli, ChannelId{ 0 }, Bytes(32, 0xAB), now);
+            assert(!err);
+        }
+        now = MonoTime{ now.ns + tickNs };
+        const std::size_t q = cli.sendQueue.size();
+        updateConnectedPure(cli, now);
+        assert(payloadsQueuedSince(cli, q) == 1);              // exactly the room the receiver stated
+        assert(cli.channels[0].sendBuffer.size() == 8);
+        assert(cli.channels[0].totalDropped == 0);
+        assert(cli.channels[0].totalReliableDropped == 0);
+
+        // The one-slot floor is what keeps this backpressure rather than deadlock: the message that
+        // FILLS the gap is delivered straight through, so the window reopens on its own.
+        const bool filled = onMessageReceived(srv.channels[0], SequenceNum{ 0 }, Bytes{ 0x01 }, now);
+        assert(filled);
+        assert(srv.channels[0].orderedBuffer.empty());
+        assert(channelFreeReceiveSlots(srv.channels[0]) == 8192 - 5);
+    }
+
     // ---- the decoder rejects hostile bytes ----
     {
         Pair     p;

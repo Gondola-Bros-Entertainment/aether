@@ -13,17 +13,22 @@ struct Position { float x = 0.0f; float y = 0.0f; float z = 0.0f; };
 // --- radius-based: entities within `radius` are relevant; closer = higher priority ---
 struct RadiusInterest { float radius = 0.0f; float radiusSq = 0.0f; };
 inline RadiusInterest newRadiusInterest(float radius) { return { radius, radius * radius }; }
-inline float radiusInterestRadius(const RadiusInterest& ri) noexcept { return ri.radius; }
 
 inline bool relevant(const RadiusInterest& ri, Position entity, Position observer) noexcept {
     const float dx = entity.x - observer.x, dy = entity.y - observer.y, dz = entity.z - observer.z;
     return dx * dx + dy * dy + dz * dz <= ri.radiusSq;
 }
+// Total for every float input, and cutting at the same place relevant() does. A non-finite position
+// (a physics blowup reaches here as readily as it reaches the grid) fails the range test, since every
+// comparison against NaN is false, and scores 0 like anything out of range -- a NaN would otherwise
+// travel through priorityApplyModifier into the drain comparator, where it compares false both ways
+// and stops being the strict weak ordering stable_sort requires.
 inline float priorityMod(const RadiusInterest& ri, Position entity, Position observer) noexcept {
     const float dx = entity.x - observer.x, dy = entity.y - observer.y, dz = entity.z - observer.z;
     const float distSq = dx * dx + dy * dy + dz * dz;
-    if (distSq >= ri.radiusSq) return 0.0f;
-    return 1.0f - std::sqrt(distSq / ri.radiusSq);   // linear falloff
+    if (!(distSq <= ri.radiusSq)) return 0.0f;       // out of range, or non-finite
+    if (ri.radiusSq <= 0.0f) return 1.0f;            // a zero radius has no falloff, and only distSq 0 is in range
+    return 1.0f - std::sqrt(distSq / ri.radiusSq);   // linear falloff, exactly 0 at the boundary relevant() includes
 }
 
 // --- grid-based: entities in the same or a neighboring cell are relevant ---
@@ -31,7 +36,6 @@ struct GridInterest { float cellSize = 0.0f; float invCellSize = 0.0f; };
 // cellSize <= 0 is degenerate; map everything to one cell (invCellSize 0) rather than divide by zero
 // (which would feed NaN into the int casts in relevant() -- undefined behavior).
 inline GridInterest newGridInterest(float cellSize) { return { cellSize, cellSize > 0.0f ? 1.0f / cellSize : 0.0f }; }
-inline float gridInterestCellSize(const GridInterest& gi) noexcept { return gi.cellSize; }
 
 namespace detail {
 // floor(coord * invCellSize) as an int, total for every float input: a NaN, +/-inf, or out-of-int-

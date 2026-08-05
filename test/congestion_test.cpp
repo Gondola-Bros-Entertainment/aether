@@ -115,22 +115,46 @@ int main() {
         assert(cwCanSend(cw, 1200));
     }
 
-    // --- cwUpdatePacing / cwCanSendPaced: the inter-packet delay actually gates a send ---
+    // --- cwUpdatePacing / cwCanSendPaced: the gate binds WITHIN a tick ---
+    // A timestamp compare against the last flush answers identically for every packet in a tick, so
+    // the tick passes all of its traffic or none of it. Tokens are spent one per admitted packet, so
+    // the second packet of a tick sees a different answer from the first.
     {
         CongestionWindow cw = newCongestionWindow(1200);
         // cwnd = 12000 bytes = 10 packets; rtt 100ms -> 100/10 = 10ms min inter-packet delay.
-        cwUpdatePacing(cw, 100.0);
+        cwUpdatePacing(cw, 100.0, atMs(0.0));
         assert(cw.minInterPacketDelay == 10.0);
 
-        // No send yet -> always allowed.
-        const bool firstAllowed = cwCanSendPaced(cw, atMs(0.0));
-        assert(firstAllowed);
+        int burst = 0;                                   // the seeded bucket: one window's worth, then dry
+        while (cwCanSendPaced(cw)) { cwOnPacedSend(cw); ++burst; }
+        assert(burst == 10);
+        assert(!cwCanSendPaced(cw));                     // ...and no more at the same instant
 
-        cwOnSend(cw, 1200, atMs(0.0));                  // stamp the send time
-        const bool tooSoon = cwCanSendPaced(cw, atMs(5.0));   // 5ms < 10ms -> gated
-        assert(!tooSoon);
-        const bool afterInterval = cwCanSendPaced(cw, atMs(10.0)); // 10ms >= 10ms -> allowed
-        assert(afterInterval);
+        cwUpdatePacing(cw, 100.0, atMs(16.0));           // one 60Hz tick earns 1.6 intervals
+        int second = 0;
+        while (cwCanSendPaced(cw)) { cwOnPacedSend(cw); ++second; }
+        assert(second == 1);                             // one whole packet; the 0.6 carries forward
+    }
+
+    // --- ...and pacing is not a function of the caller's TICK RATE ---
+    // The same second of wall clock must release the same number of packets whether the application
+    // ticks at 20Hz or 144Hz. Comparing `now` against a per-flush timestamp made the answer swing
+    // between "everything" and "nothing" purely on where the tick boundary fell.
+    {
+        const auto releasedInOneSecond = [](double hz) {
+            CongestionWindow cw = newCongestionWindow(1200);
+            cw.cwnd = 120.0 * 1200.0;                    // 120-packet window: 100ms rtt -> 0.833ms apart
+            int sent = 0;
+            for (int i = 0; i <= static_cast<int>(hz); ++i) {
+                cwUpdatePacing(cw, 100.0, atMs(i * (1000.0 / hz)));
+                while (cwCanSendPaced(cw)) { cwOnPacedSend(cw); ++sent; }
+            }
+            return sent;
+        };
+        const int fast = releasedInOneSecond(144.0);
+        const int slow = releasedInOneSecond(20.0);
+        assert(fast > 1200 && slow > 1200);              // ~1200 paced + the seeded window
+        assert(fast - slow <= 2 && slow - fast <= 2);    // identical bar the rounding of the tick grid
     }
 
     // --- BandwidthTracker: a bucketed sliding window whose rate decays on its own ---
@@ -242,30 +266,112 @@ int main() {
         assert(slow.currentSendRate > 60.0 + ramped - 0.5 && slow.currentSendRate < 60.0 + ramped + 0.5);
     }
 
-    // --- one window reduction per loss episode ---
-    // A burst drop trips several packets' triple-NACK thresholds inside the same window. Halving on each
-    // took the window to a fraction of the single reduction congestion actually called for; the second
-    // and later losses of an episode we are already recovering from must not cut it again (NewReno).
+    // --- one window reduction per loss EPISODE, with an ACK INTERLEAVED between the two drops ---
+    //
+    // Two packets of ONE flight reach their triple-NACK threshold in different headers, and between
+    // them a header arrives that acks with no loss. That header ends fast recovery, so the second drop
+    // is judged with the phase already back in avoidance: a phase-based guard lets it halve again, and
+    // one congestion signal takes two full reductions (four spread drops reach the cwnd floor). The
+    // episode is a fact about SEQUENCE space, so processAcks is what decides it.
     {
+        ReliableEndpoint tx{}, rx{};
+        const ChannelId  ch{ 0 };
+        for (std::uint16_t s = 1; s <= 10; ++s)
+            onPacketSent(tx, SequenceNum{ s }, atMs(0.0), ch, SequenceNum{ s }, 1200);
+
         CongestionWindow cw = newCongestionWindow(1200);
         cw.phase = CongestionPhase::Avoidance;
         cw.cwnd  = 48000.0;
 
-        cwOnLoss(cw);                                    // the episode: ssthresh 24000, cwnd inflated by 3 MSS
+        // One arriving packet -> the header the receiver would send -> exactly what processIncomingAcks
+        // does with it. Hoisted into a lambda because every step of the timeline mutates both endpoints.
+        const auto deliver = [&](std::uint16_t arrived) {
+            const SequenceNum sn{ arrived };
+            onPacketsReceived(rx, &sn, 1);
+            const auto [ackSeq, bits] = getAckInfo(rx);
+            const AckResult r = processAcks(tx, ackSeq, bits, atMs(60.0));
+            if (r.lostPackets > 0) { if (r.newLossEpisode) cwOnLoss(cw); }
+            else if (r.ackedPackets > 0) cwOnAck(cw, r.ackedBytes);
+            return r;
+        };
+
+        deliver(1);                                       // seq 2 and seq 6 are the drops
+        deliver(3);
+        deliver(4);
+        const double cwndAtLoss = cw.cwnd;                // the acks above grew it a little
+        const AckResult declaredFirst = deliver(5);       // seq 2 crosses the threshold here
+        assert(declaredFirst.lostPackets == 1 && declaredFirst.newLossEpisode);
+        assert(cw.phase == CongestionPhase::Recovery);
+        const double afterFirst = cw.ssthresh;
+        assert(afterFirst == cwndAtLoss / 2.0);           // ONE reduction so far
+
+        const AckResult clean = deliver(7);               // acks, no new loss -> fast recovery ends here
+        assert(clean.lostPackets == 0);
+        assert(cw.phase == CongestionPhase::Avoidance);   // the phase can no longer identify the episode
+
+        deliver(8);
+        const AckResult declaredSecond = deliver(9);      // seq 6 crosses the threshold: SAME flight
+        assert(declaredSecond.lostPackets == 1);
+        assert(!declaredSecond.newLossEpisode);           // already responded to; not a fresh signal
+        assert(cw.ssthresh == afterFirst);                // still one reduction, not halved a second time
+
+        // A drop from a LATER flight is a genuinely new episode and does reduce again.
+        for (std::uint16_t s = 11; s <= 20; ++s)
+            onPacketSent(tx, SequenceNum{ s }, atMs(100.0), ch, SequenceNum{ s }, 1200);
+        const double beforeNewEpisode = cw.ssthresh;
+        deliver(11);                                      // seq 12 is the drop
+        deliver(13);
+        deliver(14);
+        const AckResult declaredThird = deliver(15);
+        assert(declaredThird.newLossEpisode);
+        assert(cw.phase == CongestionPhase::Recovery);
+        assert(cw.ssthresh < beforeNewEpisode);
+    }
+
+    // --- cwOnLoss itself is the reduction, applied once per episode by its caller ---
+    {
+        CongestionWindow cw = newCongestionWindow(1200);
+        cw.phase = CongestionPhase::Avoidance;
+        cw.cwnd  = 48000.0;
+        cwOnLoss(cw);
         assert(cw.phase == CongestionPhase::Recovery);
         assert(cw.ssthresh == 24000.0);
-        const double afterFirst = cw.cwnd;
-        assert(afterFirst == 24000.0 + 3.0 * 1200.0);
-
-        cwOnLoss(cw);                                    // more of the same burst
-        cwOnLoss(cw);
-        assert(cw.ssthresh == 24000.0);                  // still one reduction, not 24000 -> 12000 -> 6000
-        assert(cw.cwnd == afterFirst);
-
-        cwOnAck(cw, 1200);                               // first ack of new data ends the episode...
+        assert(cw.cwnd == 24000.0 + 3.0 * 1200.0);        // fast recovery inflates by the 3 segments that left
+        cwOnAck(cw, 1200);                                // first ack of new data deflates back
         assert(cw.phase == CongestionPhase::Avoidance && cw.cwnd == cw.ssthresh);
-        cwOnLoss(cw);                                    // ...so a NEW episode reduces again
-        assert(cw.ssthresh == 12000.0);
+    }
+
+    // --- an idle slow-start restart must leave the sent ring and the window consistent ---
+    // The restart zeroes bytesInFlight because nothing of ours can still be in the network. Records left
+    // behind in the sent ring would each report their size ONE MORE TIME -- on a late ack, a loss
+    // declaration or an eviction -- and every one of those subtractions comes off a counter that no
+    // longer holds those bytes, so the window under-counts and over-admits by up to a full ring.
+    {
+        ReliableEndpoint ep{};
+        const ChannelId  ch{ 0 };
+        CongestionWindow cw = newCongestionWindow(1200);
+        for (std::uint16_t s = 1; s <= 20; ++s) {
+            onPacketSent(ep, SequenceNum{ s }, atMs(0.0), ch, SequenceNum{ s }, 1000);
+            cwOnSend(cw, 1000, atMs(0.0));
+        }
+        assert(cw.bytesInFlight == 20000 && packetsInFlight(ep) == 20);
+
+        const bool restarted = cwSlowStartRestart(cw, 100.0, atMs(1000.0));   // 1s idle > 2 * 100ms RTO
+        assert(restarted);
+        assert(cw.bytesInFlight == 0);
+        abandonSentPackets(ep);                          // what updateConnectedPure does on a restart
+        assert(packetsInFlight(ep) == 0);
+
+        // A late ack for an abandoned record now resolves to nothing, so it cannot subtract bytes the
+        // window no longer holds.
+        const AckResult late = processAcks(ep, SequenceNum{ 20 }, 0xFFFFFFFFull, atMs(1100.0));
+        assert(late.ackedBytes == 0 && late.lostBytes == 0 && late.acked.empty());
+        cwReleaseInFlight(cw, late.ackedBytes + late.lostBytes);
+        assert(cw.bytesInFlight == 0);
+
+        // ...and the fresh window admits exactly its own size, not more.
+        assert(cwCanSend(cw, static_cast<int>(cw.cwnd)));
+        assert(!cwCanSend(cw, static_cast<int>(cw.cwnd) + 1));
     }
 
     // --- processAcks reports a declared loss's bytes exactly once, and a late ack does not re-credit ---

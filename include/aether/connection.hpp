@@ -36,8 +36,10 @@ inline constexpr std::uint8_t channelWireFragmentFlag = 0x80;   // channel byte 
 inline constexpr std::uint8_t channelWireChannelMask  = 0x07;   // channel byte low 3 bits: channel id (<= 8 channels)
 // --- receiver flow control ---
 // Credit the peer has not advertised yet. A receiver that is keeping up never advertises at all, so
-// this is the steady state on a healthy link and it must never throttle: 0xFFFF is far above any
-// reachable unacked count (messageBufferSize caps that at a few hundred).
+// this is the steady state on a healthy link and it must never throttle: the unacked count is bounded
+// by messageBufferSize, which channelConfigValid holds at or under maxMessageBufferSize, so 0xFFFF is
+// above anything reachable.
+static_assert(maxMessageBufferSize < 0xFFFF, "the unadvertised credit must exceed any reachable unacked count");
 inline constexpr std::uint16_t peerCreditUnknown = 0xFFFF;
 // At or below this many free slots a channel counts as restricted: the receiver starts advertising,
 // and keeps the figure fresh, so the sender throttles before the buffer is flat out rather than
@@ -99,7 +101,7 @@ struct Connection {
     SequenceNum                  localSeq{};
     ReliableEndpoint             reliability{};
     std::vector<Channel>         channels;          // dense, indexed by channel id
-    std::vector<int>             channelPriority;   // channel indices, highest priority first
+    std::vector<ChannelId>       channelPriority;   // channel ids, highest priority first
     CongestionController         congestion{};
     std::optional<CongestionWindow> cwnd;
     BandwidthTracker             bandwidthUp{};
@@ -172,9 +174,10 @@ inline Connection newConnection(const NetworkConfig& config, std::uint64_t clien
         c.channels.push_back(newChannel(static_cast<ChannelId>(i), cfg));
     }
     c.channelPriority.resize(static_cast<std::size_t>(numChannels));
-    for (int i = 0; i < numChannels; ++i) c.channelPriority[static_cast<std::size_t>(i)] = i;
-    std::stable_sort(c.channelPriority.begin(), c.channelPriority.end(),
-                     [&](int a, int b) { return c.channels[static_cast<std::size_t>(a)].config.priority > c.channels[static_cast<std::size_t>(b)].config.priority; });
+    for (int i = 0; i < numChannels; ++i) c.channelPriority[static_cast<std::size_t>(i)] = static_cast<ChannelId>(i);
+    std::stable_sort(c.channelPriority.begin(), c.channelPriority.end(), [&](ChannelId a, ChannelId b) {
+        return c.channels[static_cast<std::size_t>(toInt(a))].config.priority > c.channels[static_cast<std::size_t>(toInt(b))].config.priority;
+    });
 
     c.congestion = newCongestionController(config.sendRate, config.maxPacketRate, config.congestionBadLossThreshold,
                                            config.congestionGoodRttThreshold, config.congestionRecoveryTimeMs);
@@ -389,14 +392,14 @@ inline void maybeAdvertiseWindow(Connection& conn, MonoTime now) {
 inline std::size_t channelInnerSize(const ChannelMessage& msg) noexcept {
     return static_cast<std::size_t>(channelWireSeqBytes) + msg.data.size();
 }
-// Wire form of a whole (unfragmented) channel message: [channel:3 bits | reserved:5][seqHi][seqLo][payload].
+// Wire form of a whole (unfragmented) channel message: [fragment:1 | reserved:4 | channel:3][seqHi][seqLo][payload].
 // Built in one exactly-sized allocation -- this is the path every message that fits an MTU takes, on every
 // send and every retransmit, so composing it from an inner buffer would copy each payload twice.
-inline Bytes encodeChannelWire(int chIdx, const ChannelMessage& msg) {
+inline Bytes encodeChannelWire(ChannelId channel, const ChannelMessage& msg) {
     constexpr std::size_t dataOffset = 1 + static_cast<std::size_t>(channelWireSeqBytes);
     const std::uint16_t   seqRaw     = msg.sequence.value;
     Bytes wire(dataOffset + msg.data.size());
-    wire[0] = static_cast<std::uint8_t>(chIdx & channelWireChannelMask);
+    wire[0] = static_cast<std::uint8_t>(toInt(channel) & channelWireChannelMask);
     wire[1] = static_cast<std::uint8_t>(seqRaw >> 8);
     wire[2] = static_cast<std::uint8_t>(seqRaw & 0xFF);
     if (!msg.data.empty()) std::memcpy(wire.data() + dataOffset, msg.data.data(), msg.data.size());
@@ -409,11 +412,11 @@ inline Bytes encodeChannelWire(int chIdx, const ChannelMessage& msg) {
 // Rendering from the message matters because pacing revisits a partially-sent message every tick, and
 // materializing a ~300KB inner buffer to slice one or two admitted fragments out of it would copy the
 // whole message per tick.
-inline Bytes encodeFragmentWireAt(int chIdx, MessageId id, const ChannelMessage& msg,
+inline Bytes encodeFragmentWireAt(ChannelId channel, MessageId id, const ChannelMessage& msg,
                                   int chunk, std::size_t index, std::size_t count) {
     const auto [start, end] = fragmentRange(channelInnerSize(msg), chunk, index);
     Bytes wire(1 + static_cast<std::size_t>(fragmentHeaderSize) + (end - start));
-    wire[0] = static_cast<std::uint8_t>((chIdx & channelWireChannelMask) | channelWireFragmentFlag);
+    wire[0] = static_cast<std::uint8_t>((toInt(channel) & channelWireChannelMask) | channelWireFragmentFlag);
     writeFragmentHeader(wire.data() + 1, FragmentHeader{ id, static_cast<std::uint8_t>(index), static_cast<std::uint8_t>(count) });
     std::uint8_t*       dst    = wire.data() + 1 + fragmentHeaderSize;
     std::size_t         pos    = start;
@@ -424,8 +427,8 @@ inline Bytes encodeFragmentWireAt(int chIdx, MessageId id, const ChannelMessage&
     return wire;
 }
 // The (channel, seq)-unique id the peer's reassembler keys a fragmented message on.
-inline MessageId fragmentMessageId(int chIdx, const ChannelMessage& msg) noexcept {
-    return MessageId{ (static_cast<std::uint32_t>(chIdx) << 16) | msg.sequence.value };
+inline MessageId fragmentMessageId(ChannelId channel, const ChannelMessage& msg) noexcept {
+    return MessageId{ (static_cast<std::uint32_t>(toInt(channel)) << 16) | msg.sequence.value };
 }
 
 // A message rendered for RETRANSMIT (first sends go through emitPacedFragments below): the single wire
@@ -439,12 +442,12 @@ inline MessageId fragmentMessageId(int chIdx, const ChannelMessage& msg) noexcep
 // config this is unreachable -- it stays a defensive backstop for a NetPeer built bypassing it.
 struct MessageWire  { Bytes data; std::uint8_t fragIndex = 0; };
 struct MessageWires { std::vector<MessageWire> wires; std::uint8_t fragmentCount = 0; bool ok = true; };
-inline MessageWires buildMessageWires(const NetworkConfig& cfg, int chIdx, const ChannelMessage& msg) {
-    MessageWires out;
+inline MessageWires buildMessageWires(const NetworkConfig& cfg, ChannelId channel, const ChannelMessage& msg) {
+    MessageWires      out;
     const std::size_t innerLen = channelInnerSize(msg);
     const int         chunk    = maxFragmentChunk(cfg);
     if (chunk <= 0 || innerLen <= static_cast<std::size_t>(chunk)) {   // fits one datagram -> one plain wire
-        out.wires.push_back(MessageWire{ encodeChannelWire(chIdx, msg), 0 });
+        out.wires.push_back(MessageWire{ encodeChannelWire(channel, msg), 0 });
         return out;
     }
     const std::size_t count = fragmentCountFor(innerLen, chunk);
@@ -454,7 +457,7 @@ inline MessageWires buildMessageWires(const NetworkConfig& cfg, int chIdx, const
     for (std::size_t i = 0; i < count; ++i) {
         const std::uint8_t index = static_cast<std::uint8_t>(i);
         if (fragmentAcked(msg, index)) continue;
-        out.wires.push_back(MessageWire{ encodeFragmentWireAt(chIdx, fragmentMessageId(chIdx, msg), msg, chunk, i, count), index });
+        out.wires.push_back(MessageWire{ encodeFragmentWireAt(channel, fragmentMessageId(channel, msg), msg, chunk, i, count), index });
     }
     return out;
 }
@@ -465,11 +468,10 @@ inline MessageWires buildMessageWires(const NetworkConfig& cfg, int chIdx, const
 // Reserving at admission is what makes cwCanSend bind within a tick instead of testing a stale figure.
 // The reservation is in the same unit flushPendingWires charges (the wire's own size), so the two
 // cancel exactly and pendingBytes is back to 0 once the tick's wires are flushed.
-inline void enqueuePayload(Connection& conn, bool trackReliable, int chIdx,
+inline void enqueuePayload(Connection& conn, bool trackReliable, ChannelId channel,
                            SequenceNum seq, std::uint8_t fragIndex, Bytes wireData) {
     if (trackReliable && conn.cwnd) cwOnAdmit(*conn.cwnd, static_cast<int>(wireData.size()));
-    conn.pendingWires.push_back(
-        PendingWire{ std::move(wireData), trackReliable, ChannelMsg{ static_cast<ChannelId>(chIdx), seq, fragIndex } });
+    conn.pendingWires.push_back(PendingWire{ std::move(wireData), trackReliable, ChannelMsg{ channel, seq, fragIndex } });
 }
 
 // Coalesce this tick's accumulated wires into packets: a lone wire stays a plain Payload; several
@@ -517,10 +519,10 @@ inline void flushPendingWires(Connection& conn, MonoTime now) {
         header.type = type;
         conn.sendQueue.push_back(OutgoingPacket{ header, type, std::move(payload) });
         // Register EVERY payload packet, not only the ones carrying reliable messages. The sent ring is
-        // what processAcks walks to produce RTT and loss samples, so registering only reliable packets
-        // left a connection carrying purely unreliable traffic -- the shape of a state-snapshot stream,
-        // which is the common case -- with no samples at all: it reported zero loss and zero RTT while
-        // its rate controller additively increased into a lossy path.
+        // what processAcks walks to produce RTT and loss samples, so a connection carrying purely
+        // unreliable traffic -- the shape of a state-snapshot stream, which is the common case -- would
+        // otherwise produce no samples at all: zero loss and zero RTT while its rate controller
+        // additively increases into a lossy path.
         //
         // `size` stays the RELIABLE byte count (0 for an unreliable-only packet), because that is the
         // unit the congestion window is charged and credited on. So this widens the ack/RTT/loss
@@ -583,9 +585,9 @@ inline bool receiveIncomingPayload(Connection& conn, ChannelId channelId, Sequen
 // Does this packet type need an acknowledgement of its OWN, promptly? Only one carrying something
 // the sender is waiting on: channel data (which may be reliable) and an MTU probe (whose ack IS the
 // discovery signal). A bare Keepalive -- which is also the wire form of an ack-only -- carries
-// nothing to confirm, and treating it as needing an ack is what made two idle peers trade one every
-// tick forever: each side's ack was itself acked, ~28x the keepalive cadence, on a link with no
-// application traffic at all. A time-sync ping is answered by a pong, whose header carries the ack.
+// nothing to confirm, and treating it as needing an ack makes two idle peers trade one every tick
+// forever: each side's ack is itself acked, on a link with no application traffic at all. A time-sync
+// ping is answered by a pong, whose header carries the ack.
 inline constexpr bool needsPromptAck(PacketType t) noexcept {
     return t == PacketType::Payload || t == PacketType::PayloadBatch || t == PacketType::MtuProbe;
 }
@@ -636,7 +638,12 @@ inline void processIncomingAcks(Connection& conn, const PacketHeader& header, Mo
         cwReleaseInFlight(*conn.cwnd, res.lostBytes);
         if (res.lostPackets > 0) {
             cwReleaseInFlight(*conn.cwnd, res.ackedBytes);
-            cwOnLoss(*conn.cwnd);
+            // ONE reduction per EPISODE. Several packets of one dropped flight reach their triple-NACK
+            // threshold in different headers, and the phase cannot separate them: cwOnAck ends recovery
+            // on any header that acks with no loss, so the later drops arrive back in avoidance and
+            // each would halve again -- three spread drops of one flight down to an eighth. processAcks
+            // judges it in sequence space, where the flight boundary actually lives.
+            if (res.newLossEpisode) cwOnLoss(*conn.cwnd);
         } else if (res.ackedPackets > 0) {
             cwOnAck(*conn.cwnd, res.ackedBytes);
         }
@@ -660,7 +667,7 @@ inline void processIncomingAcks(Connection& conn, const PacketHeader& header, Mo
 // boundaries are identical across the ticks the message spans and across retransmits (selective
 // retransmit depends on that). Returns false when the budget ran out mid-message: emission is in
 // order, so the channel sends nothing past it this tick.
-inline bool emitPacedFragments(Connection& conn, Channel& channel, int chIdx, SequenceNum seq,
+inline bool emitPacedFragments(Connection& conn, Channel& channel, ChannelId chId, SequenceNum seq,
                                std::size_t count, int chunk, MonoTime now) {
     const auto it = channel.sendBuffer.find(seq);
     if (it == channel.sendBuffer.end()) return true;   // erased mid-pacing (an unreliable overflow drop): nothing left to emit
@@ -671,17 +678,18 @@ inline bool emitPacedFragments(Connection& conn, Channel& channel, int chIdx, Se
     // still 0 the message would read as unfragmented and that first fragment ack would mark it fully
     // delivered.
     if (msg.sentFragments == 0) msg.fragmentCount = static_cast<std::uint8_t>(count);
-    const MessageId msgId = fragmentMessageId(chIdx, msg);
+    const MessageId msgId = fragmentMessageId(chId, msg);
     std::size_t i = msg.sentFragments;
     for (; i < count; ++i) {
         const auto [start, end] = fragmentRange(channelInnerSize(msg), chunk, i);
         const int  wireSize     = 1 + fragmentHeaderSize + static_cast<int>(end - start);
         if (!ccCanSend(conn.congestion, wireSize)) break;
         const bool windowGates = conn.cwnd && isReliable && wireSize > smallReliableThreshold;
-        if (windowGates && !(cwCanSend(*conn.cwnd, wireSize) && cwCanSendPaced(*conn.cwnd, now))) break;
+        if (windowGates && !(cwCanSend(*conn.cwnd, wireSize) && cwCanSendPaced(*conn.cwnd))) break;
         ccDeductBudget(conn.congestion, wireSize);
-        enqueuePayload(conn, isReliable, chIdx, seq, static_cast<std::uint8_t>(i),
-                       encodeFragmentWireAt(chIdx, msgId, msg, chunk, i, count));
+        if (windowGates) cwOnPacedSend(*conn.cwnd);
+        enqueuePayload(conn, isReliable, chId, seq, static_cast<std::uint8_t>(i),
+                       encodeFragmentWireAt(chId, msgId, msg, chunk, i, count));
     }
     msg.sentFragments = static_cast<std::uint8_t>(i);
     if (i < count) return false;
@@ -690,8 +698,9 @@ inline bool emitPacedFragments(Connection& conn, Channel& channel, int chIdx, Se
 }
 
 // --- per-tick channel output ---
-inline void processChannelMessages(Connection& conn, MonoTime now, int chIdx) {
-    Channel& channel = conn.channels[static_cast<std::size_t>(chIdx)];
+inline void processChannelMessages(Connection& conn, MonoTime now, ChannelId chId) {
+    const int chIdx   = toInt(chId);
+    Channel&  channel = conn.channels[static_cast<std::size_t>(chIdx)];
     // Receiver credit, counted once per tick and then tracked locally as messages are admitted:
     // recomputing the unacked count per message would make this loop quadratic in the send buffer.
     const bool creditGates = channelIsReliable(channel);
@@ -714,8 +723,13 @@ inline void processChannelMessages(Connection& conn, MonoTime now, int chIdx) {
             // Beyond the fragmentable ceiling (see buildMessageWires): dispose + count, never stall.
             // Erased, not committed -- commit KEEPS a reliable message for retransmit, and one that can
             // never render would re-qualify as a retransmit candidate every tick forever.
-            if (count == 0) { channel.sendBuffer.erase(seq); channel.totalDropped += 1; continue; }
-            if (!emitPacedFragments(conn, channel, chIdx, seq, count, chunk, now)) break;   // budget spent mid-message
+            if (count == 0) {   // unfragmentable: gone for good, and on a reliable channel that is a broken promise
+                channel.sendBuffer.erase(seq);
+                channel.totalDropped += 1;
+                if (isReliable) channel.totalReliableDropped += 1;
+                continue;
+            }
+            if (!emitPacedFragments(conn, channel, chId, seq, count, chunk, now)) break;   // budget spent mid-message
             if (creditGates) ++unacked;   // fully emitted, so committed: it now holds one receiver slot
             continue;
         }
@@ -727,36 +741,79 @@ inline void processChannelMessages(Connection& conn, MonoTime now, int chIdx) {
         // reliable messages skip the gate (latency) but are still charged at flush, so the
         // accounting stays exact. Unreliable traffic is bounded by the byte budget above.
         const bool windowGates = conn.cwnd && isReliable && size > smallReliableThreshold;
-        if (windowGates && !(cwCanSend(*conn.cwnd, size) && cwCanSendPaced(*conn.cwnd, now))) break;
+        if (windowGates && !(cwCanSend(*conn.cwnd, size) && cwCanSendPaced(*conn.cwnd))) break;
 
-        Bytes wire = encodeChannelWire(chIdx, *peek);        // render before commit -- commit erases an unreliable *peek
+        Bytes wire = encodeChannelWire(chId, *peek);        // render before commit -- commit erases an unreliable *peek
         commitOutgoingMessage(channel, seq, now);
         ccDeductBudget(conn.congestion, size);
-        enqueuePayload(conn, isReliable, chIdx, seq, 0, std::move(wire));
+        if (windowGates) cwOnPacedSend(*conn.cwnd);
+        enqueuePayload(conn, isReliable, chId, seq, 0, std::move(wire));
         if (creditGates) ++unacked;   // one more message the receiver must find room for
     }
 }
 
 inline void processChannelOutput(Connection& conn, MonoTime now) {
-    for (const int chIdx : conn.channelPriority)
-        if (chIdx >= 0 && chIdx < static_cast<int>(conn.channels.size()))
-            processChannelMessages(conn, now, chIdx);
+    for (const ChannelId chId : conn.channelPriority)
+        if (toInt(chId) < static_cast<int>(conn.channels.size()))
+            processChannelMessages(conn, now, chId);
+}
+
+// Re-send ONE message that is due, priced PER WIRE exactly as the first-send path prices a fragment.
+// A fragmented message is several datagrams and its total can exceed the whole token bucket, so
+// charging the sum against a bucket sized in single datagrams admits it never: it would not
+// retransmit, would not advance its retry count, and so would not reach the retry-limit disposal
+// either -- and everything queued behind it would sit there too.
+//
+// msg.retxFragment is the cursor a budget-limited pass resumes from, so a big message makes progress
+// every tick instead of re-sending the same affordable prefix forever. Returns true once every wire
+// still missing has gone out; the caller then commits, so one retry is one COMPLETE attempt however
+// many ticks it spanned.
+inline bool emitRetransmitWires(Connection& conn, Channel& channel, ChannelId chId, SequenceNum seq) {
+    const auto it = channel.sendBuffer.find(seq);
+    if (it == channel.sendBuffer.end()) return false;
+    ChannelMessage&   msg      = it->second;
+    const std::size_t innerLen = channelInnerSize(msg);
+    const int         chunk    = maxFragmentChunk(conn.config);
+
+    if (chunk <= 0 || innerLen <= static_cast<std::size_t>(chunk)) {   // unfragmented: one wire
+        const int size = static_cast<int>(innerLen) + 1;
+        if (!ccCanSend(conn.congestion, size)) return false;
+        ccDeductBudget(conn.congestion, size);
+        enqueuePayload(conn, true, chId, seq, 0, encodeChannelWire(chId, msg));
+        return true;
+    }
+    const std::size_t count = fragmentCountFor(innerLen, chunk);
+    if (count == 0) return true;   // unfragmentable; the retry limit disposes of it (validateConfig rejects the config that gets here)
+    const MessageId msgId = fragmentMessageId(chId, msg);
+    std::size_t     i     = msg.retxFragment;
+    for (; i < count; ++i) {
+        if (fragmentAcked(msg, static_cast<std::uint8_t>(i))) continue;   // only the pieces still missing
+        const auto [start, end] = fragmentRange(innerLen, chunk, i);
+        const int  wireSize     = 1 + fragmentHeaderSize + static_cast<int>(end - start);
+        if (!ccCanSend(conn.congestion, wireSize)) break;
+        ccDeductBudget(conn.congestion, wireSize);
+        enqueuePayload(conn, true, chId, seq, static_cast<std::uint8_t>(i),
+                       encodeFragmentWireAt(chId, msgId, msg, chunk, i, count));
+    }
+    msg.retxFragment = static_cast<std::uint8_t>(std::min(i, count));
+    return i >= count;
 }
 
 // Re-send reliable messages whose RTO has elapsed (congestion budget still applies).
 inline void processRetransmissions(Connection& conn, MonoTime now, double rto) {
     for (int chIdx = 0; chIdx < static_cast<int>(conn.channels.size()); ++chIdx) {
-        Channel& channel = conn.channels[static_cast<std::size_t>(chIdx)];
+        const ChannelId chId    = static_cast<ChannelId>(chIdx);
+        Channel&        channel = conn.channels[static_cast<std::size_t>(chIdx)];
         // A receiver will refuse anything it has no room for, and every refused attempt spends a retry
         // the message only has so many of -- burning them against a shut window is exactly the drop the
         // advertised credit exists to prevent. Not sending keeps the retry count where it is
         // (commitRetransmit only runs on admission), so nothing is lost while it waits; the receiver's
         // re-advertise is what guarantees the reopen is heard.
         //
-        // The bound is the credit itself, not merely "credit != 0". Gating only at zero meant a receiver
-        // advertising 1 free slot still had EVERY expired message retransmitted at it each RTO: one was
+        // The bound is the credit itself, not merely "credit != 0". Gating only at zero leaves a receiver
+        // advertising 1 free slot with EVERY expired message retransmitted at it each RTO: one is
         // accepted and the rest refused, each refusal burning a retry, so a receiver hovering at one or
-        // two free slots for ~10 RTOs destroyed reliable messages anyway. Sending at most `credit` of
+        // two free slots for a few RTOs destroys reliable messages anyway. Sending at most `credit` of
         // them -- getRetransmitMessages yields oldest-first, so these are the ones most worth the slot --
         // keeps the pressure exactly at what the receiver said it can take.
         const bool creditGates = channelIsReliable(channel);
@@ -764,20 +821,13 @@ inline void processRetransmissions(Connection& conn, MonoTime now, double rto) {
         if (creditGates && budget == 0) continue;
         for (const ChannelMessage* msg : getRetransmitMessages(channel, now, rto)) {   // pointers into the send buffer, no payload copy
             if (creditGates && budget <= 0) break;   // the receiver's stated room is spent for this tick
-            MessageWires mw = buildMessageWires(conn.config, chIdx, *msg);   // fragmented: only the pieces still unacked
-            if (!mw.ok || mw.wires.empty()) continue;   // nothing missing left to resend
-            int totalSize = 0;
-            for (const MessageWire& w : mw.wires) totalSize += static_cast<int>(w.data.size());
             // Retransmits are budget-gated but never congestion-WINDOW-gated: they carry data the peer
             // is already missing, so blocking them behind a full window is exactly how a stalled
             // connection stays stalled. They are still charged at flush, so the window sees them.
-            if (!ccCanSend(conn.congestion, totalSize)) break;   // budget gone -> leave the rest for next tick, state intact
-            ccDeductBudget(conn.congestion, totalSize);
             const SequenceNum seq = msg->sequence;
-            commitRetransmit(channel, seq, now);                 // advance send state only now that it is admitted
-            if (creditGates) --budget;                           // this one is claiming a receiver slot
-            for (MessageWire& w : mw.wires)
-                enqueuePayload(conn, true, chIdx, seq, w.fragIndex, std::move(w.data));
+            if (!emitRetransmitWires(conn, channel, chId, seq)) continue;   // still owes wires: resume next tick, and let the messages behind it try
+            commitRetransmit(channel, seq, now);   // whole attempt out -> advance send state, restart the (backed-off) RTO
+            if (creditGates) --budget;             // this one is claiming a receiver slot
         }
     }
 }
@@ -819,12 +869,29 @@ inline void resetConnection(Connection& conn) {
 inline void updateConnectedPure(Connection& conn, MonoTime now) {
     const NetworkConfig& cfg = conn.config;
 
+    // Write off packets no ack ever resolved BEFORE the controller reads the loss figure. Every other
+    // loss signal is ack-driven, so a path that has gone silent produces none at all: the loss window
+    // keeps reporting its pre-outage value, ccUpdate reads good conditions and additively increases
+    // into a dead path, quality still grades Excellent, and the MTU black-hole rule (which needs a
+    // near-total loss fraction) can never fire.
+    const TimeoutResult timedOut =
+        declareTimedOutPackets(conn.reliability, now, rtoLossMultiplier * conn.reliability.rto);
+    if (conn.cwnd) {
+        cwReleaseInFlight(*conn.cwnd, timedOut.lostBytes);
+        if (timedOut.newLossEpisode) cwOnLoss(*conn.cwnd);   // one reduction per episode, same rule as the ack path
+    }
+    if (timedOut.lostPackets > 0) conn.stats.packetLoss = packetLossFraction(conn.reliability);
+
     ccUpdate(conn.congestion, conn.stats.packetLoss, conn.stats.rtt, now);
     ccRefillBudget(conn.congestion, cfg.mtu, now);
 
     if (conn.cwnd) {
-        cwSlowStartRestart(*conn.cwnd, conn.reliability.rto, now);   // idle detection is in RTO units (RFC 2861)
-        cwUpdatePacing(*conn.cwnd, conn.reliability.srtt);           // pacing spreads a window over one RTT, not one RTO
+        // The restart and the sent ring move together: it zeroes the in-flight bytes, so records that
+        // could still report those same bytes on a late ack, a loss declaration or an eviction have to
+        // go with them.
+        if (cwSlowStartRestart(*conn.cwnd, conn.reliability.rto, now))   // idle detection is in RTO units (RFC 2861)
+            abandonSentPackets(conn.reliability);
+        cwUpdatePacing(*conn.cwnd, conn.reliability.srtt, now);          // pacing spreads a window over one RTT, not one RTO
     }
 
     if (elapsedMs(conn.lastSendTime, now) > cfg.keepaliveIntervalMs) sendKeepalive(conn);
@@ -853,8 +920,12 @@ inline void updateConnectedPure(Connection& conn, MonoTime now) {
     const CongestionLevel windowLevel = conn.cwnd ? cwCongestionLevel(*conn.cwnd) : CongestionLevel::None;
     const CongestionLevel congLevel   = static_cast<int>(binaryLevel) >= static_cast<int>(windowLevel) ? binaryLevel : windowLevel;
 
+    std::uint64_t reliableDropped = 0;
+    for (const Channel& ch : conn.channels) reliableDropped += ch.totalReliableDropped;
+
     conn.stats.rtt               = conn.reliability.srtt;
     conn.stats.packetLoss        = packetLossFraction(conn.reliability);
+    conn.stats.reliableDropped   = reliableDropped;
     conn.stats.bandwidthUp       = btBytesPerSecond(conn.bandwidthUp, now);     // window ends at now, so an
     conn.stats.bandwidthDown     = btBytesPerSecond(conn.bandwidthDown, now);   // idle link decays to 0
     conn.stats.connectionQuality = assessConnectionQuality(conn.reliability.srtt, conn.stats.packetLoss * 100.0);

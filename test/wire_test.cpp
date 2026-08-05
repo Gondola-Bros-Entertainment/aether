@@ -1,7 +1,8 @@
 // wire-contract arithmetic edges: the non-obvious Ranged/Quantized boundary cases the
 // roundtrip smoke test does not cover -- negative Lo, the full int32 span (sign-extension
-// cancellation), a zero-bit range (Lo == Hi), and Quantized at the 2^32 endpoint (the
-// double math that dodges the uint32 UB). Each value round-trips BitWriter -> BitReader.
+// cancellation), a zero-bit range (Lo == Hi), Quantized at the 2^32 endpoint (the double
+// math that dodges the uint32 UB), and a non-finite Quantized input (NaN, which no
+// comparison clamps). Each value round-trips BitWriter -> BitReader.
 // Standalone: assert() is the check, one success line, no framework. Data-first.
 #include "aether/bitpack.hpp"
 #include "aether/wire.hpp"
@@ -10,10 +11,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 
 // Round-trip a single wire-contract field through the bit cursors and hand back the value.
 template <class Field>
-static Field roundtrip(const Field& in) {
+static decltype(Field::value) roundtrip(const Field& in) {
     std::uint8_t buf[16];
     aether::BitWriter w{ buf, sizeof buf };
     aether::writeWire(w, in);
@@ -24,7 +26,7 @@ static Field roundtrip(const Field& in) {
     Field out{};
     aether::readWire(r, out);
     assert(r.ok);
-    return out;
+    return out.value;
 }
 
 int main() {
@@ -67,7 +69,7 @@ int main() {
         aether::BitReader r{ buf, n };
         R out{ 0 };
         aether::readWire(r, out);
-        assert(r.ok && static_cast<int>(out) == 42);   // reconstructed from Lo, no bits read
+        assert(r.ok && out.value == 42);   // reconstructed from Lo, no bits read
     }
 
     // Quantized with Bits == 32: maxv = 2^32-1 done in double (a float cast would round up to
@@ -81,6 +83,26 @@ int main() {
         const float hi = roundtrip(Q{ 1.0f });
         assert(std::fabs(lo - (-1.0f)) < eps);
         assert(std::fabs(hi - 1.0f) < eps);
+    }
+
+    // A non-finite Quantized input must still land inside the contract. NaN fails every comparison,
+    // so a plain min/max clamp leaves it untouched and it reaches the float -> uint32 cast, which is
+    // undefined for NaN. A physics step can hand the encoder a NaN position, so the encoder has to
+    // define it: NaN goes to Lo (what interest.hpp does with a non-finite coordinate), +inf to Hi,
+    // -inf to Lo.
+    {
+        using Q = aether::Quantized<-1.0f, 1.0f, 12>;
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        const float inf = std::numeric_limits<float>::infinity();
+        const float fromNan    = roundtrip(Q{ nan });
+        const float fromPosInf = roundtrip(Q{ inf });
+        const float fromNegInf = roundtrip(Q{ -inf });
+        const float fromLo     = roundtrip(Q{ -1.0f });
+        const float fromHi     = roundtrip(Q{ 1.0f });
+        assert(fromNan >= -1.0f && fromNan <= 1.0f);   // in contract, whatever the app sent
+        assert(fromNan == fromLo);
+        assert(fromPosInf == fromHi);
+        assert(fromNegInf == fromLo);
     }
 
     // A Ranged field whose span is not 2^n-1 has unrepresented bit patterns: Ranged<0,5> costs 3 bits,
@@ -114,10 +136,11 @@ int main() {
         aether::BitReader sr{ sbuf, sn };
         S sout{ -10 };
         aether::readWire(sr, sout);
-        assert(sr.ok && static_cast<int>(sout) == -8);
+        assert(sr.ok && sout.value == -8);
     }
 
     std::printf("aether wire-edges OK: negative-Lo, full-int32 (32 bits), zero-bit Ranged, "
-                "Quantized<32> endpoints round-trip; out-of-range Ranged wire values clamp into contract\n");
+                "Quantized<32> endpoints round-trip; NaN/inf Quantized clamp into contract; "
+                "out-of-range Ranged wire values clamp into contract\n");
     return 0;
 }

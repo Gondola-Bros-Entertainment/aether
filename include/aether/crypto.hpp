@@ -1,6 +1,7 @@
 // aether - ChaCha20-Poly1305 AEAD for packet payloads (RFC 8439). Implemented from scratch, no
-// crypto dependency, and verified against the RFC 8439 section 2.8.2 test vector in the test
-// suite. Data-first: plain key bytes, free functions.
+// crypto dependency. Every primitive is pinned to the published vectors: sections 2.3.2, 2.4.2,
+// 2.5.2, 2.8.2, A.3 and A.5 in crypto_window_test.cpp and roundtrip.cpp. Data-first: plain key
+// bytes, free functions.
 //
 // Wire format of an encrypted payload: [counter:8 BE][ciphertext:N][auth tag:16].
 // The 12-byte ChaCha nonce is [counter:8 BE][protocolId:4 BE].
@@ -32,6 +33,14 @@ inline std::uint32_t cryptoLe32(const std::uint8_t* p) noexcept {
 }
 inline std::uint32_t rotl32(std::uint32_t x, int n) noexcept { return (x << n) | (x >> (32 - n)); }
 
+// Wipe key material so it does not outlive its use in freed heap, a stack frame, or a core dump.
+// Writes through a volatile pointer: a plain memset to storage that is never read again is exactly
+// what dead-store elimination removes, which is the whole reason a dedicated helper exists.
+inline void secureZero(void* p, std::size_t n) noexcept {
+    volatile std::uint8_t* q = static_cast<volatile std::uint8_t*>(p);
+    while (n--) *q++ = 0;
+}
+
 inline void quarterRound(std::uint32_t& a, std::uint32_t& b, std::uint32_t& c, std::uint32_t& d) noexcept {
     a += b; d ^= a; d = rotl32(d, 16);
     c += d; b ^= c; b = rotl32(b, 12);
@@ -40,6 +49,12 @@ inline void quarterRound(std::uint32_t& a, std::uint32_t& b, std::uint32_t& c, s
 }
 
 // One 64-byte ChaCha20 keystream block (RFC 8439 section 2.3).
+//
+// state[] holds the session key in words 4-11, and x[] ends up holding this block's output. Neither
+// is wiped: the function runs once per 64 bytes, so a volatile wipe here costs throughput on every
+// packet, and the key it would hide is one the caller holds for the whole connection anyway. The
+// wipes elsewhere (poly1305Finish, chacha20Xor, aeadSeal) cover the named buffers that outlive their
+// call; scrubbing dead stack frames is not something this file promises.
 inline void chacha20Block(const std::uint8_t key[32], std::uint32_t counter,
                           const std::uint8_t nonce[12], std::uint8_t out[64]) noexcept {
     const std::uint32_t state[16] = {
@@ -110,6 +125,9 @@ inline void chacha20Xor(const std::uint8_t key[32], std::uint32_t counter, const
         off += n;
         ++counter;
     }
+    // The last chunk of keystream is as good as the plaintext (ct XOR keystream recovers it), and
+    // unlike the key it has no reason to survive the call. Once per message, not per block.
+    secureZero(block, sizeof block);
 }
 
 // Poly1305 one-time MAC (RFC 8439 section 2.5), radix 2^26 over five limbs, as an INCREMENTAL state
@@ -234,6 +252,11 @@ inline void poly1305Finish(Poly1305State& st, std::uint8_t tag[16]) noexcept {
     const std::uint64_t rHi = hi + sHi + (rLo < lo ? 1 : 0);   // carry out of the low half
     for (int i = 0; i < 8; ++i) tag[i]     = std::uint8_t(rLo >> (8 * i));
     for (int i = 0; i < 8; ++i) tag[8 + i] = std::uint8_t(rHi >> (8 * i));
+
+    // The state holds the one-time key: st.s is its second half verbatim and st.r the clamped first
+    // half, so leaving st behind would keep forging material alive that the caller's own wipe of the
+    // key buffer cannot reach. Finish consumes the state, so wipe it here -- once per message.
+    secureZero(&st, sizeof st);
 }
 
 // One-shot over a contiguous message (a thin wrapper over the incremental state above).
@@ -253,14 +276,6 @@ inline bool constTimeEq(const std::uint8_t* a, const std::uint8_t* b, std::size_
     return diff == 0;
 }
 
-// Wipe key material so it does not outlive its use in freed heap, a stack frame, or a core dump.
-// Writes through a volatile pointer: a plain memset to storage that is never read again is exactly
-// what dead-store elimination removes, which is the whole reason a dedicated helper exists.
-inline void secureZero(void* p, std::size_t n) noexcept {
-    volatile std::uint8_t* q = static_cast<volatile std::uint8_t*>(p);
-    while (n--) *q++ = 0;
-}
-
 // Absorb the RFC 8439 AEAD MAC input streaming: aad || pad16 || ct || pad16 || le64(aadLen) ||
 // le64(ctLen). No assembly buffer -- the incremental state absorbs each piece (and its pad) directly.
 inline void poly1305Tag(const std::uint8_t polyKey[32], const std::uint8_t* aad, std::size_t aadLen,
@@ -271,9 +286,15 @@ inline void poly1305Tag(const std::uint8_t polyKey[32], const std::uint8_t* aad,
     poly1305Pad(st);
     poly1305Update(st, ct, ctLen);
     poly1305Pad(st);
+    // Both lengths are little-endian 64-bit REGARDLESS of the host's size_t. Widen first: on a 32-bit
+    // target a std::size_t shifted by 32 or more is undefined, and the natural codegen mirrors the low
+    // four bytes into the high four -- a tag matching neither the RFC nor a 64-bit build of this same
+    // library.
+    const std::uint64_t aadLen64 = aadLen;
+    const std::uint64_t ctLen64  = ctLen;
     std::uint8_t lenBlock[16];
-    for (int i = 0; i < 8; ++i) lenBlock[i]     = std::uint8_t(aadLen >> (8 * i));
-    for (int i = 0; i < 8; ++i) lenBlock[8 + i] = std::uint8_t(ctLen  >> (8 * i));
+    for (int i = 0; i < 8; ++i) lenBlock[i]     = std::uint8_t(aadLen64 >> (8 * i));
+    for (int i = 0; i < 8; ++i) lenBlock[8 + i] = std::uint8_t(ctLen64  >> (8 * i));
     poly1305Update(st, lenBlock, sizeof lenBlock);
     poly1305Finish(st, tag);
 }
@@ -288,7 +309,9 @@ inline void aeadSeal(const std::uint8_t key[32], const std::uint8_t nonce[12],
     detail::chacha20Block(key, 0, nonce, polyKey);
     detail::chacha20Xor(key, 1, nonce, pt, ct, ptLen);
     detail::poly1305Tag(polyKey, aad, aadLen, ct, ptLen, tag);
-    detail::secureZero(polyKey, sizeof polyKey);   // a one-time MAC key: recovering it forges tags
+    // A one-time MAC key: recovering it forges this packet's tag. poly1305Finish wipes the copy it
+    // clamped into its own state, so every named copy goes (chacha20Block notes what does not).
+    detail::secureZero(polyKey, sizeof polyKey);
 }
 
 // Verify the tag and decrypt ct -> out (out holds ctLen bytes; out may alias ct for true in-place).

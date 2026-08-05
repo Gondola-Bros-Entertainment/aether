@@ -89,10 +89,10 @@ struct FragmentAssembler {
 };
 
 // Bookkeeping charged for holding one fragment, on top of its payload: a map node, the Bytes header,
-// and its own heap block. Counting payload alone made maxReassemblyBufferSize describe something other
-// than memory -- a flood of 7-byte fragments measured 80x the accounted total actually resident, so the
-// byte cap never bound at all and the real ceiling was maxBuffers * 255 * this. Approximate by nature;
-// the point is that it is not zero.
+// and its own heap block. It has to be charged for maxReassemblyBufferSize to describe memory at all:
+// a tiny fragment costs an order of magnitude more resident bytes than payload bytes, so a flood of
+// them would blow far past a payload-only accounting and the real ceiling would be maxBuffers * 255 *
+// this. Approximate by nature; the point is that it is not zero.
 inline constexpr std::size_t fragmentOverheadBytes = 80;
 
 // What a buffer costs against the cap. totalSize stays pure payload because the assembled message is
@@ -136,7 +136,12 @@ inline std::optional<Bytes> processFragment(FragmentAssembler& a, const std::uin
     cleanupFragments(a, now);
     const auto hdr = readFragmentHeader(data, len);
     if (!hdr) return std::nullopt;
-    if (hdr->count == 0) return std::nullopt;   // a 0-fragment message can never complete -- never buffer it
+    // Both header fields are checked before anything is created or evicted: an index at or past the
+    // count belongs to no message, so it must not reach the eviction loop below (it would throw out a
+    // live assembly) or the buffer creation (the entry would hold no data, cost 0 against the byte cap,
+    // and still occupy one of maxBuffers slots).
+    if (hdr->count == 0) return std::nullopt;            // a 0-fragment message can never complete
+    if (hdr->index >= hdr->count) return std::nullopt;   // out of range for the message it claims to be part of
     const std::uint8_t* fragData = data + fragmentHeaderSize;
     const std::size_t   fragSize = len - static_cast<std::size_t>(fragmentHeaderSize);   // len >= fragmentHeaderSize (readFragmentHeader checked)
     // A fragment with no data is malformed: a real split always puts at least one byte in every piece. It
@@ -163,7 +168,10 @@ inline std::optional<Bytes> processFragment(FragmentAssembler& a, const std::uin
     }
     FragmentBuffer& buf = it->second;
 
-    if (hdr->index < buf.count && buf.fragments.find(hdr->index) == buf.fragments.end()) {
+    // index < count was checked at entry and buf.count == hdr->count (a disagreeing count is rejected
+    // above, and a fresh buffer takes its count from this header), so only the duplicate is left to
+    // rule out -- re-storing an index would double-count its bytes against the cap.
+    if (buf.fragments.find(hdr->index) == buf.fragments.end()) {
         buf.fragments.emplace(hdr->index, Bytes(fragData, fragData + fragSize));
         buf.totalSize      += fragSize;
         a.currentSize      += charge;   // matches fragmentBufferCharge, so the running total cannot drift

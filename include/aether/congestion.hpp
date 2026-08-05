@@ -154,8 +154,15 @@ struct CongestionWindow {
     // flush, since every admitted wire is flushed.
     std::uint64_t           pendingBytes        = 0;
     int                     mtu                 = 0;
-    std::optional<MonoTime> lastSendTime;
+    std::optional<MonoTime> lastSendTime;   // last flush; drives the idle detection in cwSlowStartRestart
     double                  minInterPacketDelay = 0.0;   // milliseconds
+    // Pacing held as a TOKEN BUCKET in packets, earned from elapsed time by cwUpdatePacing and spent
+    // one per admitted packet. A timestamp compare against the last flush cannot pace WITHIN a tick:
+    // lastSendTime does not move until the tick's wires are flushed, so every packet in the tick tests
+    // the same figure and the gate passes all of them or none -- and which one it is depends on the
+    // caller's tick rate, the single thing the controller exists to be independent of.
+    double                  pacingTokens        = 0.0;
+    std::optional<MonoTime> lastPacingRefill;
 };
 
 inline CongestionWindow newCongestionWindow(int mtu) {
@@ -193,16 +200,15 @@ inline void cwOnAck(CongestionWindow& cw, int bytes) {
     }
 }
 
+// One reduction, for one loss EPISODE. Call it only when the loss actually opened a new episode: the
+// caller owns that judgement because it is a fact about SEQUENCE space, which this window has none of
+// (see noteLossEpisode / AckResult::newLossEpisode). The phase cannot stand in for it -- any header
+// that acks with no loss ends recovery, so the second and third drops of a single flight arrive with
+// the phase already back in avoidance, and each would take another full halving.
 inline void cwOnLoss(CongestionWindow& cw) {
     // RFC 5681 fast recovery: halve ssthresh, then inflate the window by the 3 segments the
     // duplicate acks proved had left the network, so the sender keeps emitting during recovery
     // (cwOnAck deflates back to ssthresh on the first ack of new data).
-    //
-    // ONE reduction per loss episode. A burst drop trips several packets' triple-NACK thresholds within
-    // the same window, and halving on each would cut the window to a fraction of the single reduction
-    // congestion actually calls for. Further losses while already recovering are part of the episode we
-    // have already responded to (NewReno); the exit is cwOnAck's first ack of new data.
-    if (cw.phase == CongestionPhase::Recovery) return;
     cw.ssthresh = std::max(static_cast<double>(minCwndBytes), cw.cwnd / 2.0);
     cw.cwnd     = cw.ssthresh + 3.0 * static_cast<double>(cw.mtu);
     cw.phase    = CongestionPhase::Recovery;
@@ -224,33 +230,44 @@ inline bool cwCanSend(const CongestionWindow& cw, int packetBytes) {
     return cw.bytesInFlight + cw.pendingBytes + static_cast<std::uint64_t>(packetBytes) <= static_cast<std::uint64_t>(cw.cwnd);
 }
 
-inline void cwUpdatePacing(CongestionWindow& cw, double rttMs) {
+// Recompute the pacing interval (a window spread over one RTT) and earn the tokens the time since the
+// last call is worth. Call once per tick, before the channels are drained. Capacity is a window's
+// worth of packets: nothing beyond that can be in flight anyway (cwCanSend), so the cap bounds a burst
+// after an idle without ever throttling below what one tick would legitimately release.
+inline void cwUpdatePacing(CongestionWindow& cw, double rttMs, MonoTime now) {
     if (cw.cwnd > 0.0 && rttMs > 0.0) {
         const double packetsInWindow = cw.cwnd / static_cast<double>(cw.mtu);
         cw.minInterPacketDelay = packetsInWindow > 0.0 ? rttMs / packetsInWindow : 0.0;
     }
+    const double capacity = std::max(1.0, cw.cwnd / static_cast<double>(cw.mtu <= 0 ? 1 : cw.mtu));
+    if (!cw.lastPacingRefill) { cw.pacingTokens = capacity; cw.lastPacingRefill = now; return; }
+    const double elapsed = elapsedMs(*cw.lastPacingRefill, now);
+    cw.lastPacingRefill  = now;
+    cw.pacingTokens = cw.minInterPacketDelay <= 0.0 ? capacity   // no interval to pace to: the gate is open
+                                                    : std::min(cw.pacingTokens + elapsed / cw.minInterPacketDelay, capacity);
 }
 
-inline bool cwCanSendPaced(const CongestionWindow& cw, MonoTime now) {
-    if (!cw.lastSendTime) return true;
-    return elapsedMs(*cw.lastSendTime, now) >= cw.minInterPacketDelay;
-}
+inline bool cwCanSendPaced(const CongestionWindow& cw) noexcept { return cw.pacingTokens >= 1.0; }
+// Spend one packet's pacing token. Called at ADMISSION, not at flush, so the gate binds within a tick.
+inline void cwOnPacedSend(CongestionWindow& cw) noexcept { cw.pacingTokens -= 1.0; }
 
-// Reset to slow start after a long idle (RFC 2861): more than 2 RTOs without sending.
-inline void cwSlowStartRestart(CongestionWindow& cw, double rtoMs, MonoTime now) {
-    if (!cw.lastSendTime) return;
+// Reset to slow start after a long idle (RFC 2861): more than 2 RTOs without sending. Returns whether
+// it restarted, because the caller must abandon the sent ring in the same breath (abandonSentPackets):
+// the bytes and the records that carry them have to go together or the window under-counts.
+inline bool cwSlowStartRestart(CongestionWindow& cw, double rtoMs, MonoTime now) {
+    if (!cw.lastSendTime) return false;
     constexpr double ssrIdleThreshold = 2.0;
-    if (elapsedMs(*cw.lastSendTime, now) > ssrIdleThreshold * rtoMs) {
-        const double prevCwnd = cw.cwnd;
-        cw.phase    = CongestionPhase::SlowStart;
-        cw.cwnd     = static_cast<double>(initialCwndPackets * cw.mtu);
-        cw.ssthresh = prevCwnd;
-        // Nothing sent for 2 RTOs means nothing of ours is still in the network: every outstanding
-        // packet was delivered or dropped long ago. Ghost bytes -- a packet lost right before the idle,
-        // never NACKed because no later traffic arrived to reveal it -- would otherwise wedge the fresh
-        // window shut until that packet's ring slot happens to be reused.
-        cw.bytesInFlight = 0;
-    }
+    if (elapsedMs(*cw.lastSendTime, now) <= ssrIdleThreshold * rtoMs) return false;
+    const double prevCwnd = cw.cwnd;
+    cw.phase    = CongestionPhase::SlowStart;
+    cw.cwnd     = static_cast<double>(initialCwndPackets * cw.mtu);
+    cw.ssthresh = prevCwnd;
+    // Nothing sent for 2 RTOs means nothing of ours is still in the network: every outstanding
+    // packet was delivered or dropped long ago. Ghost bytes -- a packet lost right before the idle,
+    // never NACKed because no later traffic arrived to reveal it -- would otherwise wedge the fresh
+    // window shut until that packet's ring slot happens to be reused.
+    cw.bytesInFlight = 0;
+    return true;
 }
 
 inline CongestionLevel cwCongestionLevel(const CongestionWindow& cw) {

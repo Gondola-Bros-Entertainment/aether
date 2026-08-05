@@ -180,7 +180,140 @@ int main() {
         assert(!isInFlight(ep, SequenceNum{ 0 }) && isInFlight(ep, SequenceNum{ 256 }));
     }
 
+    // The window index is a free-running cursor MASKED into the window, so its wrap costs nothing. A
+    // signed counter is UB at 2^31 and the negative value it becomes indexes LossWindow::bits out of
+    // bounds -- about 200 days on one connection at 120 packets a second.
+    {
+        ReliableEndpoint ep{};
+        ep.lossWindowIndex = 0xFFFFFFFFu;    // one short of the wrap; 0xFFFFFFFF & 255 == slot 255
+        ep.lossWindowCount = lossWindowSize;
+        recordLossSample(ep, true);
+        assert(ep.lossWindowIndex == 0u);                              // wrapped, defined, back to slot 0
+        assert(lossCount(ep.lossWindow, lossWindowSize) == 1);
+        recordLossSample(ep, true);                                    // slot 0: a seamless continuation
+        assert(ep.lossWindowIndex == 1u);
+        assert(lossCount(ep.lossWindow, lossWindowSize) == 2);
+    }
+
+    // A sequence far in the FUTURE resynchronizes the endpoint; it must never deafen it. Skipping the
+    // remoteSeq update along with the insert is self-sealing: once the remote falls out of range every
+    // later packet is equally far out, so remoteSeq freezes and no ack is ever sent again -- while
+    // received-time keeps the connection alive on top of a channel that can no longer confirm anything.
+    {
+        ReliableEndpoint ep{};
+        ep.maxSeqDistance = 1024;
+        const SequenceNum first{ 1 };
+        onPacketsReceived(ep, &first, 1);
+        assert(ep.remoteSeq == SequenceNum{ 1 });
+
+        const SequenceNum farAhead{ 5000 };   // the peer kept sending through a long silence
+        onPacketsReceived(ep, &farAhead, 1);
+        assert(ep.remoteSeq == SequenceNum{ 5000 });     // resynchronized...
+        assert(getAckInfo(ep).second == 0);              // ...with an empty bitfield: nothing before it is known
+
+        const SequenceNum resumed[] = { SequenceNum{ 5001 }, SequenceNum{ 5002 } };
+        onPacketsReceived(ep, resumed, 2);
+        const auto [ackSeq, ackBits] = getAckInfo(ep);
+        assert(ackSeq == SequenceNum{ 5002 });           // ...and it keeps acking from there
+        assert((ackBits & 0x1u) != 0);
+
+        const SequenceNum ancient{ 100 };                // far in the PAST: a duplicate, not an advance
+        onPacketsReceived(ep, &ancient, 1);
+        assert(ep.remoteSeq == SequenceNum{ 5002 });
+        assert(!rbExists(ep.received, ancient));
+    }
+
+    // ...and the DEFAULT distance is a real bound. abs(sequenceDiff) tops out at 32768, so a guard
+    // testing "> 32768" rejects nothing at any of the 65536 offsets.
+    {
+        ReliableEndpoint ep{};
+        assert(ep.maxSeqDistance == defaultMaxSequenceDistance);
+        assert(defaultMaxSequenceDistance < 32768);
+        const SequenceNum here{ 1000 };
+        onPacketsReceived(ep, &here, 1);
+        const SequenceNum tooOld{ static_cast<std::uint16_t>(1000 - defaultMaxSequenceDistance - 1) };
+        onPacketsReceived(ep, &tooOld, 1);
+        assert(!rbExists(ep.received, tooOld));          // out of range -> not even recorded
+        const SequenceNum justInRange{ static_cast<std::uint16_t>(1000 - defaultMaxSequenceDistance) };
+        onPacketsReceived(ep, &justInRange, 1);
+        assert(rbExists(ep.received, justInRange));      // ...and the edge itself still is
+    }
+
+    // Karn's algorithm: a packet already DECLARED LOST contributes no RTT sample. The elapsed time to
+    // its late ack measures the retransmit timeline, not the path, and one such sample drags the whole
+    // estimator with it (srtt 20 -> 130, rto from the 50ms floor to over a second).
+    {
+        ReliableEndpoint ep{};
+        const ChannelId  ch{ 0 };
+        for (std::uint16_t s = 0; s < 6; ++s)
+            onPacketSent(ep, SequenceNum{ s }, MonoTime{ 0 }, ch, SequenceNum{ s }, 100);
+
+        ReliableEndpoint peer{};   // everything but seq 0 arrives, so seq 0 is NACKed by the bitfield
+        const SequenceNum got[] = { SequenceNum{ 1 }, SequenceNum{ 2 }, SequenceNum{ 3 },
+                                    SequenceNum{ 4 }, SequenceNum{ 5 } };
+        onPacketsReceived(peer, got, 5);
+        const auto [ackSeq, ackBits] = getAckInfo(peer);
+
+        const MonoTime at20{ 20ull * 1000000 };
+        for (int i = 0; i < fastRetransmitThreshold; ++i) processAcks(ep, ackSeq, ackBits, at20);
+        assert(ep.hasRttSample && ep.totalLost == 1);          // honest 20ms samples, and seq 0 written off
+        const double srttBefore = ep.srtt, rtoBefore = ep.rto;
+        assert(srttBefore > 19.9 && srttBefore < 20.1);
+        assert(rtoBefore == minRtoMs);
+
+        const AckResult late = processAcks(ep, SequenceNum{ 0 }, 0, MonoTime{ 500ull * 1000000 });
+        assert(!late.acked.empty());        // it WAS delivered, so the channel message is resolved...
+        assert(late.ackedBytes == 0);       // ...but its bytes already left flight when it was declared
+        assert(ep.srtt == srttBefore);      // ...and the estimator does not take its timing
+        assert(ep.rto  == rtoBefore);
+    }
+
+    // The retransmit wait backs off per ATTEMPT, held at maxRtoMs. A flat RTO spends a ten-retry budget
+    // inside about half a second at the 50ms floor, so a path that blinks erases every reliable message
+    // in flight while the connection itself is nowhere near its own timeout.
+    {
+        assert(retransmitTimeoutMs(50.0, 1) == 50.0);      // the first retransmit waits one plain RTO
+        assert(retransmitTimeoutMs(50.0, 2) == 100.0);
+        assert(retransmitTimeoutMs(50.0, 3) == 200.0);
+        assert(retransmitTimeoutMs(50.0, 6) == 1600.0);
+        assert(retransmitTimeoutMs(50.0, 7) == maxRtoMs);   // held at the cap from here on
+        assert(retransmitTimeoutMs(50.0, 99) == maxRtoMs);
+        assert(retransmitTimeoutMs(500.0, 4) == maxRtoMs);  // the cap binds before the shift does
+
+        double budget = 0.0;                                // what a default retry budget actually spans
+        for (int retry = 1; retry <= 10; ++retry) budget += retransmitTimeoutMs(minRtoMs, retry);
+        assert(budget > 10000.0);                           // longer than the default connection timeout
+    }
+
+    // Packets no ack ever resolved are written off by TIMEOUT. Every other loss signal is ack-driven,
+    // so a path that has gone silent produces none at all and the loss figure freezes at its last
+    // healthy value -- which is what a rate controller and the quality grade both read.
+    {
+        ReliableEndpoint ep{};
+        const ChannelId  ch{ 0 };
+        for (std::uint16_t s = 1; s <= 8; ++s)
+            onPacketSent(ep, SequenceNum{ s }, MonoTime{ 0 }, ch, SequenceNum{ s }, 300);
+        assert(packetLossFraction(ep) == 0.0);   // no acks have arrived: nothing sampled either way
+
+        const TimeoutResult early = declareTimedOutPackets(ep, MonoTime{ 50ull * 1000000 }, 200.0);
+        assert(early.lostPackets == 0);          // 50ms: inside the grace, nothing written off yet
+
+        const TimeoutResult swept = declareTimedOutPackets(ep, MonoTime{ 500ull * 1000000 }, 200.0);
+        assert(swept.lostPackets == 8);
+        assert(swept.lostBytes == 8 * 300);
+        assert(swept.newLossEpisode);            // ...and it counts as ONE congestion episode, not eight
+        assert(packetLossFraction(ep) == 1.0);   // the signal finally moved
+
+        const TimeoutResult again = declareTimedOutPackets(ep, MonoTime{ 900ull * 1000000 }, 200.0);
+        assert(again.lostPackets == 0);          // already declared: never counted twice
+
+        // A late ack still resolves the channel message, and still releases nothing twice.
+        const AckResult late = processAcks(ep, SequenceNum{ 8 }, 0, MonoTime{ 900ull * 1000000 });
+        assert(!late.acked.empty() && late.ackedBytes == 0);
+    }
+
     std::printf("aether loss-window OK: lossCount take==64 mask, overflow aging, 0%%/25%%/100%% ratios exact; "
-                "ring returns unresolved bytes exactly once (lost-then-evicted 0, displaced live counted)\n");
+                "ring returns unresolved bytes exactly once (lost-then-evicted 0, displaced live counted); "
+                "index wrap masked, far-future resync, Karn, backoff, timeout-declared loss\n");
     return 0;
 }

@@ -23,13 +23,13 @@ namespace aether {
 static_assert(sizeof(sockaddr_storage) <= addrStorageSize, "Address.storage too small");
 
 namespace {
-sockaddr*       sa(Address& a)       { return reinterpret_cast<sockaddr*>(a.storage); }
-const sockaddr* sa(const Address& a) { return reinterpret_cast<const sockaddr*>(a.storage); }
+sockaddr*       sa(Address& a)       { return reinterpret_cast<sockaddr*>(a.storage.data()); }
+const sockaddr* sa(const Address& a) { return reinterpret_cast<const sockaddr*>(a.storage.data()); }
 } // namespace
 
 Address addrV4(std::uint32_t ip, std::uint16_t port) {
     Address a{};
-    auto* in            = reinterpret_cast<sockaddr_in*>(a.storage);
+    auto* in            = reinterpret_cast<sockaddr_in*>(a.storage.data());
     in->sin_family      = AF_INET;
     in->sin_addr.s_addr = htonl(ip);
     in->sin_port        = htons(port);
@@ -44,7 +44,7 @@ Address addrLocalhost(std::uint16_t port) { return addrV4(INADDR_LOOPBACK, port)
 
 Address addrAny6(std::uint16_t port) {
     Address a{};
-    auto* in        = reinterpret_cast<sockaddr_in6*>(a.storage);
+    auto* in        = reinterpret_cast<sockaddr_in6*>(a.storage.data());
     in->sin6_family = AF_INET6;
     in->sin6_addr   = in6addr_any;
     in->sin6_port   = htons(port);
@@ -57,18 +57,18 @@ Address addrAny6(std::uint16_t port) {
 
 std::uint16_t addrPort(const Address& a) {
     if (sa(a)->sa_family == AF_INET6)
-        return ntohs(reinterpret_cast<const sockaddr_in6*>(a.storage)->sin6_port);
-    return ntohs(reinterpret_cast<const sockaddr_in*>(a.storage)->sin_port);
+        return ntohs(reinterpret_cast<const sockaddr_in6*>(a.storage.data())->sin6_port);
+    return ntohs(reinterpret_cast<const sockaddr_in*>(a.storage.data())->sin_port);
 }
 
 bool addrEqual(const Address& a, const Address& b) {
-    return a.len == b.len && std::memcmp(a.storage, b.storage, a.len) == 0;
+    return a.len == b.len && std::memcmp(a.storage.data(), b.storage.data(), a.len) == 0;
 }
 
 Bytes serializeAddr(const Address& a) {
     Bytes b;
     if (sa(a)->sa_family == AF_INET6) {
-        const auto* in   = reinterpret_cast<const sockaddr_in6*>(a.storage);
+        const auto* in   = reinterpret_cast<const sockaddr_in6*>(a.storage.data());
         const auto  port = ntohs(in->sin6_port);
         b.push_back(6);
         b.push_back(static_cast<std::uint8_t>(port >> 8));
@@ -76,7 +76,7 @@ Bytes serializeAddr(const Address& a) {
         const auto* ip = reinterpret_cast<const std::uint8_t*>(&in->sin6_addr);
         b.insert(b.end(), ip, ip + 16);
     } else {
-        const auto* in   = reinterpret_cast<const sockaddr_in*>(a.storage);
+        const auto* in   = reinterpret_cast<const sockaddr_in*>(a.storage.data());
         const auto  port = ntohs(in->sin_port);
         const auto  ip   = ntohl(in->sin_addr.s_addr);
         b.push_back(4);
@@ -101,7 +101,7 @@ std::optional<Address> deserializeAddr(const std::uint8_t* p, std::size_t n) {
     if (p[0] == 6) {
         if (n != 19) return std::nullopt;   // exact length, as above
         Address a{};
-        auto* in        = reinterpret_cast<sockaddr_in6*>(a.storage);
+        auto* in        = reinterpret_cast<sockaddr_in6*>(a.storage.data());
         in->sin6_family = AF_INET6;
         in->sin6_port   = htons(port);
         std::memcpy(&in->sin6_addr, p + 3, 16);
@@ -150,8 +150,9 @@ int sendTo(Socket& s, std::span<const std::uint8_t> data, const Address& to) {
 }
 
 // Returns the datagram length (>= 0; a real 0-byte datagram returns 0), or -1 for "no more data"
-// (EAGAIN/EWOULDBLOCK) or a hard error. The drain loops on n >= 0, so a 0-byte datagram no longer
-// reads as "queue empty" and stalls the rest of the queue for the tick.
+// (EAGAIN/EWOULDBLOCK) or a hard error. Zero must mean a datagram and not "queue empty": the drain
+// loops while n >= 0, so folding the two together ends the tick's drain at the first 0-byte datagram
+// and leaves the rest of the queue sitting in the kernel until the next tick.
 int recvFrom(Socket& s, std::span<std::uint8_t> buf, Address& from) {
     from = Address{};
     socklen_t len = sizeof(from.storage);

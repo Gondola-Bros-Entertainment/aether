@@ -478,7 +478,7 @@ int main() {
             aether::Ranged<int, 0, 7>          button;   //  3 bits
             bool                               firing{};   //  1 bit
         };
-        const Move in{ 512, 1000, 0.5f, 5, true };       // 36 bits -> 5 bytes
+        const Move in{ { 512 }, { 1000 }, { 0.5f }, { 5 }, true };   // 36 bits -> 5 bytes
 
         std::uint8_t bb[16];
         aether::BitWriter bw{ bb, sizeof bb };
@@ -488,8 +488,8 @@ int main() {
         aether::BitReader br{ bb, packed };
         const auto out = aether::unpackBits<Move>(br);
         assert(out);
-        assert(out->x == 512 && out->y == 1000 && out->button == 5 && out->firing);
-        const float dy = static_cast<float>(out->aimYaw) - static_cast<float>(in.aimYaw);
+        assert(out->x.value == 512 && out->y.value == 1000 && out->button.value == 5 && out->firing);
+        const float dy = out->aimYaw.value - in.aimYaw.value;
         assert(dy > -0.001f && dy < 0.001f);
 
         // same logical packet on the byte-aligned generic path, for comparison
@@ -1287,13 +1287,13 @@ int main() {
         aether::DeltaTracker<Ent>    tr = aether::newDeltaTracker<Ent>(8);
         aether::BaselineManager<Ent> bm = aether::newBaselineManager<Ent>(8, 5000.0);
         const Ent  s0{ 100, 10, 20 };
-        const auto enc0 = aether::deltaEncode(tr, 0, s0);
+        const auto enc0 = aether::deltaEncode(tr, aether::BaselineSeq{ 0 }, s0);
         const auto dec0 = aether::deltaDecode(bm, enc0);
         assert(dec0 && dec0->hp == 100 && dec0->x == 10 && dec0->y == 20);
-        aether::pushBaseline(bm, 0, *dec0, aether::MonoTime{ 0 });
-        aether::deltaOnAck(tr, 0);
+        aether::pushBaseline(bm, aether::BaselineSeq{ 0 }, *dec0, aether::MonoTime{ 0 });
+        aether::deltaOnAck(tr, aether::BaselineSeq{ 0 });
         const Ent  s1{ 100, 11, 20 };
-        const auto enc1 = aether::deltaEncode(tr, 1, s1);
+        const auto enc1 = aether::deltaEncode(tr, aether::BaselineSeq{ 1 }, s1);
         assert(enc1.size() < enc0.size());                    // delta beats full snapshot
         const auto dec1 = aether::deltaDecode(bm, enc1);
         assert(dec1 && dec1->hp == 100 && dec1->x == 11 && dec1->y == 20);
@@ -1801,7 +1801,7 @@ int main() {
         // fragment is rendered, each tagged with its own index.
         const aether::ChannelMessage* peek = aether::peekOutgoingMessage(ch);
         assert(peek);
-        const aether::MessageWires first = aether::buildMessageWires(cfg, 0, *peek);
+        const aether::MessageWires first = aether::buildMessageWires(cfg, aether::ChannelId{ 0 }, *peek);
         assert(first.ok && first.fragmentCount > 1);
         assert(first.wires.size() == first.fragmentCount);
         for (std::size_t i = 0; i < first.wires.size(); ++i) assert(first.wires[i].fragIndex == i);
@@ -1819,7 +1819,7 @@ int main() {
 
         // The retransmit render carries exactly the missing fragment -- and still reports the message's
         // TOTAL fragment count, which is what the channel needs to know when it is finally whole.
-        const aether::MessageWires again = aether::buildMessageWires(cfg, 0, stored);
+        const aether::MessageWires again = aether::buildMessageWires(cfg, aether::ChannelId{ 0 }, stored);
         assert(again.ok && again.wires.size() == 1);
         assert(again.wires[0].fragIndex == missing);
         assert(again.fragmentCount == first.fragmentCount);
@@ -1828,7 +1828,7 @@ int main() {
         // Acking the last one completes it, and there is then nothing left to resend.
         aether::acknowledgeMessage(ch, sr.seq, missing);
         assert(ch.sendBuffer.at(sr.seq).acked);
-        const aether::MessageWires complete = aether::buildMessageWires(cfg, 0, ch.sendBuffer.at(sr.seq));
+        const aether::MessageWires complete = aether::buildMessageWires(cfg, aether::ChannelId{ 0 }, ch.sendBuffer.at(sr.seq));
         assert(complete.wires.empty());
         std::printf("aether selective-retransmit OK: %u-fragment message resends 1 wire, not %u\n",
                     static_cast<unsigned>(first.fragmentCount), static_cast<unsigned>(first.fragmentCount));

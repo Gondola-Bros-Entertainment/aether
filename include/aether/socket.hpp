@@ -5,6 +5,7 @@
 
 #include "aether/types.hpp"
 
+#include <array>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -15,9 +16,11 @@ inline constexpr std::size_t maxUdpPacketSize = 65536;
 inline constexpr std::size_t addrStorageSize  = 128;   // >= sizeof(sockaddr_storage)
 
 // An IP endpoint (v4 or v6). Opaque bytes; build it with the helpers below.
+// std::array, not a C array: reflection counts a C array element-by-element, so a user struct
+// embedding an Address would field-count as addrStorageSize + 1 and blow the field cap.
 struct Address {
-    alignas(8) unsigned char storage[addrStorageSize]{};
-    std::uint32_t            len{};
+    alignas(8) std::array<unsigned char, addrStorageSize> storage{};
+    std::uint32_t                                         len{};
 };
 
 Address       addrAny(std::uint16_t port);         // 0.0.0.0:port

@@ -1,7 +1,7 @@
-// aether - reflective bit-packed serialization. The fusion: aggregate reflection (define a
-// plain struct, no codegen) + bit-packing (wire-contract types cost only the bits
-// they need) + a unified field walk. A struct of Ranged/Quantized fields packs into a
-// fraction of its byte-aligned size, with zero boilerplate.
+// aether - reflective bit-packed serialization: aggregate reflection (reflect.hpp) walking the
+// fields, the bit cursors (bitpack.hpp) writing them. A field with a wire contract (Ranged,
+// Quantized) costs only the bits its type declares; everything else costs its natural width. A
+// struct of Ranged/Quantized fields therefore packs into a fraction of its byte-aligned size.
 #pragma once
 
 #include "aether/bitpack.hpp"
@@ -73,6 +73,16 @@ template <class T> void unpackField(BitReader& r, T& v) noexcept {
     if constexpr (isWireType<T>) {
         readWire(r, v);
     } else if constexpr (std::is_enum_v<T>) {
+        // A fixed underlying type is what makes the cast total: the enum holds every bit pattern of
+        // that type, so no bit field read off the wire is out of range. Without one the valid values
+        // stop at the largest enumerator, which reflection cannot see, and the cast would be
+        // undefined behaviour -- reject the shape at compile time instead. (reflect.hpp:readAny
+        // requires the same of the byte path.)
+        static_assert(detail::enumHasFixedUnderlying<T>,
+                      "aether: a serializable enum needs a fixed underlying type (enum class E, or enum E : "
+                      "std::uint8_t). Without one its valid values are bounded by its enumerators, which "
+                      "reflection cannot see, so an out-of-range wire value would be undefined behaviour "
+                      "instead of a rejected packet.");
         std::underlying_type_t<T> u{};
         unpackPrimitive(r, u);
         v = static_cast<T>(u);

@@ -1,7 +1,7 @@
 // aether - packet integrity, rate limiting, and connect tokens. CRC32C (Castagnoli) detects
 // corruption; the rate limiter throttles connection requests per source; connect tokens are
 // AEAD-sealed credentials that authenticate a client's identity (with replay defense). The CRC table
-// is built at compile time (software); a SIMD path is a later speed concern.
+// is built at compile time (software).
 #pragma once
 
 #include "aether/crypto.hpp"
@@ -79,13 +79,18 @@ inline constexpr double cleanupIntervalMs     = 5000.0;
 // space promptly under a flood, long enough that the prune cannot run once per arriving packet.
 inline constexpr double capacityPruneIntervalMs = 100.0;
 inline constexpr int    rateLimiterMaxSources = 4096;   // hard cap on tracked sources (spoof-flood memory shield)
+// How many tracked sources one eviction looks at. A full walk per arriving datagram costs more than
+// the flood does, so the search for something to drop is a bounded sample taken from a rotating
+// cursor: successive evictions cover the whole table without any single packet paying for it.
+inline constexpr int    rateLimiterEvictScan  = 64;
 
 struct RateLimiter {
     std::map<std::uint64_t, std::vector<MonoTime>> requests;
-    int      maxRequestsPerSecond = 0;
-    int      maxTrackedSources    = rateLimiterMaxSources;
-    double   windowMs             = 1000.0;
-    MonoTime lastCleanup{};
+    int           maxRequestsPerSecond = 0;
+    int           maxTrackedSources    = rateLimiterMaxSources;
+    double        windowMs             = 1000.0;
+    MonoTime      lastCleanup{};
+    std::uint64_t evictCursor          = 0;   // where the next capacity eviction starts scanning
 };
 
 inline RateLimiter newRateLimiter(int maxReqs, MonoTime now) {
@@ -109,6 +114,27 @@ inline void maybeCleanup(RateLimiter& rl, MonoTime now) {
     if (elapsedMs(rl.lastCleanup, now) >= cleanupIntervalMs) pruneRateLimiter(rl, now);
 }
 
+// When a source was last seen. Timestamps are appended in arrival order, so the last one is the most
+// recent; a source whose timestamps have all aged out is maximally stale.
+inline MonoTime rateLimiterLastSeen(const std::vector<MonoTime>& seen) noexcept {
+    return seen.empty() ? MonoTime{ 0 } : seen.back();
+}
+
+// Free one slot by dropping the stalest source in a bounded sample. The cursor rotates so the samples
+// sweep the table rather than re-examining one arbitrary prefix of it.
+inline void evictStalestSource(RateLimiter& rl) {
+    if (rl.requests.empty()) return;
+    auto it = rl.requests.lower_bound(rl.evictCursor);
+    if (it == rl.requests.end()) it = rl.requests.begin();
+    auto stalest = it;
+    for (int n = 1; n < rateLimiterEvictScan; ++n) {
+        if (++it == rl.requests.end()) it = rl.requests.begin();
+        if (rateLimiterLastSeen(it->second).ns < rateLimiterLastSeen(stalest->second).ns) stalest = it;
+    }
+    rl.evictCursor = stalest->first + 1;   // wrapping past the top of the keyspace is fine: lower_bound(0) is begin()
+    rl.requests.erase(stalest);
+}
+
 // Allow a request if fewer than the cap occurred within the window; records it either way. Bounds
 // the table at maxTrackedSources so a spoofed-source flood cannot grow it without limit (a memory
 // shield distinct from the per-source rate check; the return-routability cookie is the full fix).
@@ -116,14 +142,17 @@ inline bool rateLimiterAllow(RateLimiter& rl, std::uint64_t addrKey, MonoTime no
     maybeCleanup(rl, now);
     auto it = rl.requests.find(addrKey);
     if (it == rl.requests.end() && static_cast<int>(rl.requests.size()) >= rl.maxTrackedSources) {
-        // At the cap: drop stale sources rather than wait out the 5s interval -- but not on every
-        // packet. A flood from random sources reaches this branch with EVERY datagram, and an
-        // unconditional prune made each one pay a full O(maxTrackedSources) walk before any rate
-        // decision was taken, which is the flood doing more work per packet than the attacker does.
-        // One prune per capacityPruneIntervalMs recovers the space just as well and bounds the cost.
+        // At the cap, with this source untracked. Which source gets dropped must not be decided by
+        // whoever is flooding: a prune reclaims only entries that fell out of the window, and a flood
+        // keeps all of its own inside it, so pruning alone sheds every NEW source for as long as the
+        // flood lasts -- and since this gate runs ahead of the retry cookie, a shed source cannot
+        // prove routability to earn its way back. So reclaim dead space when it is cheap (the full
+        // walk is held to capacityPruneIntervalMs, because paying for one per arriving datagram is
+        // more work than the flood costs the attacker), then evict to make room regardless. The cap
+        // still holds exactly: one entry out, one in.
         if (elapsedMs(rl.lastCleanup, now) >= capacityPruneIntervalMs) pruneRateLimiter(rl, now);
-        if (static_cast<int>(rl.requests.size()) >= rl.maxTrackedSources) return false;   // still full -> shed
-        // addrKey is new, so prune did not create it -- it stays end(), and the filter below is skipped
+        if (static_cast<int>(rl.requests.size()) >= rl.maxTrackedSources) evictStalestSource(rl);
+        // addrKey is new, so neither step created it -- it stays end(), and the filter below is skipped
     }
     const double          window = rl.windowMs;
     std::vector<MonoTime> recent;
@@ -247,16 +276,31 @@ inline void enforceLimit(TokenValidator& tv, MonoTime now) {
     evictOldest(tv);
 }
 
+// Has this nonce already been spent? A read-only peek, so a caller can reject a replay as cheaply as
+// it rejects a forgery, before committing to anything.
+inline bool tokenNonceSpent(const TokenValidator& tv, const TokenNonce& nonce) {
+    return tv.usedNonces.count(nonce) != 0;
+}
+// Spend an opened token's nonce, which is what makes the token single-use. Kept separate from
+// openConnectToken because recording is irreversible for tokenLifetimeMs: a caller that may still
+// turn the request away (a full server, a full half-open table) must open and check the token
+// WITHOUT spending it, and call this only once admission is certain. Otherwise the rejected client's
+// one token is burnt and its next attempt is answered as a replay.
+inline std::optional<TokenError> consumeTokenNonce(TokenValidator& tv, const TokenNonce& nonce, MonoTime now) {
+    if (tokenNonceSpent(tv, nonce)) return TokenError::Replayed;
+    tv.usedNonces[nonce] = now;
+    enforceLimit(tv, now);
+    return std::nullopt;
+}
+
 struct TokenResult { std::optional<TokenError> error; std::uint64_t playerId = 0; Bytes userData; };
 
 // Full server-side check: open + authenticate the sealed token, then reject replays. Records it on
-// success and returns the verified player id. This is what the handshake calls.
+// success and returns the verified player id.
 inline TokenResult validateConnectToken(const EncryptionKey& key, TokenValidator& tv, const Bytes& sealed, MonoTime now) {
     const auto opened = openConnectToken(key, sealed, now);
-    if (!opened)                            return { TokenError::Invalid, 0, {} };   // forged / corrupt / expired
-    if (tv.usedNonces.count(opened->nonce)) return { TokenError::Replayed, 0, {} };
-    tv.usedNonces[opened->nonce] = now;
-    enforceLimit(tv, now);
+    if (!opened) return { TokenError::Invalid, 0, {} };   // forged / corrupt / expired
+    if (const auto err = consumeTokenNonce(tv, opened->nonce, now)) return { *err, 0, {} };
     return { std::nullopt, opened->token.playerId, opened->token.userData };
 }
 

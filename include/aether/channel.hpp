@@ -6,6 +6,7 @@
 #include "aether/reliability.hpp"   // ReceivedBuffer: the sequence-dedup ring, shared with the packet layer
 #include "aether/types.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -22,9 +23,15 @@ enum class DeliveryMode {
     ReliableOrdered,      // guaranteed, strict order
     ReliableSequenced,    // guaranteed, drops out-of-order
 };
-inline bool isReliable(DeliveryMode m)  { return m != DeliveryMode::Unreliable && m != DeliveryMode::UnreliableSequenced; }
-inline bool isSequenced(DeliveryMode m) { return m == DeliveryMode::UnreliableSequenced || m == DeliveryMode::ReliableSequenced; }
-inline bool isOrdered(DeliveryMode m)   { return m == DeliveryMode::ReliableOrdered; }
+constexpr bool isReliable(DeliveryMode m) noexcept  { return m != DeliveryMode::Unreliable && m != DeliveryMode::UnreliableSequenced; }
+constexpr bool isSequenced(DeliveryMode m) noexcept { return m == DeliveryMode::UnreliableSequenced || m == DeliveryMode::ReliableSequenced; }
+constexpr bool isOrdered(DeliveryMode m) noexcept   { return m == DeliveryMode::ReliableOrdered; }
+
+// Ceiling on messageBufferSize (channelConfigValid enforces it). Two things depend on the send buffer
+// staying well inside half the 16-bit sequence space: it is walked in WRAP-AWARE order (see
+// sendBufferOldest), which is only defined while the buffered sequences span less than 0x8000; and
+// peerCreditUnknown (connection.hpp) has to stay above any reachable unacked count, which this bounds.
+inline constexpr int maxMessageBufferSize = 16384;
 
 struct ChannelConfig {
     DeliveryMode deliveryMode         = DeliveryMode::ReliableOrdered;
@@ -51,6 +58,11 @@ struct ChannelMessage {
     bool        forceRetransmit = false;   // set by a triple-NACK: resend on the next pass, ignoring the RTO
     std::uint8_t                 fragmentCount = 0;   // 0/1 == sent in one packet; >1 == split into this many fragments
     std::uint8_t                 sentFragments = 0;   // first-send progress: fragments [0, sentFragments) have gone out (paced across ticks by the send budget)
+    // Retransmit progress within ONE attempt: the fragment index the next pass resumes from. A
+    // fragmented message can need more wire bytes than the whole token bucket holds, so a pass that
+    // runs out of budget stops here and continues next tick; the retry count advances only once every
+    // missing fragment has gone out, which is what makes one retry one complete attempt.
+    std::uint8_t                 retxFragment  = 0;
     std::array<std::uint64_t, 4> fragAckBits{};       // which fragments are acked (256-bit, matches maxFragmentCount 255); message acked when all set
 };
 
@@ -78,6 +90,11 @@ struct Channel {
     // unacked so the sender brings it back. Folding refusals into "dropped" would report healthy
     // backpressure as data loss on a channel that in fact lost nothing.
     std::uint64_t totalDropped = 0, totalDuplicate = 0, totalRefused = 0;
+    // The subset of totalDropped that is a BROKEN PROMISE: a reliable message the transport gave up on
+    // (retry budget spent, or too large to fragment). Kept apart from totalDropped because everything
+    // else in that counter is a drop the channel's contract allows; this one is the contract failing,
+    // and an application that cares about the guarantee needs to be able to see it (NetworkStats).
+    std::uint64_t totalReliableDropped = 0;
 };
 
 inline Channel newChannel(ChannelId id, const ChannelConfig& cfg) {
@@ -86,10 +103,31 @@ inline Channel newChannel(ChannelId id, const ChannelConfig& cfg) {
     c.channelId = id;
     return c;
 }
-inline bool channelIsReliable(const Channel& ch) { return isReliable(ch.config.deliveryMode); }
+// noexcept but not constexpr: Channel holds std::map, so no Channel can exist in a constant
+// expression and a constexpr here could never be evaluated as one.
+inline bool channelIsReliable(const Channel& ch) noexcept { return isReliable(ch.config.deliveryMode); }
 
 // --- sending ---
 struct SendResult { ChannelError error = ChannelError::None; SequenceNum seq{}; };
+
+inline void cleanupAcked(Channel& ch);
+
+// The OLDEST message in the send buffer, in wraparound order.
+//
+// sendBuffer is a std::map keyed on the raw 16-bit sequence, because SequenceNum::operator< is a
+// numeric compare "for ordered containers only" -- so at the wrap the map's own order is not send
+// order: with 65533,65534,65535,0,1,2 queued it walks 0,1,2,65533,65534,65535 and begin() is the
+// NEWEST message. Every buffered sequence was issued before localSeq, so the true oldest is the first
+// key at or after localSeq, and the rest of send order continues from the map's start once the top is
+// exhausted -- a rotation of the key order, found in one lower_bound rather than a scan.
+inline std::map<SequenceNum, ChannelMessage>::iterator sendBufferOldest(Channel& ch) {
+    const auto it = ch.sendBuffer.lower_bound(ch.localSeq);
+    return it == ch.sendBuffer.end() ? ch.sendBuffer.begin() : it;
+}
+// Step to the next message in send order, wrapping back to the map's first key at the top.
+inline void sendBufferAdvance(Channel& ch, std::map<SequenceNum, ChannelMessage>::iterator& it) {
+    if (++it == ch.sendBuffer.end()) it = ch.sendBuffer.begin();
+}
 
 inline SendResult channelSend(Channel& ch, const Bytes& payload, MonoTime now) {
     if (static_cast<int>(payload.size()) > ch.config.maxMessageSize) return { ChannelError::MessageTooLarge, {} };
@@ -97,7 +135,7 @@ inline SendResult channelSend(Channel& ch, const Bytes& payload, MonoTime now) {
         // A reliable channel must never silently drop a buffered message -- it would break the
         // delivery guarantee and stall the receiver's ordering -- so it backpressures instead.
         if (ch.config.blockOnFull || isReliable(ch.config.deliveryMode)) return { ChannelError::BufferFull, {} };
-        ch.sendBuffer.erase(ch.sendBuffer.begin());   // unreliable: drop oldest to make room
+        ch.sendBuffer.erase(sendBufferOldest(ch));   // unreliable: drop oldest to make room (wrap-aware, not begin())
     }
     const SequenceNum seq = ch.localSeq;
     ch.sendBuffer[seq] = ChannelMessage{ seq, payload, now, false, 0, isReliable(ch.config.deliveryMode) };
@@ -106,15 +144,18 @@ inline SendResult channelSend(Channel& ch, const Bytes& payload, MonoTime now) {
     return { ChannelError::None, seq };
 }
 
-// Peek the next UNSENT message (lowest sequence first), looking PAST in-flight ones so several
-// messages can be in flight at once -- a sliding window, not stop-and-wait (one per RTT). Cleans
-// acked entries out. Returns a pointer INTO the send buffer (no payload copy); it is valid only
-// until the buffer is next mutated, so read it before commitOutgoingMessage, which consumes it.
+// Peek the next UNSENT message (OLDEST first, in wraparound order -- see sendBufferOldest), looking
+// PAST in-flight ones so several messages can be in flight at once -- a sliding window, not
+// stop-and-wait (one per RTT). Cleans acked entries out. Returns a pointer INTO the send buffer (no
+// payload copy); it is valid only until the buffer is next mutated, so read it before
+// commitOutgoingMessage, which consumes it.
 inline const ChannelMessage* peekOutgoingMessage(Channel& ch) {
-    for (auto it = ch.sendBuffer.begin(); it != ch.sendBuffer.end(); ) {
-        if (it->second.acked)           { it = ch.sendBuffer.erase(it); continue; }
-        if (it->second.retryCount == 0) return &it->second;   // first not-yet-sent message
-        ++it;                                                 // in flight, awaiting ack -> look past it
+    cleanupAcked(ch);   // done first, so the ordered walk below cannot erase under its own iterator
+    if (ch.sendBuffer.empty()) return nullptr;
+    auto it = sendBufferOldest(ch);
+    for (std::size_t n = ch.sendBuffer.size(); n > 0; --n) {
+        if (it->second.retryCount == 0) return &it->second;   // oldest not-yet-sent message
+        sendBufferAdvance(ch, it);                            // in flight, awaiting ack -> look past it
     }
     return nullptr;
 }
@@ -130,10 +171,15 @@ inline void commitOutgoingMessage(Channel& ch, SequenceNum seq, MonoTime now) {
     else                     ch.sendBuffer.erase(it);
 }
 
-// Reliable messages whose RTO has elapsed (or that were flagged for fast-retransmit). Returns
-// CANDIDATES only -- send state advances in commitRetransmit, called once a candidate is actually
-// admitted past the congestion budget, so a budget-blocked retransmit does not burn a retry or
-// reset its RTO. Messages past the retry limit are dropped here (that is not budget-gated).
+// Reliable messages whose RTO has elapsed (or that were flagged for fast-retransmit), OLDEST first in
+// wraparound order -- the caller spends a bounded receiver credit on them, so the order has to be real
+// send order and not the map's raw key order (see sendBufferOldest). Returns CANDIDATES only -- send
+// state advances in commitRetransmit, called once a candidate is actually admitted past the congestion
+// budget, so a budget-blocked retransmit does not burn a retry or reset its RTO. Messages past the
+// retry limit are dropped here (that is not budget-gated).
+//
+// The wait grows with the attempt (retransmitTimeoutMs): a fixed RTO spends ten retries inside a
+// second, which writes reliable messages off while the connection is still nowhere near its timeout.
 //
 // The candidates are POINTERS into the send buffer, not copies -- a retransmit pass runs every tick on
 // a lossy link, and copying each candidate's payload just to decide whether the budget admits it is a
@@ -142,24 +188,35 @@ inline void commitOutgoingMessage(Channel& ch, SequenceNum seq, MonoTime now) {
 // anything that erases from the send buffer, so do not hold them across a channelSend or channelUpdate.
 inline std::vector<const ChannelMessage*> getRetransmitMessages(Channel& ch, MonoTime now, double rtoMs) {
     std::vector<const ChannelMessage*> out;
-    if (!isReliable(ch.config.deliveryMode)) return out;
-    for (auto it = ch.sendBuffer.begin(); it != ch.sendBuffer.end(); ) {
-        ChannelMessage& msg = it->second;
-        if (msg.acked || msg.retryCount == 0) { ++it; continue; }
-        if (msg.retryCount > ch.config.maxReliableRetries) { it = ch.sendBuffer.erase(it); ch.totalDropped += 1; continue; }
-        if (msg.forceRetransmit || elapsedMs(msg.sendTime, now) >= rtoMs) out.push_back(&msg);
-        ++it;
+    if (!isReliable(ch.config.deliveryMode) || ch.sendBuffer.empty()) return out;
+    auto it = sendBufferOldest(ch);
+    for (std::size_t n = ch.sendBuffer.size(); n > 0; --n) {
+        const auto cur = it;
+        sendBufferAdvance(ch, it);   // stepped before any erase below, which invalidates only `cur`
+        ChannelMessage& msg = cur->second;
+        if (msg.acked || msg.retryCount == 0) continue;
+        if (msg.retryCount > ch.config.maxReliableRetries) {
+            ch.sendBuffer.erase(cur);
+            ch.totalDropped          += 1;
+            ch.totalReliableDropped  += 1;   // the delivery guarantee just failed; the app must be able to see it
+            if (ch.sendBuffer.empty()) break;
+            continue;
+        }
+        if (msg.forceRetransmit || elapsedMs(msg.sendTime, now) >= retransmitTimeoutMs(rtoMs, msg.retryCount))
+            out.push_back(&msg);
     }
     return out;
 }
 // Commit a retransmit that was actually admitted (enqueued past the budget): advance its send time
-// and retry count and clear the fast-retransmit flag. Mirrors the peek/commit split for fresh sends.
+// and retry count, clear the fast-retransmit flag, and rewind the fragment cursor for the next
+// attempt. Mirrors the peek/commit split for fresh sends.
 inline void commitRetransmit(Channel& ch, SequenceNum seq, MonoTime now) {
     auto it = ch.sendBuffer.find(seq);
     if (it == ch.sendBuffer.end() || it->second.acked || it->second.retryCount == 0) return;
     it->second.forceRetransmit = false;
     it->second.sendTime        = now;
     it->second.retryCount     += 1;
+    it->second.retxFragment    = 0;
     ch.totalRetransmits        += 1;
 }
 
@@ -271,11 +328,29 @@ inline void flushOrderedBuffer(Channel& ch) {
 }
 
 // --- flow control ---
-// Free slots in the receive buffer: the credit this channel advertises to its sender. Counted in
-// MESSAGES, because that is the unit maxReceiveBufferSize caps.
+// Free slots: the credit this channel advertises to its sender. Counted in MESSAGES, because that is
+// the unit the buffer caps are in.
+//
+// An ordered channel has a SECOND buffer and it has to be part of the answer. While a gap is open,
+// everything arriving behind it goes to the reorder buffer, bufferOrdered refuses at
+// maxOrderedBufferSize, and the refused packets go unacked -- so a credit counting only the receive
+// buffer advertises room the receiver does not have. The sender then retransmits into a buffer that
+// stays full until orderedBufferTimeout, which outlasts a retry budget, and the messages behind the
+// gap are destroyed instead of delayed.
+//
+// The OCCUPANCY is what counts, not the cap: with the reorder buffer empty every arrival is delivered
+// straight through and the receive buffer is the only limit. The floor of one slot is what keeps a
+// full reorder buffer backpressure rather than deadlock -- the message that FILLS the gap is delivered
+// straight through and never touches the reorder buffer, so the window must never close on the one
+// message that would drain it, and the sender retransmits oldest-first, which is exactly that message.
 inline int channelFreeReceiveSlots(const Channel& ch) noexcept {
     const int used = static_cast<int>(ch.receiveBuffer.size());
-    return used >= ch.config.maxReceiveBufferSize ? 0 : ch.config.maxReceiveBufferSize - used;
+    const int free = used >= ch.config.maxReceiveBufferSize ? 0 : ch.config.maxReceiveBufferSize - used;
+    if (free == 0 || !isOrdered(ch.config.deliveryMode)) return free;
+    const int buffered = static_cast<int>(ch.orderedBuffer.size());
+    if (buffered == 0) return free;
+    const int reordFree = buffered >= ch.config.maxOrderedBufferSize ? 0 : ch.config.maxOrderedBufferSize - buffered;
+    return std::max(1, std::min(free, reordFree));
 }
 // Reliable messages sent and not yet acked. Each one may still need a slot at the receiver, so this
 // is what the peer's advertised credit is spent against. Unsent messages (retryCount 0) are still
@@ -351,7 +426,7 @@ inline void resetChannel(Channel& ch) {
     ch.orderedExpected = {};
     ch.recvDedup       = ReceivedBuffer{};
     ch.totalSent = ch.totalReceived = ch.totalRetransmits = 0;
-    ch.totalDropped = ch.totalDuplicate = ch.totalRefused = 0;
+    ch.totalDropped = ch.totalDuplicate = ch.totalRefused = ch.totalReliableDropped = 0;
 }
 
 } // namespace aether

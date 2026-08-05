@@ -21,10 +21,6 @@ struct Ranged {
                   "Ranged: range too wide (> 32 bits); split the field");
 
     T value{ Lo };
-
-    constexpr Ranged() = default;
-    constexpr Ranged(T v) noexcept : value(v) {}
-    constexpr operator T() const noexcept { return value; }
 };
 
 // A float in [Lo, Hi] sent as `Bits` of fixed-point precision (a compressed float).
@@ -34,10 +30,6 @@ struct Quantized {
     static_assert(Lo < Hi, "Quantized<Lo,Hi>: Lo must be < Hi");
 
     float value{ Lo };
-
-    constexpr Quantized() = default;
-    constexpr Quantized(float v) noexcept : value(v) {}
-    constexpr operator float() const noexcept { return value; }
 };
 
 // ---- type traits: is this a wire-contract type? ----
@@ -70,7 +62,13 @@ inline void readWire(BitReader& rd, Ranged<T, Lo, Hi>& r) noexcept {
 
 template <float Lo, float Hi, int Bits>
 inline void writeWire(BitWriter& w, const Quantized<Lo, Hi, Bits>& q) noexcept {
-    const float c = q.value < Lo ? Lo : (q.value > Hi ? Hi : q.value);
+    // NaN has to land on Lo, and the order of the tests is what puts it there: every comparison
+    // against NaN is false, so a clamp phrased the natural way round (below-Lo first) leaves NaN
+    // untouched and hands it to the uint32 cast below, which is undefined for a non-finite float.
+    // Testing `> Lo` first takes NaN down the Lo branch, the same defined-in-range fallback
+    // interest.hpp gives a non-finite coordinate -- a physics blowup makes this a real input.
+    // Infinities need no special case: +inf > Hi and -inf < Lo, so they clamp on their own.
+    const float c = q.value > Lo ? (q.value > Hi ? Hi : q.value) : Lo;
     const std::uint32_t maxv = static_cast<std::uint32_t>((std::uint64_t{ 1 } << Bits) - 1);   // 64-bit shift: valid for Bits up to 32
     // math in double: static_cast<float>(maxv) rounds 2^32-1 up to 2^32, so at Bits==32 a
     // value of Hi would cast an out-of-range float to uint32 (UB). double holds maxv exactly.

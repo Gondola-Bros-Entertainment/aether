@@ -1,13 +1,16 @@
 // aether - real UDP IO loop. A Host owns a socket and a NetPeer; hostTick drains all pending
 // datagrams (non-blocking), validates+strips their CRC, runs the pure peerProcess, and sends the
-// replies. A non-blocking drain per tick keeps it simple; a dedicated receive thread can be layered
-// on later. Data-first: a plain Host struct + free functions.
+// replies. One non-blocking drain per tick, on the caller's thread.
+// Data-first: a plain Host struct + free functions.
 #pragma once
 
+#include "aether/config.hpp"
+#include "aether/connection.hpp"
 #include "aether/peer.hpp"
 #include "aether/rendezvous.hpp"
 #include "aether/security.hpp"
 #include "aether/socket.hpp"
+#include "aether/types.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -74,9 +77,9 @@ inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<Chan
             continue;
         }
         // Ordinary peer traffic, the hot path: check the CRC in place on the scratch and materialize
-        // the payload exactly once. Copying the datagram and then copying again to strip four
-        // trailing bytes cost two allocations per datagram, which is what crc32StrippedLen exists
-        // to avoid -- so the zero-copy receive path now starts at the socket, not at the peer layer.
+        // the payload exactly once. Copying the datagram and then copying it again to strip the four
+        // trailing CRC bytes would cost two allocations per datagram, which is what crc32StrippedLen
+        // exists to avoid.
         if (const auto payloadLen = crc32StrippedLen(scratch.data(), len))
             incoming.push_back(IncomingPacket{ PeerId{ from },
                                                Bytes(scratch.begin(), scratch.begin() + static_cast<std::ptrdiff_t>(*payloadLen)) });

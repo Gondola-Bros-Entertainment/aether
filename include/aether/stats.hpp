@@ -38,6 +38,12 @@ struct NetworkStats {
     CongestionLevel   congestionLevel    = CongestionLevel::None;
     std::uint64_t     decryptionFailures = 0;
     int               pathMtu            = 0;     // confirmed path MTU (config.mtu until discovery raises it)
+    // Reliable messages the transport gave up on, summed over the connection's channels: the retry
+    // budget was spent without an ack, or the message could not be fragmented at all. NONZERO MEANS
+    // THE DELIVERY GUARANTEE WAS BROKEN -- the peer never got that data and never will. Nothing else
+    // here reports it: loss and quality describe the path, and a channel can lose a reliable message
+    // on a path those two still grade as healthy.
+    std::uint64_t     reliableDropped    = 0;
 };
 
 } // namespace aether

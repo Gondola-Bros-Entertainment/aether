@@ -28,7 +28,7 @@ On a 12-field snapshot with two fields changed, aether writes 8 bytes where zpp:
 both write 40. The diff costs a few nanoseconds of CPU, and on a bandwidth-bound network fewer
 bytes on the wire is the trade that matters. Past 16 fields the changemask adapts: a small number
 of changes is sent as sparse indices rather than a full bitmap, so one changed field in a 32-field
-struct costs a 2-byte mask instead of 4. To reproduce:
+struct costs a 2-byte mask instead of 5. To reproduce:
 
 ```sh
 cmake -B build -DAETHER_BENCH_COMPARE=ON

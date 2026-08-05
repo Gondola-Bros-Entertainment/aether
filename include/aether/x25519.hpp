@@ -1,9 +1,9 @@
 // aether - X25519 (Curve25519 ECDH, RFC 7748) from scratch, no dependencies. The field is
 // GF(2^255-19) in radix 2^16: sixteen int64 limbs, so every limb product stays well inside 64 bits
 // -- no 128-bit integers, MSVC-portable (the same constraint that shapes the poly1305 here). The
-// scalar multiply is the Montgomery ladder with a constant-time conditional swap. Verified against
-// the RFC 7748 section 5.2 test vector. Data-first: a field element is a plain array; free functions
-// transform it.
+// scalar multiply is the Montgomery ladder with a constant-time conditional swap. Pinned to both
+// RFC 7748 section 5.2 vectors, the section 5.2 iterated vectors, and the known small-order points
+// (crypto_window_test.cpp). Data-first: a field element is a plain array; free functions transform it.
 #pragma once
 
 #include <array>

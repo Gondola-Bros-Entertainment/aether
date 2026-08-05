@@ -1,6 +1,7 @@
-// aether - clocksync edge behavior. Pins three things an audit found untested: bestRttMs decays
-// UPWARD (a fluke-low best is forgotten, not pinned forever), a negative RTT sample is rejected,
-// and the offset EMA smooths toward the observed offset. assert() IS the check -> no NDEBUG.
+// aether - clocksync edge behavior. Pins the sample filter (a negative RTT and any non-finite input
+// are rejected, not absorbed), that bestRttMs decays UPWARD (a fluke-low best is forgotten, not
+// pinned forever), and that the offset EMA smooths toward the observed offset. assert() IS the
+// check -> no NDEBUG.
 #include <aether/clocksync.hpp>
 
 #include <cassert>
@@ -43,6 +44,40 @@ int main() {
         aether::clockSyncObserve(cs, 100.0, 9999.0, 50.0);   // rtt = -50 -> rejected
         assert(cs.offsetMs > keepOffset - eps && cs.offsetMs < keepOffset + eps);
         assert(cs.bestRttMs > keepBest - eps && cs.bestRttMs < keepBest + eps);
+    }
+
+    // A non-finite sample is rejected on every input, not absorbed. remoteMs comes off the wire, and
+    // one NaN would otherwise reach the EMA, which has no way back: every later estimate blends with
+    // a NaN and stays one, while clockOffsetErrorBoundMs reads bestRttMs and keeps reporting a small
+    // healthy bound over an offset that is not a number -- fail-open on the guard callers check
+    // before lag compensation. Downstream, an interpolation sample at a NaN time returns nothing at
+    // all, forever.
+    {
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        const double inf = std::numeric_limits<double>::infinity();
+
+        aether::ClockSync cs;
+        aether::clockSyncObserve(cs, 0.0, 25.0, 40.0);   // one healthy sample -> known state
+        const double keepOffset = cs.offsetMs;
+        const double keepBest   = cs.bestRttMs;
+
+        aether::clockSyncObserve(cs, 0.0, nan, 40.0);    // non-finite remote clock (peer-supplied)
+        aether::clockSyncObserve(cs, 0.0, inf, 40.0);
+        aether::clockSyncObserve(cs, 0.0, -inf, 40.0);
+        aether::clockSyncObserve(cs, nan, 25.0, 40.0);   // and non-finite local stamps
+        aether::clockSyncObserve(cs, 0.0, 25.0, nan);
+        aether::clockSyncObserve(cs, inf, 25.0, inf);
+        assert(!std::isnan(cs.offsetMs) && !std::isnan(cs.bestRttMs));
+        assert(cs.offsetMs > keepOffset - eps && cs.offsetMs < keepOffset + eps);   // untouched
+        assert(cs.bestRttMs > keepBest - eps && cs.bestRttMs < keepBest + eps);
+
+        // The estimate still tracks: 500 healthy samples after the bad ones converge normally, and
+        // the reported bound stays finite and consistent with the offset it describes.
+        const double remote = 200.0 + 40.0 / 2.0;   // t0=0, t2=40 -> midpoint 20 -> offset 200
+        for (int i = 0; i < 500; ++i) aether::clockSyncObserve(cs, 0.0, remote, 40.0);
+        const double bound = aether::clockOffsetErrorBoundMs(cs);
+        assert(std::isfinite(cs.offsetMs) && cs.offsetMs > 199.0 && cs.offsetMs < 201.0);
+        assert(std::isfinite(bound) && bound > 0.0);
     }
 
     // Offset EMA smooths toward the observed offset across non-best samples. First sample sets a

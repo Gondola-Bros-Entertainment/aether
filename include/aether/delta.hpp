@@ -1,7 +1,7 @@
-// aether - the magic path. Define a plain struct; aether reflects it, varint-packs the
-// primitives, and (the part nobody ships standalone) computes a delta against the previous
-// snapshot so only the fields that CHANGED go on the wire. Zero annotations, zero codegen,
-// the developer never thinks about bits or deltas. Data-first: free functions over plain T.
+// aether - serialization and delta compression over plain structs. reflect.hpp decomposes an
+// aggregate into its fields; packValue varint-packs each one; deltaPack writes a changemask plus
+// only the fields that differ from a previous snapshot. No annotations, no codegen, no per-type
+// registration. Data-first: free functions over plain T.
 #pragma once
 
 #include "aether/reflect.hpp"
@@ -29,10 +29,25 @@ constexpr void forEachFieldPair(const T& a, const T& b, F&& f) {
     }(std::make_index_sequence<std::tuple_size_v<decltype(ta)>>{});
 }
 
-// Deep field equality: primitives compare directly, nested aggregates recurse.
+// Deep field equality: primitives compare directly, nested aggregates and containers recurse.
+// This decides what goes on the wire, so it has to agree with packValue at EVERY depth. Containers
+// therefore recurse per element instead of calling operator==, which would compare their elements by
+// value: inside a vector or an optional that makes +0.0 and -0.0 equal (a sign flip the receiver
+// never hears about) and NaN never-equal (an unchanged field re-sent every tick), and it does not
+// compile at all for a container of plain aggregates, which have no operator==.
 template <class T> bool fieldEqual(const T& a, const T& b) {
     if constexpr (std::is_enum_v<T>) {
         return a == b;
+    } else if constexpr (detail::isStdString<T>) {
+        return a == b;                                     // bytes: no float or aggregate element to recurse into
+    } else if constexpr (detail::isStdVector<T>) {
+        if (a.size() != b.size()) return false;
+        for (std::size_t i = 0; i < a.size(); ++i)
+            if (!fieldEqual(a[i], b[i])) return false;
+        return true;
+    } else if constexpr (detail::isStdOptional<T>) {
+        if (a.has_value() != b.has_value()) return false;
+        return !a.has_value() || fieldEqual(*a, *b);
     } else if constexpr (std::is_aggregate_v<T>) {
         bool eq = true;
         forEachFieldPair(a, b, [&](const auto& x, const auto& y) { if (eq) eq = fieldEqual(x, y); });
@@ -66,6 +81,14 @@ template <class T> void packValue(Writer& w, const T& v) {
 }
 template <class T> bool unpackValue(Reader& r, T& v) {
     if constexpr (std::is_enum_v<T>) {
+        // A fixed underlying type is what makes the cast below total: the enum can hold every bit
+        // pattern of that type, so no wire value is out of range. Reject the other form at compile
+        // time rather than cast an untrusted integer into an enum that cannot represent it (UB).
+        static_assert(detail::enumHasFixedUnderlying<T>,
+                      "aether: a serializable enum needs a fixed underlying type (enum class E, or enum E : "
+                      "std::uint8_t). Without one its valid values are bounded by its enumerators, which "
+                      "reflection cannot see, so an out-of-range wire value would be undefined behaviour "
+                      "instead of a rejected packet.");
         std::underlying_type_t<T> u{};
         if (!unpackValue(r, u)) return false;
         v = static_cast<T>(u);
@@ -91,8 +114,12 @@ template <class T> bool unpackValue(Reader& r, T& v) {
         for (std::uint64_t k = 0; k < *n; ++k) { typename T::value_type e{}; if (!unpackValue(r, e)) return false; v.push_back(std::move(e)); }
         return true;
     } else if constexpr (detail::isStdOptional<T>) {
+        // One wire form per value: the encoder writes 0 or 1, so every other byte is rejected rather
+        // than folded into "present". Treating any nonzero as present would give 255 encodings of one
+        // optional, and a change-set has exactly one encoding here -- the same rule varint.hpp
+        // enforces against an overlong integer and the changemask against a set padding bit.
         const auto f = read<std::uint8_t>(r);
-        if (!f) return false;
+        if (!f || *f > 1) return false;
         if (*f) { typename T::value_type tmp{}; if (!unpackValue(r, tmp)) return false; v = std::move(tmp); }
         else v.reset();
         return true;
@@ -102,7 +129,7 @@ template <class T> bool unpackValue(Reader& r, T& v) {
         return ok;
     } else if constexpr (std::is_same_v<T, bool>) {
         const auto b = read<std::uint8_t>(r);
-        if (!b) return false;
+        if (!b || *b > 1) return false;   // canonical: 0 or 1, as packValue writes (see the optional flag)
         v = (*b != 0);
         return true;
     } else if constexpr (std::is_floating_point_v<T>) {
@@ -137,7 +164,7 @@ template <class T> std::optional<T> unpack(Reader& r) {
 //     follow (strictly ascending); 0xFF means a full bitmap follows. Sparse is chosen exactly when
 //     it is strictly smaller, so a wide struct with few changed fields -- the replication steady
 //     state -- pays per change, not per field. (A 32-field struct sends one changed field under a
-//     2-byte mask instead of 4.)
+//     2-byte mask -- mode byte plus index -- instead of 5, the mode byte plus a 4-byte bitmap.)
 // Both sides derive the layout from fieldCount<T>() alone, so encode and decode cannot disagree.
 // The decoder rejects every encoding the encoder would not produce (non-canonical): sparse where a
 // bitmap was due (and vice versa), unordered or out-of-range indices, padding bits -- one change-set,

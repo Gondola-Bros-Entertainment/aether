@@ -5,6 +5,7 @@
 // struct mutated by free functions.
 #pragma once
 
+#include <cmath>
 #include <limits>
 
 namespace aether {
@@ -23,9 +24,17 @@ struct ClockSync {
 // round-trip is a better sample, so a new best RTT is taken directly; otherwise the estimate is
 // EMA-smoothed to ride out jitter.
 inline void clockSyncObserve(ClockSync& cs, double localSendMs, double remoteMs, double localRecvMs) {
+    // remoteMs is a peer-supplied number and the local stamps come from the app, so no input is
+    // trusted to be finite. One non-finite sample is permanent damage: the EMA folds a NaN offset
+    // into every later estimate and never folds it back out, while clockOffsetErrorBoundMs reads
+    // bestRttMs and keeps reporting a healthy bound over an offset that is not a number. A rejected
+    // sample costs one round-trip; an absorbed one costs the connection its timeline.
+    if (!std::isfinite(localSendMs) || !std::isfinite(remoteMs) || !std::isfinite(localRecvMs)) return;
     const double rtt = localRecvMs - localSendMs;
     if (rtt < 0.0) return;                                       // out-of-order / bogus sample
     const double offset = remoteMs - (localSendMs + localRecvMs) / 2.0;
+    // Finite inputs at the extremes can still overflow the subtraction, so check the results too.
+    if (!std::isfinite(rtt) || !std::isfinite(offset)) return;
     if (!cs.hasSample || rtt < cs.bestRttMs) {
         cs.offsetMs  = offset;
         cs.bestRttMs = rtt;
