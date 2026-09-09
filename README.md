@@ -33,7 +33,7 @@ cmake --build build --config Debug
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-CI runs cppcheck, ASan/UBSan, compiler tests with GCC, Clang, and MSVC, and an installed-package
+CI uses cppcheck 2.21.0, ASan/UBSan, compiler tests with GCC, Clang, and MSVC, and an installed-package
 consumer on Linux, macOS, and Windows. Keep test builds in Debug: some existing tests use
 `assert`, which Release builds disable.
 

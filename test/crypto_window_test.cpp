@@ -237,6 +237,7 @@ void testPoly1305Incremental() {
             aether::detail::Poly1305State st;
             aether::detail::poly1305Init(st, key.data());
             aether::detail::poly1305Update(st, msg.data(), i);
+            aether::detail::poly1305Update(st, nullptr, 0); // Empty update preserves every partial-block position.
             aether::detail::poly1305Update(st, msg.data() + i, j - i);
             aether::detail::poly1305Update(st, msg.data() + j, n - j);
             std::uint8_t got[16];

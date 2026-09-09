@@ -184,6 +184,7 @@ inline void poly1305Absorb(Poly1305State& st, const std::uint8_t buf[17]) noexce
 }
 
 inline void poly1305Update(Poly1305State& st, const std::uint8_t* msg, std::size_t len) noexcept {
+    if (len == 0) return; // Empty updates accept nullptr and leave a carried partial block intact.
     std::size_t  off = 0;
     std::uint8_t buf[17];
     if (st.blockLen > 0) {                                       // top up a carried partial block first

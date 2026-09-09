@@ -11,16 +11,41 @@ on:
 jobs:
   cppcheck:
     name: cppcheck
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    env:
+      CPPCHECK_VERSION: 2.21.0
     steps:
       - uses: actions/checkout@v5
-      - name: Install cppcheck
-        run: sudo apt-get update && sudo apt-get install -y cppcheck
+      - name: Cache cppcheck
+        id: cppcheck-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/cppcheck
+          key: cppcheck-${{ env.CPPCHECK_VERSION }}-ubuntu24-${{ runner.arch }}-v1
+      - name: Check out cppcheck source
+        if: steps.cppcheck-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v5
+        with:
+          repository: cppcheck-opensource/cppcheck
+          ref: e73bf44c3e49686b7495fab352d03a6c6075516b # 2.21.0
+          path: .tools/cppcheck
+          persist-credentials: false
+      - name: Build cppcheck
+        if: steps.cppcheck-cache.outputs.cache-hit != 'true'
+        run: |
+          cmake -S .tools/cppcheck -B "$RUNNER_TEMP/cppcheck-build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$RUNNER_TEMP/cppcheck" \
+            -DBUILD_GUI=OFF -DBUILD_TESTS=OFF
+          cmake --build "$RUNNER_TEMP/cppcheck-build" --parallel 2
+          cmake --install "$RUNNER_TEMP/cppcheck-build"
       - name: Run cppcheck
-        run: >
-          cppcheck --enable=warning,performance,portability --std=c++20
-          --error-exitcode=1 --quiet
-          -I include src test bench
+        run: |
+          "$RUNNER_TEMP/cppcheck/bin/cppcheck" --version
+          test "$("$RUNNER_TEMP/cppcheck/bin/cppcheck" --version)" = "Cppcheck $CPPCHECK_VERSION"
+          "$RUNNER_TEMP/cppcheck/bin/cppcheck" \
+            --enable=warning,performance,portability --std=c++20 \
+            --error-exitcode=1 --quiet -I include src test bench
 
   sanitizers:
     name: asan + ubsan
