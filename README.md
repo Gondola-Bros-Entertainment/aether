@@ -37,16 +37,21 @@ CI uses cppcheck 2.21.0, ASan/UBSan, compiler tests with GCC, Clang, and MSVC, a
 consumer on Linux, macOS, and Windows. Keep test builds in Debug: some existing tests use
 `assert`, which Release builds disable.
 
-The [echo server](examples/echo_server.cpp) and [echo client](examples/echo_client.cpp) show the
-socket API with a network loop and connection events. Run them in separate terminals:
+The [echo server](examples/echo_server.cpp) and [echo client](examples/echo_client.cpp) demonstrate
+connection events, error handling, and a reliable ordered request/reply. Run them in separate terminals:
 
 ```sh
-./build/aether_echo_server
-./build/aether_echo_client
+./build/aether_echo_server 7777
+./build/aether_echo_client 127.0.0.1 7777 "hello aether"
 ```
 
-They default to port 7777 and localhost. With a multi-configuration generator, the executables
-are in the configuration directory, such as `build/Debug`.
+The client verifies the reply and exits with status zero. Invalid arguments, send rejection,
+disconnection, a mismatched reply, or a 10-second deadline return a nonzero status. The default
+channel accepts messages up to 1024 bytes. With no arguments, the client uses localhost:7777 and
+sends `hello aether`; the server defaults to port 7777 and runs until interrupted with Ctrl+C.
+
+These examples use the current unauthenticated encrypted handshake. With a multi-configuration
+generator, executables are in the configuration directory, such as `build/Debug`.
 
 ### Use from CMake
 

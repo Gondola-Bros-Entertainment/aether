@@ -1,6 +1,14 @@
-// Minimal package smoke test: include the umbrella (which needs C++20) and link the imported
-// target. Compiles only if find_package located the installed headers AND aether::aether
-// propagated the C++20 requirement. The CI "package" job builds this against an installed prefix.
 #include <aether/aether.hpp>
 
-int main() { return 0; }
+#include <array>
+#include <cstdint>
+
+int main() {
+    // Force the installed library's platform object and native dependencies to link.
+    std::array<std::uint8_t, 32> random{};
+    aether::secureRandomBytes(random.data(), random.size());
+    const auto address = aether::addrLocalhost(7777);
+    const auto encoded = aether::serializeAddr(address);
+    const auto decoded = aether::deserializeAddr(encoded.data(), encoded.size());
+    return decoded && aether::addrEqual(address, *decoded) && aether::addrPort(*decoded) == 7777 ? 0 : 1;
+}

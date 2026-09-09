@@ -125,9 +125,8 @@ if(AETHER_BENCH_COMPARE)
 endif()
 
 # --- examples ---
-# The echo pair: real programs on the public API (run the server, then type at it through the
-# client). Default ON only when aether is the top-level build, same as the install rules, so a
-# parent project pulling aether in does not grow example binaries.
+# The echo pair uses the public API. Default ON only for top-level builds so dependency
+# consumers do not inherit example binaries.
 option(AETHER_EXAMPLES "Build the example programs" ${PROJECT_IS_TOP_LEVEL})
 if(AETHER_EXAMPLES)
     add_executable(aether_echo_server examples/echo_server.cpp)
