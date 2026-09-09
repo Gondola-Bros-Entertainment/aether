@@ -7,6 +7,15 @@ int main() {
     using namespace aether;
     using aether::test::require;
     const auto destination = addrLocalhost(19001);
+    Socket unopened;
+    std::array<std::uint8_t, 1> byte{};
+    Address source;
+    // Must classify consistently even before Windows initializes Winsock.
+    require(recvFrom(unopened, byte, source) == -1);
+    require(unopened.lastReceiveError.code == SocketErrorCode::Closed);
+    require(sendTo(unopened, byte, destination) == -1);
+    require(unopened.lastSendError.code == SocketErrorCode::Closed);
+    require(unopened.receiveErrors == 1 && unopened.sendErrors == 1);
     require(addressValid(destination));
     require(addressValid(addrAny6(0)));
     Address invalid;

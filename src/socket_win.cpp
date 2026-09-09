@@ -167,7 +167,8 @@ Address localAddr(const Socket& s) {
 
 int sendTo(Socket& s, std::span<const std::uint8_t> data, const Address& to) {
     s.lastSendError = {};
-    if (!addressValid(to)) s.lastSendError = {SocketErrorCode::InvalidAddress, 0};
+    if (s.fd == invalidSocket) s.lastSendError = {SocketErrorCode::Closed, 0};
+    else if (!addressValid(to)) s.lastSendError = {SocketErrorCode::InvalidAddress, 0};
     else if (data.size() > maxUdpPayloadSize) s.lastSendError = {SocketErrorCode::MessageTooLarge, 0};
     if (s.lastSendError.code != SocketErrorCode::None) { ++s.sendErrors; return -1; }
     const int n = ::sendto(static_cast<SOCKET>(s.fd), reinterpret_cast<const char*>(data.data()),
@@ -190,6 +191,11 @@ int sendTo(Socket& s, std::span<const std::uint8_t> data, const Address& to) {
 int recvFrom(Socket& s, std::span<std::uint8_t> buf, Address& from) {
     s.lastReceiveError = {};
     from = Address{};
+    if (s.fd == invalidSocket) {
+        s.lastReceiveError = {SocketErrorCode::Closed, 0};
+        ++s.receiveErrors;
+        return -1;
+    }
     int       len = sizeof(from.storage);
     const int n   = ::recvfrom(static_cast<SOCKET>(s.fd), reinterpret_cast<char*>(buf.data()),
                                static_cast<int>(std::min<std::size_t>(buf.size(), maxUdpPacketSize)), 0, sa(from), &len);

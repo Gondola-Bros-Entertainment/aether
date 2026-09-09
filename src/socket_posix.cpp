@@ -161,7 +161,8 @@ Address localAddr(const Socket& s) {
 
 int sendTo(Socket& s, std::span<const std::uint8_t> data, const Address& to) {
     s.lastSendError = {};
-    if (!addressValid(to)) s.lastSendError = {SocketErrorCode::InvalidAddress, 0};
+    if (s.fd == invalidSocket) s.lastSendError = {SocketErrorCode::Closed, 0};
+    else if (!addressValid(to)) s.lastSendError = {SocketErrorCode::InvalidAddress, 0};
     else if (data.size() > maxUdpPayloadSize) s.lastSendError = {SocketErrorCode::MessageTooLarge, 0};
     if (s.lastSendError.code != SocketErrorCode::None) { ++s.sendErrors; return -1; }
     ssize_t n;
@@ -184,6 +185,11 @@ int sendTo(Socket& s, std::span<const std::uint8_t> data, const Address& to) {
 int recvFrom(Socket& s, std::span<std::uint8_t> buf, Address& from) {
     s.lastReceiveError = {};
     from = Address{};
+    if (s.fd == invalidSocket) {
+        s.lastReceiveError = {SocketErrorCode::Closed, 0};
+        ++s.receiveErrors;
+        return -1;
+    }
     socklen_t len = sizeof(from.storage);
     ssize_t   n;
     do { len = sizeof(from.storage); n = ::recvfrom(s.fd, buf.data(), buf.size(), 0, sa(from), &len); }
