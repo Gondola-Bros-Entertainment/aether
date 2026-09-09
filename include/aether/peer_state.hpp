@@ -51,7 +51,7 @@ struct PeerEvent {
     Bytes               data{};                                      // Message
     PeerId              other{};                                     // Migrated: new id (peer = old)
     std::uint64_t       playerId = 0;                                // Connected / Reconnected: verified connect-token identity (server side)
-    Bytes               userData;                                    // verified application claims (server side)
+    Bytes               userData{};                                  // verified application claims (server side)
 };
 inline PeerEvent evConnected(const PeerId& p, ConnectionDirection d, std::uint64_t playerId = 0) { return { .kind = PeerEvent::Connected, .peer = p, .direction = d, .playerId = playerId }; }
 inline PeerEvent evDisconnected(const PeerId& p, DisconnectReason r) { return { .kind = PeerEvent::Disconnected, .peer = p, .reason = r }; }
