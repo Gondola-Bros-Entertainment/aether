@@ -16,7 +16,7 @@ void handshakeTestRandomBytes(std::uint8_t* out, std::size_t count) {
 int main() {
     using namespace aether;
     const PeerId remote{addrLocalhost(18001)};
-    auto peer = newPeerState(addrLocalhost(18000), NetworkConfig{}, MonoTime{1});
+    auto peer = newPeerState(addrLocalhost(18000), aether::test::anonymousConfig<NetworkConfig>(), MonoTime{1});
     peerConnect(peer, remote, MonoTime{1});
     Packet invalid{PacketHeader{PacketType::ConnectionChallenge, {}, {}, 0}, encodeSaltAndKey(42, X25519Key{})};
     const int before = randomCalls;
@@ -25,7 +25,7 @@ int main() {
     aether::test::require(peer.pending.at(remote).challengeKeyAttempts == maxChallengeKeyAttempts);
     aether::test::require(!peer.pending.at(remote).ephemeralReady);
     // Retrying an already accepted challenge still works after the remaining work budget is spent.
-    peer = newPeerState(addrLocalhost(18000), NetworkConfig{}, MonoTime{1});
+    peer = newPeerState(addrLocalhost(18000), aether::test::anonymousConfig<NetworkConfig>(), MonoTime{1});
     peerConnect(peer, remote, MonoTime{1});
     X25519Key priv{}, pub{};
     genEphemeralKeypair(priv, pub);

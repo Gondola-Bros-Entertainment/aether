@@ -15,6 +15,7 @@
 #include <cstring>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -171,35 +172,67 @@ inline bool rateLimiterAllow(RateLimiter& rl, std::uint64_t addrKey, MonoTime no
 
 // --- connect tokens (AEAD-sealed) ---
 // Connect tokens seal application-issued claims under a key shared by the issuer and admitting
-// servers. Validation checks the ChaCha20-Poly1305 seal and expiry; the token is a bearer credential.
-// It does not bind the presenter to a handshake key. Account integration belongs to the application.
+// servers. The sealed claims contain a per-client PSK and protocol/audience scope.
+// Network admission also proves possession through Noise. Account integration belongs to the application.
 inline constexpr std::size_t connectTokenNonceBytes = 12;   // 96-bit random nonce (IETF ChaCha20-Poly1305 width)
-// "TOKN" -- the domain separator, bound as AEAD AAD so a token sealed for this purpose cannot be
+// "TKN2" -- the versioned domain separator, bound as AEAD AAD so a token sealed for this purpose cannot be
 // confused with other ciphertext minted under the same key.
-inline constexpr std::array<std::uint8_t, 4> connectTokenDomainBytes = { 'T', 'O', 'K', 'N' };
+inline constexpr std::array<std::uint8_t, 4> connectTokenDomainBytes = { 'T', 'K', 'N', '2' };
 using TokenNonce = std::array<std::uint8_t, connectTokenNonceBytes>;
+inline constexpr std::size_t connectTokenClaimsBytes = 60;
+inline constexpr std::size_t maxConnectTokenUserData = 256;
+inline constexpr std::size_t maxSealedConnectTokenBytes = connectTokenNonceBytes + connectTokenClaimsBytes
+    + maxConnectTokenUserData + authTagSize;
+
+struct TokenScope {
+    std::uint32_t protocolId = 0;
+    std::uint64_t audience = 0; // application-assigned server or admission authority
+    friend bool operator==(const TokenScope&, const TokenScope&) = default;
+};
 
 struct ConnectToken {
     std::uint64_t playerId{};    // application-issued numeric identity; no account-provider dependency
     UnixTime      expiresAt{};   // shared Unix epoch expiry; distinct from the transport's monotonic clock
     Bytes         userData;      // opaque app data carried to the server (role, region, ...)
+    TokenScope    scope{};
+    EncryptionKey proofKey{};   // issuer/server only; the client receives its own copy separately
+    ~ConnectToken() { detail::secureZero(proofKey.data(), proofKey.size()); }
 };
+
+struct ConnectCredential {
+    Bytes token;
+    EncryptionKey proofKey{};
+    TokenScope scope{};
+    UnixTime expiresAt{};
+    ~ConnectCredential() { detail::secureZero(proofKey.data(), proofKey.size()); }
+};
+
+inline bool nonzeroKey(const EncryptionKey& key) noexcept {
+    std::uint8_t combined = 0;
+    for (const auto byte : key) combined |= byte;
+    return combined != 0;
+}
 
 // Seal a token under the server key -- call this in your backend, after the player authenticates.
 // Output is [nonce:12][ciphertext][tag:16]. The nonce is a 96-bit CSPRNG draw (the IETF
 // ChaCha20-Poly1305 width): random-nonce collision stays negligible to ~2^32 tokens per key, and
 // the nonce doubles as the token's identity for replay defense.
 inline Bytes sealConnectToken(const EncryptionKey& key, const ConnectToken& t) {
+    if (t.userData.size() > maxConnectTokenUserData) throw std::invalid_argument("Connect token user data exceeds limit");
     std::uint8_t nonce[connectTokenNonceBytes];
     secureRandomBytes(nonce, sizeof nonce);
-    Bytes pt(16 + t.userData.size());
+    Bytes pt(connectTokenClaimsBytes + t.userData.size());
     putU64(pt.data(),     t.playerId);
     putU64(pt.data() + 8, t.expiresAt.ns);
-    if (!t.userData.empty()) std::memcpy(pt.data() + 16, t.userData.data(), t.userData.size());
+    for (std::size_t i = 0; i < 4; ++i) pt[16 + i] = static_cast<std::uint8_t>(t.scope.protocolId >> (i * 8));
+    putU64(pt.data() + 20, t.scope.audience);
+    std::copy(t.proofKey.begin(), t.proofKey.end(), pt.begin() + 28);
+    if (!t.userData.empty()) std::memcpy(pt.data() + connectTokenClaimsBytes, t.userData.data(), t.userData.size());
     Bytes        ct(pt.size());
     std::uint8_t tag[16];
     aeadSeal(key.data(), nonce, connectTokenDomainBytes.data(), connectTokenDomainBytes.size(),
              pt.data(), pt.size(), ct.data(), tag);
+    detail::secureZero(pt.data(), pt.size());
     Bytes out;
     out.reserve(sizeof nonce + ct.size() + static_cast<std::size_t>(authTagSize));
     out.insert(out.end(), nonce, nonce + sizeof nonce);
@@ -208,26 +241,42 @@ inline Bytes sealConnectToken(const EncryptionKey& key, const ConnectToken& t) {
     return out;
 }
 
+// Run on the trusted credential issuer. Deliver the complete result over an authenticated,
+// confidential channel. Only credential.token goes onto the UDP wire; proofKey never does.
+inline ConnectCredential issueConnectCredential(const EncryptionKey& key, ConnectToken claims) {
+    if (!nonzeroKey(key) || claims.scope.protocolId == 0 || claims.scope.audience == 0 || claims.expiresAt.ns == 0)
+        throw std::invalid_argument("Connect credentials require a nonzero issuer key, protocol, audience and expiry");
+    do { secureRandomBytes(claims.proofKey.data(), claims.proofKey.size()); } while (!nonzeroKey(claims.proofKey));
+    ConnectCredential credential{sealConnectToken(key, claims), claims.proofKey, claims.scope, claims.expiresAt};
+    detail::secureZero(claims.proofKey.data(), claims.proofKey.size());
+    return credential;
+}
+
 // A token whose seal + expiry checked out, plus the nonce that identifies it for replay defense.
 struct OpenedToken { ConnectToken token; TokenNonce nonce{}; };
 
 // Verify a sealed token: seal authentic AND not expired. nullopt = forged, corrupt, or expired.
 // Replay is the caller's job (validateConnectToken does it).
 inline std::optional<OpenedToken> openConnectToken(const EncryptionKey& key, const Bytes& sealed, UnixTime now) {
-    if (sealed.size() < connectTokenNonceBytes + static_cast<std::size_t>(authTagSize)) return std::nullopt;
+    if (sealed.size() < connectTokenNonceBytes + connectTokenClaimsBytes + authTagSize
+        || sealed.size() > maxSealedConnectTokenBytes) return std::nullopt;
     TokenNonce nonce{};
     std::memcpy(nonce.data(), sealed.data(), connectTokenNonceBytes);
     const std::size_t   ctLen = sealed.size() - connectTokenNonceBytes - authTagSize;
     const std::uint8_t* ct    = sealed.data() + connectTokenNonceBytes;
     const std::uint8_t* tag   = sealed.data() + connectTokenNonceBytes + ctLen;
-    const auto pt = aeadOpen(key.data(), nonce.data(), connectTokenDomainBytes.data(),
+    auto pt = aeadOpen(key.data(), nonce.data(), connectTokenDomainBytes.data(),
                              connectTokenDomainBytes.size(), ct, ctLen, tag);
-    if (!pt || pt->size() < 16) return std::nullopt;
+    if (!pt || pt->size() < connectTokenClaimsBytes) return std::nullopt;
     const std::uint8_t* p = pt->data();
     ConnectToken t;
     t.playerId  = getU64(p);
     t.expiresAt = UnixTime{ getU64(p + 8) };
-    t.userData.assign(pt->begin() + 16, pt->end());
+    for (std::size_t i = 0; i < 4; ++i) t.scope.protocolId |= std::uint32_t(p[16 + i]) << (i * 8);
+    t.scope.audience = getU64(p + 20);
+    std::copy_n(pt->begin() + 28, t.proofKey.size(), t.proofKey.begin());
+    t.userData.assign(pt->begin() + connectTokenClaimsBytes, pt->end());
+    detail::secureZero(pt->data(), pt->size());
     if (now.ns >= t.expiresAt.ns) return std::nullopt;   // expired
     return OpenedToken{ std::move(t), nonce };
 }
@@ -275,12 +324,14 @@ inline std::optional<TokenError> consumeTokenNonce(TokenValidator& tv, const Tok
 
 struct TokenResult { std::optional<TokenError> error; std::uint64_t playerId = 0; Bytes userData; };
 
-// Full server-side check: open + authenticate the sealed token, then reject replays. Records it on
-// success and returns the verified player id.
-inline TokenResult validateConnectToken(const EncryptionKey& key, TokenValidator& tv, const Bytes& sealed, UnixTime now) {
+// Low-level claim validation plus spending, for authorities that already verified possession.
+// This function alone does not authenticate a network client; use peerConnectWithToken/peerProcess
+// for session admission. Explicit expected scope prevents cross-application validation.
+inline TokenResult validateConnectToken(const EncryptionKey& key, TokenValidator& tv, const Bytes& sealed, UnixTime now, TokenScope expectedScope) {
     now = advanceTokenTime(tv, now);
     const auto opened = openConnectToken(key, sealed, now);
-    if (!opened) return { TokenError::Invalid, 0, {} };   // forged / corrupt / expired
+    if (!opened || expectedScope.protocolId == 0 || expectedScope.audience == 0
+        || opened->token.scope != expectedScope) return { TokenError::Invalid, 0, {} };
     if (const auto err = consumeTokenNonce(tv, opened->nonce, opened->token.expiresAt, now)) return { *err, 0, {} };
     return { std::nullopt, opened->token.playerId, opened->token.userData };
 }

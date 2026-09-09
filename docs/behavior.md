@@ -1,41 +1,52 @@
 # Behavior reference
 
-This describes the current implementation. Authentication gaps are listed explicitly; they are
-not guarantees provided by the current protocol.
+This describes the 0.2 implementation. [Authentication](authentication.md) specifies
+the session protocol and its application trust boundary.
 
 ## Handshake and resumption
 
-A new connection takes three round trips: request/retry cookie, cookied request/key challenge,
-then key response/acceptance. The cookie runs on every new connection before allocating a pending
-slot or generating an ephemeral keypair. Requests are padded to at least the retry response size;
-shorter requests receive no retry. Per-source rate limits are keyed by host, not source port.
-Client challenge processing also bounds expensive key attempts, including rejected public keys.
+A new authenticated connection takes three round trips: request/retry cookie,
+cookied request/Noise reply, then client confirmation/server acceptance. The server
+checks credential scope and the first Noise authenticator before generating a cookie.
+A cookie precedes allocation of a pending slot and server X25519 work. Per-source
+rate limits apply to all requests and are keyed by host, not source port. Client
+challenge DH work is limited to three attempts per configured retry interval.
 
-The exchange uses X25519 to derive directional ChaCha20-Poly1305 traffic keys. Packet headers
-are authenticated as associated data, and a sliding window rejects packet replays. Randomness
-comes from the operating system. Crypto tests include RFC 7748 and RFC 8439 vectors.
+The concrete Noise NNpsk0 handshake uses X25519, ChaCha20-Poly1305 and SHA-256/HKDF.
+The library matches independent Cacophony handshake, transcript and transport vectors,
+plus RFC 7748, 8439, 4231 and 5869 primitive vectors. Cookies prove return reachability;
+the credential PSK authenticates the transcript. The server only consumes a token after
+fresh client confirmation and a second expiry/capacity check. The client reports a
+connection only after authenticating the matching server acceptance. Secure pending
+sessions ignore plaintext acceptance, denial and disconnect packets.
 
-**The exchange is unauthenticated.** A connect token authenticates its issuer's sealed claims,
-but possession of those bearer bytes is not bound to a client's handshake key. Cookies prove
-return reachability, not peer identity. An active intermediary is outside the current handshake's
-security guarantees. The planned repair must bind credentials and protocol context to the key
-exchange and confirm possession before admitting the session.
+Timeout resumption uses the cached session secret as a new PSK, fresh ephemeral keys,
+a fresh server challenge and confirmation in both directions. The old cached generation
+is consumed only after proof; a captured request cannot win a replay race or recreate
+traffic keys. Identity and application claims survive. There is no 0-RTT application
+traffic. Unknown remote resume state falls back to a supplied fresh credential after
+the local attempt timeout; unauthenticated denial cannot force fallback.
 
-Current resumption skips the new-connection handshake. It authenticates a request with the cached
-session master and ratchets that master on acceptance. This prevents reuse after acceptance but
-does not prevent a captured valid request from winning a race against the legitimate client.
-Fresh challenge proof before committing a resume remains required work. Until an encrypted packet
-arrives from the resumed address, server output is capped at three times bytes received.
+`maxResumableSessions` bounds the timeout cache (default 64; zero disables it). Cache
+entries expire after 30 seconds. Full cache capacity leaves additional dropped sessions
+requiring a fresh credential. Explicit disconnects are not resumable. A successful
+resume creates a new generation; original credential expiry gates initial admission,
+not the lifetime of the established session or its short resume window.
 
-Address migration uses the explicit session routing ID to select a candidate connection, verifies
-the packet's authentication tag, and requires an encrypted path challenge round trip before moving
-the connection. A forged routing ID does not authorize migration.
+Anonymous development/P2P connections use the previous unauthenticated X25519 exchange
+only when explicitly enabled. A token-gated host never admits an anonymous fallback.
+Anonymous initial exchange does not protect against an active intermediary; its later
+resume cannot retroactively establish identity. `hostJoinRoom` requires anonymous
+opt-in: its room/pairing service is not a credential issuer.
 
-Connect-token replay state is retained until actual expiry. Storage exhaustion rejects new tokens
-rather than evicting live replay records. Its scope is one admission authority; applications must
-preserve the validator state or rotate the sealing key after state loss. The current token format
-does not bind an application audience or protocol ID. Do not share a sealing key across unrelated
-trust domains.
+Address migration selects a connection by session routing ID, verifies its packet tag,
+and completes an encrypted path challenge before moving state. A forged routing ID or
+replayed packet does not authorize migration. Packet headers are associated data and
+a sliding window rejects replayed datagrams. Randomness comes from the operating system.
+
+Replay-validator state persists until actual token expiry; exhaustion fails admission.
+Applications preserve that state or rotate the sealing key after loss. Sharing an issuer
+key and audience across independent validators does not establish global single use.
 
 ## Delivery and backpressure
 
@@ -70,7 +81,8 @@ budget is discarded before CRC validation or allocation; later datagrams remain 
 bounds socket intake, not total tick time. Connection count, queued work, and application scheduling
 also affect tick cost. Aether does not start a receive thread.
 
-`config.mtu` defaults to 1200 bytes and is the sizing floor. Path-MTU probes can raise the usable
+`config.mtu` defaults to 1200 bytes and is the sizing floor. The supported UDP payload
+ceiling is 65507 bytes for both IP families; normal internet paths need much smaller values. Path-MTU probes can raise the usable
 datagram size up to `mtuProbeCeiling` (default 1500), but this headroom is used for coalescing.
 Fragments remain sized to the floor so a drop in discovered MTU does not strand an assembly.
 
@@ -122,6 +134,21 @@ Connection `packetsSent` counts framed datagrams placed in the outgoing queue, i
 packets. `bytesSent` counts their bytes. These counters do not prove socket transmission or receipt.
 Socket counters separately record successful local I/O.
 
-The low-level `sendTo` returns a byte count or `-1`. The current `hostTick` adapter discards that
-return value; it does not emit socket-send error events. Reliable retries can recover transient
-loss, but the adapter does not distinguish a local send failure from network loss.
+`sendTo` and `recvFrom` retain byte-count/`-1` results and set `lastSendError` or
+`lastReceiveError`: would-block, oversize, invalid address, closed socket or native
+system error. Socket send/receive error counters are distinct from successful I/O;
+a receive would-block is a normal empty queue. Reliable retries can recover transient
+send failures; a local success still does not prove remote receipt.
+
+`hostTakeDiagnostics` drains bounded records for socket failures and per-peer broadcast
+rejections (32 of each, plus omitted counts). They accumulate between calls, including
+calls outside the tick. `peerBroadcast` directly returns its per-peer rejections.
+`hostShutdown` uses the same direct/relay send path, and `closeHost` clears sessions.
+Connection queries count only the Connected state; disconnecting entries may still
+occupy admission slots while their shutdown completes.
+
+`resolveAddresses` performs blocking DNS/numeric resolution outside the tick. Results
+retain system preference order, preserve IPv6 scope IDs, and contain at most 16 unique
+endpoints. `addressToString` produces numeric IPv4 or bracketed IPv6 endpoints without
+reverse DNS. Applications choose and retry appropriate addresses; the library does
+not run background resolver threads or promise Happy Eyeballs connection racing.

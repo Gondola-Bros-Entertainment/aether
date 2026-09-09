@@ -1,5 +1,5 @@
 // Connect, send one message on reliable ordered channel 0, and verify its echo.
-#include "common.hpp"
+#include "credentials.hpp"
 #include <aether/net.hpp>
 
 #include <cstdio>
@@ -9,30 +9,10 @@
 
 namespace {
 
-std::optional<aether::Address> parseIpv4(const char* text, std::uint16_t port) {
-    std::uint32_t ip = 0;
-    const char* p = text;
-    for (int octet = 0; octet < 4; ++octet) {
-        if (*p < '0' || *p > '9') return std::nullopt;
-        unsigned value = 0;
-        while (*p >= '0' && *p <= '9') {
-            value = value * 10 + static_cast<unsigned>(*p++ - '0');
-            if (value > 255) return std::nullopt;
-        }
-        ip = (ip << 8) | value;
-        if (octet < 3) {
-            if (*p++ != '.') return std::nullopt;
-        } else if (*p != '\0') {
-            return std::nullopt;
-        }
-    }
-    return aether::addrV4(ip, port);
-}
-
-int runEcho(aether::Host& host, const aether::Address& server, const std::string& message) {
+int runEcho(aether::Host& host, const aether::Address& server, const std::string& message, const aether::ConnectCredential& credential) {
     const aether::Bytes payload(message.begin(), message.end());
     const auto start = aether_example::monoNow();
-    aether::hostConnect(host, server, start);
+    if (aether::hostConnectWithToken(host, server, credential, start)) { std::fprintf(stderr, "echo_client: invalid credential or connect state\n"); return 1; }
     bool sent = false;
     while (aether::elapsedMs(start, aether_example::monoNow()) < 10000.0) {
         const auto now = aether_example::monoNow();
@@ -50,14 +30,14 @@ int runEcho(aether::Host& host, const aether::Address& server, const std::string
                     return 1;
                 }
                 std::printf("echo: %s\n", message.c_str());
-                aether::hostDisconnect(host, server, now);
-                aether::hostTick(host, {}, now); // Send the disconnect before closing the socket.
-                return 0;
+                aether::hostShutdown(host, now);
+                return aether_example::reportDiagnostics(host) ? 0 : 1;
             } else if (event.kind == aether::PeerEvent::Disconnected) {
                 std::fprintf(stderr, "echo_client: disconnected before receiving the echo\n");
                 return 1;
             }
         }
+        if (!aether_example::reportDiagnostics(host)) return 1;
         std::this_thread::sleep_for(aether_example::tickInterval);
     }
     std::fprintf(stderr, "echo_client: no echo within 10 seconds\n");
@@ -67,13 +47,16 @@ int runEcho(aether::Host& host, const aether::Address& server, const std::string
 } // namespace
 
 int main(int argc, char** argv) {
-    const auto port = aether_example::parsePort(argc > 2 ? argv[2] : "7777");
-    const auto server = port ? parseIpv4(argc > 1 ? argv[1] : "127.0.0.1", *port) : std::nullopt;
-    if (argc > 4 || !server) {
-        std::fprintf(stderr, "usage: echo_client [IPv4 [port [message]]]; port must be 1..65535\n");
+    const auto port = aether_example::parsePort(argc > 3 ? argv[3] : "7777");
+    const auto credential = argc >= 2 ? aether_example::readCredential(argv[1]) : std::nullopt;
+    if (argc > 5 || !port || !credential) {
+        std::fprintf(stderr, "usage: echo_client CREDENTIAL_FILE [hostname [port [message]]]\n");
         return 1;
     }
-    const std::string message = argc > 3 ? argv[3] : "hello aether";
+    const auto addresses = aether::resolveAddresses(argc > 2 ? argv[2] : "127.0.0.1", *port, aether::AddressFamily::IPv4);
+    if (addresses.error) { std::fprintf(stderr, "echo_client: address resolution failed\n"); return 1; }
+    const auto& server = addresses.addresses.front();
+    const std::string message = argc > 4 ? argv[4] : "hello aether";
     const aether::NetworkConfig config;
     if (message.size() > static_cast<std::size_t>(config.defaultChannelConfig.maxMessageSize)) {
         std::fprintf(stderr, "echo_client: message exceeds the default %d-byte channel limit\n",
@@ -85,7 +68,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "echo_client: could not open a UDP socket\n");
         return 1;
     }
-    const int result = runEcho(*host, *server, message);
+    const int result = runEcho(*host, server, message, *credential);
     aether::closeHost(*host);
     return result;
 }

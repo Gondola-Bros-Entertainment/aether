@@ -12,16 +12,16 @@ Aether provides the networking mechanisms without depending on an application or
 
 ## Development status
 
-The current handshake encrypts traffic but does **not** authenticate the key exchange against an
-active man-in-the-middle. Connect tokens provide bearer-token admission, not proof that the
-presenter is the intended client. A captured, valid resume request can also win a replay race.
-Authenticated key exchange and fresh proof during resumption remain required security work.
+Version 0.2 uses authenticated, scoped credentials with the concrete
+`Noise_NNpsk0_25519_ChaChaPoly_SHA256` handshake. Fresh key confirmation precedes
+admission and resumption. Anonymous encrypted connections require an explicit
+`allowUnauthenticated = true` opt-in at both endpoints.
 
-Packet format version 1 uses a 17-byte header, including an authenticated session routing ID.
-It is incompatible with the earlier unversioned 9-byte header. Upgrade both endpoints together.
-
-See [the behavior reference](docs/behavior.md) for delivery guarantees, resource bounds, and
-current handshake behavior.
+Packet format version 2 retains the 17-byte header and changes the handshake and
+credential formats. Upgrade both endpoints and reissue credentials together; there
+is no downgrade negotiation. This is an implementation milestone, not an independent
+security certification. See [authentication](docs/authentication.md), the
+[behavior reference](docs/behavior.md), and [migration notes](docs/migration-0.2.md).
 
 ## Build and test
 
@@ -34,24 +34,29 @@ ctest --test-dir build -C Debug --output-on-failure
 ```
 
 CI uses cppcheck 2.21.0, ASan/UBSan, compiler tests with GCC, Clang, and MSVC, and an installed-package
-consumer on Linux, macOS, and Windows. Keep test builds in Debug: some existing tests use
+consumer on Linux, macOS, and Windows, including native Linux ARM64 transport tests. Keep test builds in Debug: some existing tests use
 `assert`, which Release builds disable.
 
-The [echo server](examples/echo_server.cpp) and [echo client](examples/echo_client.cpp) demonstrate
-connection events, error handling, and a reliable ordered request/reply. Run them in separate terminals:
+The [credential issuer](examples/echo_credentials.cpp), [echo server](examples/echo_server.cpp)
+and [echo client](examples/echo_client.cpp) exercise the authenticated public API.
+Create a new directory under a private parent, then run the server and clients in
+separate terminals:
 
 ```sh
-./build/aether_echo_server 7777
-./build/aether_echo_client 127.0.0.1 7777 "hello aether"
+./build/aether_echo_credentials /private/path/echo-demo
+./build/aether_echo_server /private/path/echo-demo/server.key 7777
+./build/aether_echo_client /private/path/echo-demo/client-1.credential localhost 7777 "hello aether"
+./build/aether_echo_client /private/path/echo-demo/client-2.credential localhost 7777 "second client"
 ```
 
-The client verifies the reply and exits with status zero. Invalid arguments, send rejection,
-disconnection, a mismatched reply, or a 10-second deadline return a nonzero status. The default
-channel accepts messages up to 1024 bytes. With no arguments, the client uses localhost:7777 and
-sends `hello aether`; the server defaults to port 7777 and runs until interrupted with Ctrl+C.
-
-These examples use the current unauthenticated encrypted handshake. With a multi-configuration
-generator, executables are in the configuration directory, such as `build/Debug`.
+The issuer creates two separate credentials valid for ten minutes. Each may establish
+one session on that running server. The server key stays on the issuer/server; distribute
+only each client's credential to that client. These files demonstrate provisioning,
+not an account service. On Windows, use a directory protected by your user ACL.
+Multi-configuration generators put executables in a configuration directory such as
+`build/Debug`. The client verifies its echo and exits nonzero on failure. The default
+channel message limit is 1024 bytes. The example resolves IPv4 names; the library
+resolver also supports IPv6. Ctrl+C gracefully shuts down the server.
 
 ### Use from CMake
 
@@ -87,10 +92,12 @@ A `Host` owns a UDP socket and peer state. `openHost` validates configuration an
 check its optional result before use. Call `hostTick` regularly with monotonic time. It receives
 a bounded batch, advances transport timers, sends queued traffic, and returns events.
 
-Use `hostConnect` to start a connection. After a `Connected` event, `hostSend` queues a message
+Use `hostConnectWithToken` with a `ConnectCredential` to start an authenticated connection. After a `Connected` event, `hostSend` queues a message
 for one peer. Its optional error reports local rejection; success means queued, not remotely
-delivered. `hostTick` also accepts messages to broadcast. Call `closeHost` when finished with
-the socket. The [examples](examples/) demonstrate this sequence.
+delivered. `hostTick` also accepts messages to broadcast. Take bounded socket and broadcast
+failures with `hostTakeDiagnostics`; socket counters remain cumulative. `hostReconnect`
+performs fresh resumption. `hostShutdown` flushes disconnects; continue ticking for retries
+if desired, then call `closeHost` to release the socket and session state. The [examples](examples/) demonstrate this sequence.
 
 Each channel chooses its delivery mode:
 
@@ -184,26 +191,31 @@ This is a separate codec from `deltaPack`. Quantization trades precision for few
 
 ## Connect tokens
 
-An application credential issuer uses `sealConnectToken` to seal an application-issued numeric
-`playerId`, expiry, and opaque data. The issuer and admitting servers share an `EncryptionKey`;
-the client receives only the sealed bytes through the application's authenticated service.
+An authenticated application backend calls `issueConnectCredential` with an issuer/server
+sealing key and `ConnectToken` claims: numeric `playerId`, Unix expiry, up to 256 bytes
+of opaque `userData`, and `TokenScope{protocolId, audience}`. It generates a unique PSK
+and returns both the opaque sealed token and the separate client proof key. Deliver
+the complete `ConnectCredential` through that backend's trusted channel.
 
-Set `NetworkConfig::tokenKey` before opening the server host to require tokens. Clients present
-the bytes with `hostConnectWithToken`. The admitted identity arrives in `PeerEvent::playerId`.
-This admission check does not yet authenticate the ephemeral key exchange.
+Set the server's `NetworkConfig::tokenKey` and nonzero `tokenAudience`. Clients call
+`hostConnectWithToken`; the token alone cannot authenticate them. Server-side
+`Connected` and `Reconnected` events carry the verified `playerId` and `userData`.
+Game authentication credentials are separate from SSH, deployment keys and
+Cloudflare service tokens.
 
-Credential expiry uses `UnixTime` in Unix epoch nanoseconds. Transport timers use `MonoTime`.
-`hostTick` obtains Unix time from the system; callers of `peerProcess` supply it as the fourth
-argument when accepting tokens. Omitting it rejects token admission.
+Credential expiry uses `UnixTime` in Unix epoch nanoseconds; transport timers use
+`MonoTime`. `hostTick` obtains Unix time from the system. Pure-core callers supply
+it as `peerProcess`'s fourth argument when accepting credentials; omission fails
+admission closed. Replay storage rejects new admissions when full. A Unix-time
+high watermark prevents backwards clock corrections from reviving expired tokens.
 
-The replay validator retains each spent nonce until its token expires and rejects new admissions
-when storage is full. `validateConnectToken` exposes `TokenError::ReplayCapacity`. A time high
-watermark prevents backward clock corrections from reviving expired credentials.
+Replay storage is local to an admission authority and held in memory. Preserve it
+across restarts or rotate the sealing key after state loss. Independent validators
+sharing a key and audience do not enforce global single use. Scope binds protocol
+and audience but does not replace this operational requirement.
 
-Replay protection belongs to the authority retaining that table. Preserve its state across
-restarts or rotate the sealing key when state is lost. Independent validators sharing a key do
-not enforce global single use. Token scope binding and authenticated resumption remain part of
-the unfinished authentication work described above.
+See [authentication and wire details](docs/authentication.md) for proof, expiry,
+resumption and trust boundaries, and [0.2 migration](docs/migration-0.2.md) for API changes.
 
 ## License
 

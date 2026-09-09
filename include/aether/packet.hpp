@@ -42,7 +42,7 @@ struct PacketHeader {
     std::uint64_t connectionId{}; // session identity, independent of address and packet sequence
 };
 
-inline constexpr std::uint8_t packetWireVersion = 1;
+inline constexpr std::uint8_t packetWireVersion = 2;
 inline constexpr std::size_t packetHeaderBytes = 17; // 9-byte prefix + 8-byte session ID
 
 // Pack the header MSB-first into a fixed stable wire format:

@@ -21,7 +21,21 @@
 
 namespace aether {
 
+inline constexpr std::size_t maxHostDiagnostics = 32;
+enum class HostIoOperation { Send, Receive };
+struct HostIoError { HostIoOperation operation = HostIoOperation::Send; Address address; SocketError error; };
+// Bounded records accumulate until taken, including API calls made between ticks.
+// Socket counters remain cumulative even when this diagnostic buffer fills.
+struct HostDiagnostics {
+    std::vector<HostIoError> ioErrors;
+    std::vector<BroadcastFailure> queueErrors;
+    std::uint64_t omittedIoErrors = 0;
+    std::uint64_t omittedQueueErrors = 0;
+    std::optional<ConnectError> rendezvousConnectError;
+};
+
 struct Host {
+    HostDiagnostics diagnostics;
     Socket                       socket{};
     NetPeer                      peer;
     std::optional<Address>       rendezvousAddr;   // set by hostJoinRoom; replies from here are Paired messages
@@ -34,6 +48,30 @@ struct Host {
     double                       punchTimeoutMs = defaultPunchTimeoutMs;   // try the punch this long, then relay
     bool                         relaying = false;  // routing through the rendezvous because the punch did not connect
 };
+
+inline HostDiagnostics hostTakeDiagnostics(Host& host) {
+    auto diagnostics = std::move(host.diagnostics);
+    host.diagnostics = {};
+    return diagnostics;
+}
+inline void hostRecordIoError(Host& host, HostIoOperation operation, const Address& address, SocketError error) {
+    if (host.diagnostics.ioErrors.size() < maxHostDiagnostics)
+        host.diagnostics.ioErrors.push_back({operation, address, error});
+    else ++host.diagnostics.omittedIoErrors;
+}
+inline bool hostSendDatagram(Host& host, ByteSpan data, const Address& to) {
+    if (sendTo(host.socket, data, to) >= 0) return true;
+    hostRecordIoError(host, HostIoOperation::Send, to, host.socket.lastSendError);
+    return false;
+}
+inline void hostFlush(Host& host, const std::vector<RawPacket>& outgoing) {
+    for (const auto& packet : outgoing) {
+        if (host.relaying && host.partnerAddr && host.rendezvousAddr && addrEqual(packet.to.addr, *host.partnerAddr)) {
+            const auto wrapped = encodeRelay(host.roomId, packet.data.data(), packet.data.size());
+            hostSendDatagram(host, wrapped, *host.rendezvousAddr);
+        } else hostSendDatagram(host, packet.data, packet.to.addr);
+    }
+}
 
 // Open a host bound to bindAddr (use addrAny(port) for a server, addrLocalhost(0) for ephemeral).
 inline std::optional<Host> openHost(const Address& bindAddr, const NetworkConfig& config, MonoTime now) {
@@ -57,7 +95,11 @@ inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<Chan
     for (std::size_t packets = 0; packets < budget.maxDatagrams && receivedBytes < budget.maxBytes; ++packets) {
         Address   from{};
         const int n = recvFrom(h.socket, std::span<std::uint8_t>(scratch.data(), scratch.size()), from);
-        if (n < 0) break;   // -1 == no more data (or a hard socket error); a 0-byte datagram returns 0 and is drained (CRC-rejected) so it cannot stall the queue
+        if (n < 0) {
+            if (h.socket.lastReceiveError.code != SocketErrorCode::WouldBlock)
+                hostRecordIoError(h, HostIoOperation::Receive, {}, h.socket.lastReceiveError);
+            break;
+        }
         const std::size_t len = static_cast<std::size_t>(n);
         // A boundary datagram that does not fit is discarded before CRC/copying. It is UDP loss,
         // recoverable by reliable channels; the rest remains queued for a future tick.
@@ -72,7 +114,7 @@ inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<Chan
                 h.partnerAddr = paired->second;
                 h.punchStart  = now;
                 h.relaying    = (h.punchTimeoutMs <= 0.0);      // <= 0 means skip the punch and relay immediately
-                if (paired->first == PunchRole::Connect) peerConnect(h.peer, PeerId{ paired->second }, now);
+                if (paired->first == PunchRole::Connect) h.diagnostics.rendezvousConnectError = peerConnect(h.peer, PeerId{ paired->second }, now);
                 else if (!h.relaying)                    h.punchTarget = paired->second;   // Accept: hole-punch direct
                 continue;
             }
@@ -93,24 +135,18 @@ inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<Chan
                                                Bytes(scratch.begin(), scratch.begin() + static_cast<std::ptrdiff_t>(*payloadLen)) });
     }
 
-    for (const auto& [ch, msg] : messages) peerBroadcast(h.peer, ch, msg, std::nullopt, now);
+    for (const auto& [ch, msg] : messages) {
+        for (auto& failure : peerBroadcast(h.peer, ch, msg, std::nullopt, now)) {
+            if (h.diagnostics.queueErrors.size() < maxHostDiagnostics) h.diagnostics.queueErrors.push_back(std::move(failure));
+            else ++h.diagnostics.omittedQueueErrors;
+        }
+    }
 
     const auto epochNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
     const UnixTime tokenTime{epochNs > 0 ? static_cast<std::uint64_t>(epochNs) : 0};
     auto result = peerProcess(h.peer, now, incoming, tokenTime);
-    for (const RawPacket& rp : result.outgoing) {
-        if (h.relaying && h.partnerAddr && h.rendezvousAddr && addrEqual(rp.to.addr, *h.partnerAddr)) {
-            // Relaying wraps each packet with a 9-byte [tag][roomId] header, so the effective MTU on the
-            // relay (fallback) path is path_mtu - 9. With the default config.mtu (1200) a wrapped packet
-            // (<= 1209) still fits any real path; if you raise mtu toward the true path MTU and rely on the
-            // relay, leave 9 bytes of headroom (set mtu <= path_mtu - 9) so the wrapped datagram is not dropped.
-            const Bytes wrapped = encodeRelay(h.roomId, rp.data.data(), rp.data.size());   // forward via the rendezvous
-            sendTo(h.socket, std::span<const std::uint8_t>(wrapped.data(), wrapped.size()), *h.rendezvousAddr);
-        } else {
-            sendTo(h.socket, std::span<const std::uint8_t>(rp.data.data(), rp.data.size()), rp.to.addr);
-        }
-    }
+    hostFlush(h, result.outgoing);
 
     // hole-punch: while an Accept peer waits to be reached, keep an outbound flowing to the peer's
     // address so its NAT mapping stays open; the inbound handshake lands once both sides have punched.
@@ -119,7 +155,7 @@ inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<Chan
             h.punchTarget = std::nullopt;
         } else {
             const std::uint8_t punch = 0;
-            sendTo(h.socket, std::span<const std::uint8_t>(&punch, 1), *h.punchTarget);
+            hostSendDatagram(h, std::span<const std::uint8_t>(&punch, 1), *h.punchTarget);
         }
     }
 
@@ -133,31 +169,57 @@ inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<Chan
     // re-send Register until the rendezvous pairs us -- UDP, so the first one can be lost.
     if (h.pendingRoom && h.rendezvousAddr && elapsedMs(h.lastRegister, now) >= registerRetryMs) {
         const Bytes reg = encodeRegister(*h.pendingRoom);
-        sendTo(h.socket, std::span<const std::uint8_t>(reg.data(), reg.size()), *h.rendezvousAddr);
+        hostSendDatagram(h, std::span<const std::uint8_t>(reg.data(), reg.size()), *h.rendezvousAddr);
         h.lastRegister = now;
     }
     return std::move(result.events);
 }
 
-inline void hostConnect(Host& h, const Address& addr, MonoTime now) { peerConnect(h.peer, PeerId{ addr }, now); }
+inline std::optional<ConnectError> hostConnect(Host& h, const Address& addr, MonoTime now) { return peerConnect(h.peer, PeerId{ addr }, now); }
 // Connect presenting a sealed connect token (minted by your auth backend); the server must be opened
 // with the matching config.tokenKey. The verified playerId arrives on the Connected event.
-inline void hostConnectWithToken(Host& h, const Address& addr, const Bytes& token, MonoTime now) {
-    peerConnectWithToken(h.peer, PeerId{ addr }, token, now);
+inline std::optional<ConnectError> hostConnectWithToken(Host& h, const Address& addr, const ConnectCredential& token, MonoTime now) {
+    return peerConnectWithToken(h.peer, PeerId{ addr }, token, now);
 }
 // Join a room on the rendezvous server; once paired, hostTick auto-connects (or hole-punches) to the
 // peer. Register is re-sent each tick until paired, so a lost first datagram does not strand the join.
-inline void hostJoinRoom(Host& h, const Address& rendezvous, std::uint64_t roomId, MonoTime now) {
+inline std::optional<ConnectError> hostJoinRoom(Host& h, const Address& rendezvous, std::uint64_t roomId, MonoTime now) {
+    if (!addressValid(rendezvous)) return ConnectError::InvalidAddress;
+    if (!h.peer.config.allowUnauthenticated || h.peer.config.tokenKey) return ConnectError::AuthenticationRequired;
     h.rendezvousAddr = rendezvous;
     h.pendingRoom    = roomId;
     h.lastRegister   = now;
     const Bytes reg = encodeRegister(roomId);
-    sendTo(h.socket, std::span<const std::uint8_t>(reg.data(), reg.size()), rendezvous);
+    hostSendDatagram(h, std::span<const std::uint8_t>(reg.data(), reg.size()), rendezvous);
+    return std::nullopt;
 }
-inline void hostDisconnect(Host& h, const Address& addr, MonoTime now) { peerDisconnect(h.peer, PeerId{ addr }, now); }
+inline std::optional<ConnectError> hostReconnect(Host& h, const Address& addr, std::uint64_t token, MonoTime now,
+                                                std::optional<ConnectCredential> fallback = std::nullopt) {
+    return peerReconnect(h.peer, PeerId{addr}, token, now, std::move(fallback));
+}
+inline void hostDisconnect(Host& h, const Address& addr, MonoTime now, DisconnectReason reason = DisconnectReason::Requested) {
+    peerDisconnect(h.peer, PeerId{addr}, now, reason);
+}
+// Flush initial disconnects using normal direct/relay routing. Keep ticking for retry/timeout
+// processing if desired, then closeHost releases the socket and all remaining session state.
+inline void hostShutdown(Host& h, MonoTime now) {
+    h.pendingRoom.reset();
+    h.punchTarget.reset();
+    hostFlush(h, peerShutdown(h.peer, now));
+}
 inline std::optional<ConnectionError> hostSend(Host& h, const Address& addr, ChannelId ch, const Bytes& data, MonoTime now) {
     return peerSend(h.peer, PeerId{ addr }, ch, data, now);
 }
-inline void closeHost(Host& h) { closeSocket(h.socket); }
+inline void closeHost(Host& h) {
+    closeSocket(h.socket);
+    h.peer.pending.clear();
+    h.peer.connections.clear();
+    h.peer.resumableTokens.clear();
+    h.peer.sendQueue.clear();
+    h.peer.fragmentAssemblers.clear();
+    h.peer.pathValidations.clear();
+    h.pendingRoom.reset();
+    h.punchTarget.reset();
+}
 
 } // namespace aether

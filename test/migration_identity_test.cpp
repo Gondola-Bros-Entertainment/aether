@@ -5,7 +5,7 @@
 
 int main() {
     using namespace aether;
-    const NetworkConfig config;
+    const NetworkConfig config = aether::test::anonymousConfig<NetworkConfig>();
     const PeerId other{addrV4(0x0A000001, 1000)}, original{addrV4(0x0A000002, 2000)};
     const PeerId rebound{addrV4(0x0A000003, 3000)};
     auto peer = newPeerState(addrLocalhost(4000), config, MonoTime{1});
@@ -46,6 +46,6 @@ int main() {
     aether::test::require(!deserializePacket(packet));
     aether::test::require(!deserializePacket(Bytes(16)));
     // A re-keyed resume changes the public identity as well as the traffic keys.
-    applySessionKeys(sender, ratchetResumeMaster(master, 123), 123, false);
+    applySessionKeys(sender, otherMaster, 123, false);
     aether::test::require(sender.connectionId != id);
 }

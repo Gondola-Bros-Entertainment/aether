@@ -8,9 +8,7 @@
 //     dropped silently: replying would make the server a reflector, and cancelling the pending would
 //     let anyone who can guess an in-flight client's address abort its handshake.
 //
-//  2. The connect-token identity survives a fast reconnect. The resume path rebuilt the connection
-//     without it, so a resumed session came up anonymous on a token-gated server with no way to
-//     recover who the player was.
+// Authenticated credential, expiry, capacity and resumption regressions are in session_auth_test.cpp.
 #include <aether/aether.hpp>
 
 #include <cassert>
@@ -107,7 +105,7 @@ int main() {
     // useless from any other address, and expires on its own.
     {
         const Address addrS = addrLocalhost(9301);
-        NetPeer S = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
+        NetPeer S = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
         const PeerId idA{ addrLocalhost(9302) }, idB{ addrLocalhost(9303) };
 
         // an uncookied request allocates nothing and yields only a cookie (asserted inside the helper)
@@ -118,7 +116,7 @@ int main() {
         // the SAME cookie presented from a different source address is worthless: it is bound to the
         // address it was minted for, which is the whole point of proving routability
         {
-            NetPeer S2 = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
+            NetPeer S2 = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
             const Bytes forA = retryCookieFor(S2, idA, {}, MonoTime{ 1000000 });
             std::vector<IncomingPacket> in{ control(idB, PacketType::ConnectionRequest, encodeConnectionRequest(forA, {})) };
             processAt(S2, MonoTime{ 2000000 }, in);
@@ -127,7 +125,7 @@ int main() {
 
         // a garbage cookie of the right length is rejected too (it is a MAC, not a length check)
         {
-            NetPeer S3 = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
+            NetPeer S3 = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
             const Bytes junk(retryCookieSize, 0xAB);
             std::vector<IncomingPacket> in{ control(idA, PacketType::ConnectionRequest, encodeConnectionRequest(junk, {})) };
             processAt(S3, MonoTime{ 2000000 }, in);
@@ -144,7 +142,7 @@ int main() {
 
         // and it expires: past two epochs the same cookie no longer validates
         {
-            NetPeer S4 = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
+            NetPeer S4 = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
             const Bytes old = retryCookieFor(S4, idA, {}, MonoTime{ 1000000 });
             const MonoTime later{ 1000000 + cookieEpochNs * 3 };
             assert(!retryCookieValid(S4.cookieSecret, idA.addr, old, later));
@@ -154,7 +152,7 @@ int main() {
 
         // a malformed request framing earns nothing at all -- not even a cookie to reflect
         {
-            NetPeer S5 = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
+            NetPeer S5 = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
             std::vector<IncomingPacket> in{ control(idA, PacketType::ConnectionRequest, Bytes{}) };
             const auto r = processAt(S5, MonoTime{ 1000000 }, in);
             assert(r.outgoing.empty());
@@ -167,7 +165,7 @@ int main() {
     {
         const Address addrS = addrLocalhost(9401), addrA = addrLocalhost(9402);
         const PeerId  idA{ addrA };
-        NetPeer S = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
+        NetPeer S = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
 
         std::vector<IncomingPacket> in{ cookiedRequest(S, idA, {}, MonoTime{ 500000 }) };
         const auto challenge = processAt(S, MonoTime{ 1000000 }, in);
@@ -204,8 +202,8 @@ int main() {
     {
         const Address addrS = addrLocalhost(9411), addrC = addrLocalhost(9412);
         const PeerId  idS{ addrS }, idC{ addrC };
-        NetPeer S = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
-        NetPeer C = newPeerState(addrC, NetworkConfig{}, MonoTime{ 0 });
+        NetPeer S = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
+        NetPeer C = newPeerState(addrC, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
         peerConnect(C, idS, MonoTime{ 0 });
 
         TestLink link = newTestLink(C, idC, S, idS);
@@ -220,8 +218,8 @@ int main() {
     {
         const Address addrS = addrLocalhost(9431), addrC = addrLocalhost(9432);
         const PeerId  idS{ addrS }, idC{ addrC };
-        NetPeer S = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
-        NetPeer C = newPeerState(addrC, NetworkConfig{}, MonoTime{ 0 });
+        NetPeer S = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
+        NetPeer C = newPeerState(addrC, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
         peerConnect(C, idS, MonoTime{ 0 });
 
         TestLink link = newTestLink(C, idC, S, idS);
@@ -238,7 +236,7 @@ int main() {
     // had disconnected -- one bogus event per abandoned handshake, and a spoof flood is all of them.
     {
         const Address addrS = addrLocalhost(9441);
-        NetPeer S = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
+        NetPeer S = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
         const PeerId ghost{ addrLocalhost(9442) };
 
         std::vector<IncomingPacket> in{ cookiedRequest(S, ghost, {}, MonoTime{ tickNs / 2 }) };
@@ -251,7 +249,7 @@ int main() {
         for (const auto& e : expired.events) assert(e.kind != PeerEvent::Disconnected);
 
         // A client's OWN failed connect still reports the timeout -- that one the caller is waiting for.
-        NetPeer C = newPeerState(addrLocalhost(9443), NetworkConfig{}, MonoTime{ 0 });
+        NetPeer C = newPeerState(addrLocalhost(9443), aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
         const PeerId dead{ addrLocalhost(9444) };               // nothing is listening
         peerConnect(C, dead, MonoTime{ 0 });
         bool timedOut = false;
@@ -266,7 +264,7 @@ int main() {
     // The cap was checked at the request and then the response inserted unconditionally, so every
     // handshake already in flight when the last slot filled still became a connection.
     {
-        NetworkConfig cfg;
+        NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         cfg.maxClients = 2;
         const Address addrS = addrLocalhost(9451);
         NetPeer S = newPeerState(addrS, cfg, MonoTime{ 0 });
@@ -301,78 +299,9 @@ int main() {
                     peerCount(S), clients);
     }
 
-    // --- 2. the verified connect-token identity survives a fast reconnect ---
-    {
-        EncryptionKey K{};
-        secureRandomBytes(K.data(), K.size());
-        NetworkConfig serverCfg;  serverCfg.tokenKey = K;
-
-        const Address addrS = addrLocalhost(9421), addrC = addrLocalhost(9422);
-        const PeerId  idS{ addrS }, idC{ addrC };
-        NetPeer S = newPeerState(addrS, serverCfg, MonoTime{ 0 });
-        NetPeer C = newPeerState(addrC, NetworkConfig{}, MonoTime{ 0 });
-
-        constexpr std::uint64_t player = 424242;
-        const Bytes token = sealConnectToken(K, ConnectToken{ player, UnixTime{ 3600ull * 1000000000ull }, {} });
-        peerConnectWithToken(C, idS, token, MonoTime{ 0 });
-
-        TestLink      link        = newTestLink(C, idC, S, idS);
-        std::uint64_t connectedAs = 0;
-        MonoTime      t = testLinkRun(link, MonoTime{ 0 }, tickNs, 24, [&](const TestLinkStep& s) {
-            for (const PeerEvent& e : s.bEvents) if (e.kind == PeerEvent::Connected) connectedAs = e.playerId;
-            return connectedAs != 0 && peerIsConnected(C, idS);   // the client is keyed one tick after the server
-        });
-        assert(connectedAs == player);
-        assert(peerPlayerId(S, idC) == player);
-        const auto sessionToken = peerSessionToken(C, idS);
-        assert(sessionToken.has_value());
-        const X25519Key masterBefore = *S.connections.at(idC).resumeMaster;
-
-        // Blackhole the link so both ends time out and stash a resumable session.
-        for (int k = 0; k < 30; ++k) {
-            t = MonoTime{ t.ns + 1000000000ull };   // 1s per step, past the 10s connection timeout
-            processAt(C, t, {});
-            processAt(S, t, {});
-        }
-        assert(peerCount(S) == 0 && peerCount(C) == 0);
-
-        peerReconnect(C, idS, *sessionToken, t);
-        std::uint64_t reconnectedAs = 0;
-        bool          resumed       = false;
-        testLinkRun(link, t, tickNs, 24, [&](const TestLinkStep& s) {
-            for (const PeerEvent& e : s.bEvents)
-                if (e.kind == PeerEvent::Reconnected) { resumed = true; reconnectedAs = e.playerId; }
-            return resumed;
-        });
-        assert(resumed);                                  // it took the 0-RTT resume path, not a full handshake
-        assert(reconnectedAs == player);                  // ...and the event carries the identity
-        assert(peerPlayerId(S, idC) == player);           // ...as does the connection itself
-
-        // The resumed session must NOT key from the master the previous one used. Every timeout re-arms
-        // the resumable with whatever the connection holds, so leaving it unchanged made a captured
-        // resume request valid again on the next generation -- and re-keying from it reproduced the
-        // earlier session's keystream exactly, since a resumed connection restarts its nonce at 0.
-        const X25519Key masterAfter = *S.connections.at(idC).resumeMaster;
-        assert(masterAfter != masterBefore);              // the chain advanced, end to end
-
-        // A resume authenticates the SENDER, never the address it claims to be at. So the resumed
-        // connection comes up anti-amplification capped: a resume replayed with a victim's source
-        // address must not buy the attacker seconds of our outbound aimed at that victim.
-        assert(!S.connections.at(idC).pathValidated);
-        assert(S.connections.at(idC).unvalidatedRecvBytes > 0);
-        // The real client is genuinely there, so its first encrypted packet lifts the cap and 0-RTT is
-        // unaffected -- it never waits for a round trip it would have had to pay for otherwise.
-        testLinkRun(link, t, tickNs, 12, [&](const TestLinkStep&) {
-            return S.connections.count(idC) && S.connections.at(idC).pathValidated;
-        });
-        assert(S.connections.at(idC).pathValidated);
-        std::printf("handshake_test: connect-token identity %llu survives the fast reconnect\n",
-                    static_cast<unsigned long long>(player));
-    }
-
     // --- 2b. the anti-amplification cap itself ---
     {
-        NetworkConfig cfg;
+        NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         Connection    c = newConnection(cfg, 7, MonoTime{ 0 });
 
         // A normally-handshaked connection is validated already: the cookie and the challenge echo both
@@ -399,42 +328,9 @@ int main() {
         std::printf("handshake_test: unvalidated paths are amplification-capped\n");
     }
 
-    // --- 3. a spent resume cannot be replayed into a second session ---
-    {
-        X25519Key master{};
-        secureRandomBytes(master.data(), master.size());
-        constexpr std::uint64_t token = 0xA1B2C3D4E5F60718ull;
-        constexpr std::uint64_t salt  = 0x0011223344556677ull;
-
-        const auto captured = resumeMac(master, token, salt);   // what an observer records off the wire
-        assert(detail::constTimeEq(resumeMac(master, token, salt).data(), captured.data(), 16));
-
-        // Accepting the resume advances the master, and the advanced value is what a later timeout
-        // re-arms the resumable with.
-        const X25519Key next = ratchetResumeMaster(master, salt);
-        assert(next != master);
-
-        // So presenting the captured bytes a second time no longer authenticates.
-        assert(!detail::constTimeEq(resumeMac(next, token, salt).data(), captured.data(), 16));
-
-        // And even if it somehow did, it could not reproduce the keystream: the session keys derive
-        // from the advanced secret, so no two sessions share a (key, nonce) pair. That reuse is what
-        // turned a replay into a two-time pad -- XOR of the two ciphertexts recovered the plaintext.
-        const DirectionalKeys k1 = deriveDirectionalKeys(master, salt);
-        const DirectionalKeys k2 = deriveDirectionalKeys(next, salt);
-        assert(k1.serverToClient != k2.serverToClient);
-        assert(k1.clientToServer != k2.clientToServer);
-
-        // The ratchet is deterministic and salt-bound: both peers must land on the same value from the
-        // same salt, or the resumed session would fail to decrypt.
-        assert(ratchetResumeMaster(master, salt) == next);
-        assert(ratchetResumeMaster(master, salt + 1) != next);
-        std::printf("handshake_test: a spent resume cannot be replayed; the master ratchets\n");
-    }
-
     // --- 4. the per-source rate limit keys on the HOST, not the (host, port) pair ---
     {
-        NetPeer P = newPeerState(addrLocalhost(9500), NetworkConfig{}, MonoTime{ 0 });
+        NetPeer P = newPeerState(addrLocalhost(9500), aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
 
         // One host, many source ports, one bucket. Hashing the port too minted a fresh budget for every
         // port an ordinary host bound: ~1200x its cap from 5000 ports, which also filled the tracked-
@@ -450,7 +346,7 @@ int main() {
 
         // The seed is per-peer and drawn from the CSPRNG, so an attacker cannot compute an address
         // that lands in a victim's bucket and starve it -- FNV-1a alone is trivially invertible.
-        NetPeer Q = newPeerState(addrLocalhost(9501), NetworkConfig{}, MonoTime{ 0 });
+        NetPeer Q = newPeerState(addrLocalhost(9501), aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
         assert(Q.addrHashSeed != P.addrHashSeed);
         assert(sockAddrToKey(addrV4(0x0A000001u, 1000), Q.addrHashSeed) != k1);
         std::printf("handshake_test: rate-limit key is per-host and seeded\n");
@@ -464,8 +360,8 @@ int main() {
     {
         const Address addrS = addrLocalhost(9461), addrC = addrLocalhost(9462);
         const PeerId  idS{ addrS }, idC{ addrC };
-        NetPeer S = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
-        NetPeer C = newPeerState(addrC, NetworkConfig{}, MonoTime{ 0 });
+        NetPeer S = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
+        NetPeer C = newPeerState(addrC, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
         peerConnect(C, idS, MonoTime{ 0 });
 
         TestLink  link = newTestLink(C, idC, S, idS);
@@ -498,8 +394,8 @@ int main() {
     {
         const Address addrS = addrLocalhost(9463), addrC = addrLocalhost(9464);
         const PeerId  idS{ addrS }, idC{ addrC };
-        NetPeer S = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
-        NetPeer C = newPeerState(addrC, NetworkConfig{}, MonoTime{ 0 });
+        NetPeer S = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
+        NetPeer C = newPeerState(addrC, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
         peerConnect(C, idS, MonoTime{ 0 });
 
         TestLink        link = newTestLink(C, idC, S, idS);
@@ -521,77 +417,11 @@ int main() {
         std::printf("handshake_test: a degenerate challenge keys nothing and blocks nothing\n");
     }
 
-    // --- 6. an admission cap must not burn the client's single-use connect token ---
-    // Recording a token nonce is what makes the token single-use, and it lasts until that token's expiry.
-    // Doing it before the caps burns the token of every client the server turns away, so the retry it
-    // makes once a slot frees is answered as a replay -- a full server locking clients out for a day.
-    {
-        EncryptionKey K{};
-        secureRandomBytes(K.data(), K.size());
-        NetworkConfig cfg;
-        cfg.tokenKey   = K;
-        cfg.maxClients = 1;
-        NetPeer      S = newPeerState(addrLocalhost(9471), cfg, MonoTime{ 0 });
-        const PeerId idA{ addrV4(0x0A000010u, 9472) }, idOther{ addrV4(0x0A000011u, 9473) };
-
-        const UnixTime expires{ 3600ull * 1000000000ull };
-        const Bytes    otherToken = sealConnectToken(K, ConnectToken{ 1, expires, {} });
-        handshakeRaw(S, idOther, 0x9999ull, otherToken, MonoTime{ tickNs });   // the single client slot is taken
-        assert(peerCount(S) == 1);
-
-        constexpr std::uint64_t player = 909;
-        const Bytes token = sealConnectToken(K, ConnectToken{ player, expires, {} });
-        std::vector<IncomingPacket> full{ cookiedRequest(S, idA, token, MonoTime{ 2 * tickNs }) };
-        const auto denied = processAt(S, MonoTime{ 2 * tickNs }, full);
-        assert(denied.outgoing.size() == 1);
-        const auto deny = replyPacket(denied.outgoing[0]);
-        assert(deny && deny->header.type == PacketType::ConnectionDenied);
-        assert(decodeDenyReason(deny->payload) == DenyReason::ServerFull);
-        assert(S.pending.count(idA) == 0);
-
-        S.connections.clear();   // a slot frees...
-        std::vector<IncomingPacket> again{ cookiedRequest(S, idA, token, MonoTime{ 4 * tickNs }) };
-        processAt(S, MonoTime{ 4 * tickNs }, again);
-        assert(S.pending.count(idA) == 1);                    // ...and the SAME token still works
-        assert(S.pending.at(idA).playerId == player);
-        std::printf("handshake_test: a cap-rejected request does not spend the client's connect token\n");
-    }
-
-    // --- 7. the pre-cookie token gate runs for a connect token ---
-    // Resume blobs and sealed tokens are told apart by length, so the resume decode has to be exact.
-    // A size-only check swallows every real token (all of them are longer than a resume blob), and the
-    // gate it guards then never opens the AEAD: garbage earns a cookie for free.
-    {
-        EncryptionKey K{};
-        secureRandomBytes(K.data(), K.size());
-        NetworkConfig cfg;
-        cfg.tokenKey = K;
-        NetPeer      S = newPeerState(addrLocalhost(9481), cfg, MonoTime{ 0 });
-        const PeerId idA{ addrV4(0x0A000012u, 9482) };
-
-        const Bytes garbage(48, 0xCD);   // longer than a resume blob, and not a token either
-        std::vector<IncomingPacket> junk{ control(idA, PacketType::ConnectionRequest, encodeConnectionRequest({}, garbage)) };
-        const auto rejected = processAt(S, MonoTime{ tickNs }, junk);
-        assert(rejected.outgoing.size() == 1);
-        const auto deny = replyPacket(rejected.outgoing[0]);
-        assert(deny && deny->header.type == PacketType::ConnectionDenied);
-        assert(decodeDenyReason(deny->payload) == DenyReason::InvalidToken);
-        aether::test::require(!decodeResume(garbage));   // ...because a 48-byte body is not a resume
-
-        const Bytes token = sealConnectToken(K, ConnectToken{ 5, UnixTime{ 3600ull * 1000000000ull }, {} });
-        std::vector<IncomingPacket> real{ control(idA, PacketType::ConnectionRequest, encodeConnectionRequest({}, token)) };
-        const auto accepted = processAt(S, MonoTime{ 2 * tickNs }, real);
-        assert(accepted.outgoing.size() == 1);
-        const auto retry = replyPacket(accepted.outgoing[0]);
-        assert(retry && retry->header.type == PacketType::ConnectionRetry);   // a real token still earns its cookie
-        std::printf("handshake_test: the token gate opens the AEAD for a connect token, not just for garbage\n");
-    }
-
     // --- 8. an unauthenticated cleartext Disconnect cannot erase a handshake ---
     // Erasing a pending here aborts a connect attempt with one spoofed packet, and silently: the entry
     // is gone, so cleanupPending has nothing left to report the timeout for and the caller waits forever.
     {
-        NetPeer      C = newPeerState(addrLocalhost(9491), NetworkConfig{}, MonoTime{ 0 });
+        NetPeer      C = newPeerState(addrLocalhost(9491), aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
         const PeerId dead{ addrLocalhost(9492) };
         peerConnect(C, dead, MonoTime{ 0 });
 
@@ -607,7 +437,7 @@ int main() {
             if (e.kind == PeerEvent::Disconnected && e.reason == DisconnectReason::Timeout) timedOut = true;
         assert(timedOut);                     // ...and the caller still hears the outcome
 
-        NetPeer      S = newPeerState(addrLocalhost(9493), NetworkConfig{}, MonoTime{ 0 });
+        NetPeer      S = newPeerState(addrLocalhost(9493), aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
         const PeerId idA{ addrV4(0x0A000013u, 9494) };
         std::vector<IncomingPacket> req{ cookiedRequest(S, idA, {}, MonoTime{ tickNs / 2 }) };
         processAt(S, MonoTime{ tickNs }, req);
@@ -624,8 +454,8 @@ int main() {
     {
         const Address addrS = addrLocalhost(9495), addrC = addrLocalhost(9496);
         const PeerId  idS{ addrS }, idC{ addrC };
-        NetPeer S = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
-        NetPeer C = newPeerState(addrC, NetworkConfig{}, MonoTime{ 0 });
+        NetPeer S = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
+        NetPeer C = newPeerState(addrC, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
         peerConnect(C, idS, MonoTime{ 0 });
 
         TestLink link = newTestLink(C, idC, S, idS);
@@ -643,8 +473,8 @@ int main() {
     {
         const Address addrA = addrLocalhost(9501), addrB = addrLocalhost(9502);
         const PeerId  idA{ addrA }, idB{ addrB };
-        NetPeer A = newPeerState(addrA, NetworkConfig{}, MonoTime{ 0 });
-        NetPeer B = newPeerState(addrB, NetworkConfig{}, MonoTime{ 0 });
+        NetPeer A = newPeerState(addrA, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
+        NetPeer B = newPeerState(addrB, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
         peerConnect(A, idB, MonoTime{ 0 });
         peerConnect(B, idA, MonoTime{ 0 });
 
@@ -676,7 +506,7 @@ int main() {
     // table by it alone lets whichever drops last replace the other's master, and the peer that really
     // holds that master then has its correctly-MAC'd resume rejected.
     {
-        NetPeer      S = newPeerState(addrLocalhost(9511), NetworkConfig{}, MonoTime{ 0 });
+        NetPeer      S = newPeerState(addrLocalhost(9511), aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
         const PeerId idA{ addrV4(0x0A000014u, 9512) }, idB{ addrV4(0x0A000015u, 9513) };
         constexpr std::uint64_t shared = 0x5151515151515151ull;
 
@@ -699,56 +529,11 @@ int main() {
         std::printf("handshake_test: a colliding session token cannot clobber the live resumable\n");
     }
 
-    // --- 12. a reconnect the server cannot honour falls back to a full authenticated connect ---
-    // A resume blob is not a sealed connect token, so a token-gated server denies it once its resumable
-    // is gone. The reconnect has to carry the token that fallback needs, or it fails outright.
-    {
-        EncryptionKey K{};
-        secureRandomBytes(K.data(), K.size());
-        NetworkConfig serverCfg;
-        serverCfg.tokenKey = K;
-        const Address addrS = addrLocalhost(9521), addrC = addrLocalhost(9522);
-        const PeerId  idS{ addrS }, idC{ addrC };
-        NetPeer S = newPeerState(addrS, serverCfg, MonoTime{ 0 });
-        NetPeer C = newPeerState(addrC, NetworkConfig{}, MonoTime{ 0 });
-
-        constexpr std::uint64_t player  = 777;
-        const UnixTime          expires{ 3600ull * 1000000000ull };
-        const Bytes first  = sealConnectToken(K, ConnectToken{ player, expires, {} });
-        const Bytes second = sealConnectToken(K, ConnectToken{ player, expires, {} });   // a token is single-use
-        peerConnectWithToken(C, idS, first, MonoTime{ 0 });
-
-        TestLink link = newTestLink(C, idC, S, idS);
-        MonoTime t    = testLinkConnect(link, MonoTime{ 0 }, tickNs, 32);
-        assert(peerIsConnected(S, idC) && peerIsConnected(C, idS));
-        const auto sessionToken = peerSessionToken(C, idS);
-        assert(sessionToken.has_value());
-
-        for (int k = 0; k < 30; ++k) {   // blackhole both ends so each stashes a resumable
-            t = MonoTime{ t.ns + 1000000000ull };
-            processAt(C, t, {});
-            processAt(S, t, {});
-        }
-        assert(peerCount(S) == 0 && peerCount(C) == 0);
-        S.resumableTokens.clear();      // the server forgot the session (grace expired, or it restarted)
-
-        peerReconnect(C, idS, *sessionToken, t, second);
-        bool up = false;
-        testLinkRun(link, t, tickNs, 64, [&](const TestLinkStep& s) {
-            for (const PeerEvent& e : s.bEvents) if (e.kind == PeerEvent::Connected) up = true;
-            return up && peerIsConnected(C, idS);
-        });
-        assert(up);
-        assert(peerIsConnected(S, idC) && peerIsConnected(C, idS));
-        assert(peerPlayerId(S, idC) == player);   // authenticated by the fallback token, not by the dead resume
-        std::printf("handshake_test: a reconnect the server cannot resume falls back to a full authenticated connect\n");
-    }
-
     // --- 13. a Retry is never larger than the request that drew it ---
     // The cookie is minted for an address that has proven nothing, so a request smaller than its own
     // reply would make the server a reflector for whatever address the datagram claimed.
     {
-        NetPeer      S = newPeerState(addrLocalhost(9531), NetworkConfig{}, MonoTime{ 0 });
+        NetPeer      S = newPeerState(addrLocalhost(9531), aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
         const PeerId idA{ addrV4(0x0A000016u, 9532) };
 
         const Bytes tiny{ 0 };   // framing-valid: no cookie, no body -- and far below the minimum
@@ -775,8 +560,8 @@ int main() {
     {
         const Address addrS = addrLocalhost(9541), addrC = addrLocalhost(9542);
         const PeerId  idS{ addrS }, idC{ addrC }, idMoved{ addrV4(0x0A000017u, 9543) };
-        NetPeer S = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
-        NetPeer C = newPeerState(addrC, NetworkConfig{}, MonoTime{ 0 });
+        NetPeer S = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
+        NetPeer C = newPeerState(addrC, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
         peerConnect(C, idS, MonoTime{ 0 });
         TestLink link = newTestLink(C, idC, S, idS);
         MonoTime t    = testLinkConnect(link, MonoTime{ 0 }, tickNs, 24);

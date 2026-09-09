@@ -79,6 +79,7 @@ jobs:
       matrix:
         include:
           - { os: ubuntu-latest, cc: gcc,   cxx: g++ }
+          - { os: ubuntu-24.04-arm, cc: gcc, cxx: g++ }
           - { os: ubuntu-latest, cc: clang, cxx: clang++ }
           - { os: macos-latest,  cc: clang, cxx: clang++ }
     timeout-minutes: 20

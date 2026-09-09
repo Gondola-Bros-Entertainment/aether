@@ -324,7 +324,7 @@ void testMonotonicTimeSaturation() {
 }
 
 void testConfigurationValidation() {
-    const aether::NetworkConfig c;   // defaults are valid
+    const aether::NetworkConfig c = aether::test::anonymousConfig<aether::NetworkConfig>();   // defaults are valid
     assert(!aether::validateConfig(c));
     aether::NetworkConfig c1 = c; c1.maxFragments = 0;
     assert(aether::validateConfig(c1) == aether::ConfigError::InvalidMaxFragments);
@@ -350,7 +350,7 @@ void testConfigurationValidation() {
 }
 
 void testOversizedMessageFailure() {
-    aether::NetworkConfig cfg;                                     // NOT validated, deliberately:
+    aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();                                     // NOT validated, deliberately:
     cfg.defaultChannelConfig.maxMessageSize = 400000;              // past the ~295KB fragmentable ceiling
     aether::Connection conn = aether::newConnection(cfg, 1, aether::MonoTime{ 0 });
     aether::markConnected(conn, aether::MonoTime{ 0 });
@@ -367,7 +367,7 @@ void testOversizedMessageFailure() {
 }
 
 void testConfigurationPropagation() {
-    aether::NetworkConfig cfg;
+    aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     cfg.maxInFlight         = 8;
     cfg.maxSequenceDistance = 1000;
     cfg.fragmentTimeoutMs   = 250.0;
@@ -663,7 +663,7 @@ void testCongestionAndBatching() {
 
 void testConfigurationAndQuality() {
     assert(!aether::validateConfig(aether::NetworkConfig{}));
-    aether::NetworkConfig bad;
+    aether::NetworkConfig bad = aether::test::anonymousConfig<aether::NetworkConfig>();
     bad.mtu = aether::minMtu - 1;   // below the smallest MTU any path is required to carry
     assert(aether::validateConfig(bad) == aether::ConfigError::InvalidMtu);
     const auto rejected = aether::openHost(aether::addrLocalhost(0), bad, aether::MonoTime{ 0 });
@@ -674,7 +674,7 @@ void testConfigurationAndQuality() {
 }
 
 void testConnectionDelivery() {
-    const aether::NetworkConfig cfg;
+    const aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     aether::Connection a = aether::newConnection(cfg, 111, aether::MonoTime{ 0 });
     aether::Connection b = aether::newConnection(cfg, 222, aether::MonoTime{ 0 });
     aether::markConnected(a, aether::MonoTime{ 0 });
@@ -707,7 +707,7 @@ void testConnectionDelivery() {
 }
 
 void testMessageCoalescing() {
-    aether::NetworkConfig cfg;
+    aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     cfg.channelConfigs = { aether::unreliableChannel() };   // channel 0 unreliable: all messages drain per tick
     aether::Connection a = aether::newConnection(cfg, 111, aether::MonoTime{ 0 });
     aether::Connection b = aether::newConnection(cfg, 222, aether::MonoTime{ 0 });
@@ -773,7 +773,7 @@ void testClockOffset() {
 }
 
 void testReliableDeliveryWithLoss() {
-    const aether::NetworkConfig cfg;
+    const aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     aether::Connection a = aether::newConnection(cfg, 111, aether::MonoTime{ 0 });
     aether::Connection b = aether::newConnection(cfg, 222, aether::MonoTime{ 0 });
     aether::markConnected(a, aether::MonoTime{ 0 });
@@ -845,13 +845,13 @@ void testCrcAndTokenValidation() {
     aether::EncryptionKey tk{};
     for (int i = 0; i < 32; ++i) tk[static_cast<std::size_t>(i)] = std::uint8_t(i * 3 + 7);
     aether::TokenValidator tv = aether::newTokenValidator(100);
-    const aether::Bytes sealed = aether::sealConnectToken(tk, aether::ConnectToken{ 7, aether::UnixTime{ 5ull * 1000000000 }, {} });
-    assert(sealed.size() == aether::connectTokenNonceBytes + 16u + static_cast<std::size_t>(aether::authTagSize));   // [nonce:12][pt:16][tag:16]
-    const aether::Bytes sealedAgain = aether::sealConnectToken(tk, aether::ConnectToken{ 7, aether::UnixTime{ 5ull * 1000000000 }, {} });
+    const aether::Bytes sealed = aether::sealConnectToken(tk, aether::ConnectToken{ 7, aether::UnixTime{ 5ull * 1000000000 }, {}, {17, 42} });
+    assert(sealed.size() == aether::connectTokenNonceBytes + aether::connectTokenClaimsBytes + static_cast<std::size_t>(aether::authTagSize));   // [nonce:12][pt:16][tag:16]
+    const aether::Bytes sealedAgain = aether::sealConnectToken(tk, aether::ConnectToken{ 7, aether::UnixTime{ 5ull * 1000000000 }, {}, {17, 42} });
     assert(sealedAgain != sealed);                                       // fresh 96-bit random nonce per seal -> no reuse
-    const auto v1 = aether::validateConnectToken(tk, tv, sealed, aether::UnixTime{ 1000000 });
+    const auto v1 = aether::validateConnectToken(tk, tv, sealed, aether::UnixTime{ 1000000 }, {17, 42});
     assert(!v1.error && v1.playerId == 7);                                // opens + authenticates
-    const auto v2 = aether::validateConnectToken(tk, tv, sealed, aether::UnixTime{ 2000000 });
+    const auto v2 = aether::validateConnectToken(tk, tv, sealed, aether::UnixTime{ 2000000 }, {17, 42});
     assert(v2.error == aether::TokenError::Replayed);                     // same sealed bytes -> replay
 
     aether::Bytes tampered = sealed; tampered[tampered.size() - 1] ^= 0x01;
@@ -860,7 +860,7 @@ void testCrcAndTokenValidation() {
     aether::EncryptionKey wrongKey{}; wrongKey[0] = 1;
     const auto openWrongKey = aether::openConnectToken(wrongKey, sealed, aether::UnixTime{ 1000000 });
     assert(!openWrongKey);                                               // wrong key -> rejected
-    const aether::Bytes shortLived = aether::sealConnectToken(tk, aether::ConnectToken{ 9, aether::UnixTime{ 1000 }, {} });
+    const aether::Bytes shortLived = aether::sealConnectToken(tk, aether::ConnectToken{ 9, aether::UnixTime{ 1000 }, {}, {17, 42} });
     const auto openExpired = aether::openConnectToken(tk, shortLived, aether::UnixTime{ 2000 });
     assert(!openExpired);                                                // expired -> rejected
     std::printf("aether security OK: CRC32C vector + corruption detect + rate limit + sealed token (open/replay/tamper/expiry)\n");
@@ -915,13 +915,13 @@ void testReplayAndQuantizationEdges() {
     aether::EncryptionKey tk2{};
     for (int i = 0; i < 32; ++i) tk2[static_cast<std::size_t>(i)] = std::uint8_t(i * 5 + 1);
     aether::TokenValidator tv = aether::newTokenValidator(64);
-    const aether::Bytes s1 = aether::sealConnectToken(tk2, aether::ConnectToken{ 42, aether::UnixTime{ 5ull * 1000000000 }, {} });
-    const auto a1 = aether::validateConnectToken(tk2, tv, s1, aether::UnixTime{ 1 });
+    const aether::Bytes s1 = aether::sealConnectToken(tk2, aether::ConnectToken{ 42, aether::UnixTime{ 5ull * 1000000000 }, {}, {17, 42} });
+    const auto a1 = aether::validateConnectToken(tk2, tv, s1, aether::UnixTime{ 1 }, {17, 42});
     assert(!a1.error && a1.playerId == 42);                              // first use OK
-    const auto a2 = aether::validateConnectToken(tk2, tv, s1, aether::UnixTime{ 2 });
+    const auto a2 = aether::validateConnectToken(tk2, tv, s1, aether::UnixTime{ 2 }, {17, 42});
     assert(a2.error == aether::TokenError::Replayed);                    // same bytes -> replay
-    const aether::Bytes s2 = aether::sealConnectToken(tk2, aether::ConnectToken{ 42, aether::UnixTime{ 5ull * 1000000000 }, {} });
-    const auto a3 = aether::validateConnectToken(tk2, tv, s2, aether::UnixTime{ 3 });
+    const aether::Bytes s2 = aether::sealConnectToken(tk2, aether::ConnectToken{ 42, aether::UnixTime{ 5ull * 1000000000 }, {}, {17, 42} });
+    const auto a3 = aether::validateConnectToken(tk2, tv, s2, aether::UnixTime{ 3 }, {17, 42});
     assert(!a3.error);                                                   // fresh seal (new nonce) OK
 
     // wire: Quantized at the full 32-bit width must round-trip a value at Hi (the old code
@@ -939,7 +939,7 @@ void testReplayAndQuantizationEdges() {
 }
 
 void testPeerHandshake() {
-    const aether::NetworkConfig cfg;
+    const aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     const aether::Address addrA = aether::addrLocalhost(1111);
     const aether::Address addrB = aether::addrLocalhost(2222);
     const aether::PeerId  idA{ addrA }, idB{ addrB };
@@ -989,7 +989,7 @@ void testPeerHandshake() {
                 aether::clockOffsetMs(A.connections.at(idB)));
 
     // reconnect: idle past the timeout so both sides drop, then re-establish via the session
-    // token -- a fast token-authenticated reconnect (no challenge); the server fires Reconnected.
+    // token -- a fresh authenticated reconnect; the server fires Reconnected.
     const auto token = aether::peerSessionToken(A, idB);
     assert(token);
     const auto origSend = A.connections.at(idB).sendKey;   // the client's pre-drop send key
@@ -1010,8 +1010,7 @@ void testPeerHandshake() {
         for (const auto& e : rb2.events) if (e.kind == aether::PeerEvent::Reconnected) reconnected = true;
     }
     assert(reconnected && aether::peerIsConnected(A, idB) && aether::peerIsConnected(B, idA));
-    // 0-RTT reconnect stays encrypted AND re-keys: the resumed session derives FRESH directional
-    // keys from the cached shared secret + a fresh salt, so it never replays the original keystream.
+    // Resumption derives fresh directional keys through a new Noise handshake.
     {
         const auto& ca = A.connections.at(idB);
         const auto& cb = B.connections.at(idA);
@@ -1030,7 +1029,7 @@ void testPeerHandshake() {
 }
 
 void testAddressMigration() {
-    const aether::NetworkConfig cfg;
+    const aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     const aether::Address addrA  = aether::addrLocalhost(7001);
     const aether::Address addrB  = aether::addrLocalhost(7002);
     const aether::Address addrA2 = aether::addrLocalhost(7003);   // A's address after a NAT rebind
@@ -1102,7 +1101,7 @@ void testAddressMigration() {
 }
 
 void testMigrationReplayChallenge() {
-    const aether::NetworkConfig cfg;
+    const aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     const aether::PeerId idA{ aether::addrLocalhost(7020) }, idB{ aether::addrLocalhost(7021) },
                          idEvil{ aether::addrLocalhost(7022) };
     aether::NetPeer A = aether::newPeerState(idA.addr, cfg, aether::MonoTime{ 0 });
@@ -1147,8 +1146,8 @@ void testMigrationReplayChallenge() {
 void testTokenAdmission() {
     aether::EncryptionKey K{};   // the backend<->game-server shared key
     for (int i = 0; i < 32; ++i) K[static_cast<std::size_t>(i)] = std::uint8_t(i * 9 + 5);
-    aether::NetworkConfig serverCfg; serverCfg.tokenKey = K;   // server requires a token
-    const aether::NetworkConfig clientCfg;                     // client needs no key
+    aether::NetworkConfig serverCfg = aether::test::anonymousConfig<aether::NetworkConfig>(); serverCfg.tokenKey = K; serverCfg.tokenAudience = 42;   // scoped credential admission
+    const aether::NetworkConfig clientCfg = aether::test::anonymousConfig<aether::NetworkConfig>();                     // client needs no key
 
     const aether::Address addrS = aether::addrLocalhost(7101);
     const aether::Address addrC = aether::addrLocalhost(7102);
@@ -1157,7 +1156,7 @@ void testTokenAdmission() {
     aether::NetPeer C = aether::newPeerState(addrC, clientCfg, aether::MonoTime{ 1 });
 
     // the "backend" mints a token for player 12345, the client presents it
-    const aether::Bytes token = aether::sealConnectToken(K, aether::ConnectToken{ 12345, aether::UnixTime{ 3600ull * 1000000000 }, {} });
+    const auto token = aether::issueConnectCredential(K, aether::ConnectToken{ 12345, aether::UnixTime{ 3600ull * 1000000000 }, {}, {serverCfg.protocolId, serverCfg.tokenAudience} });
     aether::peerConnectWithToken(C, idS, token, aether::MonoTime{ 0 });
 
     aether::TestLink link = aether::newTestLink(C, idC, S, idS);
@@ -1280,7 +1279,7 @@ void testRendezvousExpiry() {
 }
 
 void testUdpHandshake() {
-    const aether::NetworkConfig cfg;
+    const aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     auto hA = aether::openHost(aether::addrLocalhost(0), cfg, aether::MonoTime{ 0 });
     auto hB = aether::openHost(aether::addrLocalhost(0), cfg, aether::MonoTime{ 999 });
     assert(hA && hB);
@@ -1302,7 +1301,7 @@ void testUdpHandshake() {
 }
 
 void testUdpRendezvousPunch() {
-    const aether::NetworkConfig cfg2;
+    const aether::NetworkConfig cfg2 = aether::test::anonymousConfig<aether::NetworkConfig>();
     auto rv = aether::openUdp(aether::addrLocalhost(0));
     auto hA = aether::openHost(aether::addrLocalhost(0), cfg2, aether::MonoTime{ 0 });
     auto hB = aether::openHost(aether::addrLocalhost(0), cfg2, aether::MonoTime{ 777 });
@@ -1327,7 +1326,7 @@ void testUdpRendezvousPunch() {
 }
 
 void testRendezvousRegisterRetry() {
-    const aether::NetworkConfig rcfg;
+    const aether::NetworkConfig rcfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     auto rv2 = aether::openUdp(aether::addrLocalhost(0));
     auto h   = aether::openHost(aether::addrLocalhost(0), rcfg, aether::MonoTime{ 0 });
     assert(rv2 && h);
@@ -1353,7 +1352,7 @@ void testRendezvousRegisterRetry() {
 }
 
 void testUdpRelayHandshake() {
-    const aether::NetworkConfig rcfg;
+    const aether::NetworkConfig rcfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     auto rv = aether::openUdp(aether::addrLocalhost(0));
     auto hA = aether::openHost(aether::addrLocalhost(0), rcfg, aether::MonoTime{ 0 });
     auto hB = aether::openHost(aether::addrLocalhost(0), rcfg, aether::MonoTime{ 5 });
@@ -1401,19 +1400,19 @@ void testReceiveMessageSize() {
 }
 
 void testChannelCapacityValidation() {
-    aether::NetworkConfig c;
+    aether::NetworkConfig c = aether::test::anonymousConfig<aether::NetworkConfig>();
     c.defaultChannelConfig.messageBufferSize = 0;   // would make every reliable send BufferFull forever
     assert(validateConfig(c) == aether::ConfigError::InvalidChannelConfig);
-    aether::NetworkConfig c2;
+    aether::NetworkConfig c2 = aether::test::anonymousConfig<aether::NetworkConfig>();
     c2.channelConfigs.push_back(aether::ChannelConfig{ .maxMessageSize = 0 });   // dead channel
     assert(validateConfig(c2) == aether::ConfigError::InvalidChannelConfig);
-    aether::NetworkConfig c3;
+    aether::NetworkConfig c3 = aether::test::anonymousConfig<aether::NetworkConfig>();
     c3.defaultChannelConfig.maxMessageSize = 400000;   // beyond maxFragmentCount fragments at the default MTU -> rejected at setup, not dropped at send
     assert(validateConfig(c3) == aether::ConfigError::MessageTooLargeToFragment);
     // ...and the fragment ceiling is the ONLY size limit: a message far bigger than one send-rate
     // bucket validates fine, because fragment pacing spreads its emission across ticks (the old
     // whole-message admission rejected this as MessageExceedsSendBudget).
-    aether::NetworkConfig c4;
+    aether::NetworkConfig c4 = aether::test::anonymousConfig<aether::NetworkConfig>();
     c4.defaultChannelConfig.maxMessageSize = static_cast<int>(aether::maxFragmentableMessage(c4));   // ~295KB >> one bucket
     assert(!validateConfig(c4));
     assert(!validateConfig(aether::NetworkConfig{}));   // defaults remain valid
@@ -1436,7 +1435,7 @@ void testOrderedGapFailureAcrossWrap() {
 }
 
 void testFragmentDeliveryWithLoss() {
-    aether::NetworkConfig cfg;
+    aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     cfg.defaultChannelConfig.maxMessageSize = 16384;   // allow (and force fragmentation of) a >MTU message
     const aether::Address addrA = aether::addrLocalhost(3333), addrB = aether::addrLocalhost(4444);
     const aether::PeerId  idA{ addrA }, idB{ addrB };
@@ -1493,7 +1492,7 @@ void testFragmentDeliveryWithLoss() {
 }
 
 void testCongestionWindowWithLoss() {
-    aether::NetworkConfig cfg;
+    aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     cfg.useCwndCongestion = true;
     cfg.channelConfigs.push_back(aether::reliableOrderedChannel());
     cfg.channelConfigs.push_back(aether::unreliableChannel());   // never acked -- must not be charged
@@ -1557,7 +1556,7 @@ void testReceiveBufferLimit() {
 }
 
 void testResumeProof() {
-    const aether::NetworkConfig cfg;
+    const aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     const aether::Address addrA = aether::addrLocalhost(5555), addrB = aether::addrLocalhost(6666), addrF = aether::addrLocalhost(7777);
     const aether::PeerId  idA{ addrA }, idB{ addrB }, idF{ addrF };
     aether::NetPeer A = aether::newPeerState(addrA, cfg, aether::MonoTime{ 0 });
@@ -1586,10 +1585,9 @@ void testResumeProof() {
     assert(B.resumableTokens.count(*token) == 1);
 
     // forger replays the (observed) token with a bogus MAC -- it never held the master
-    std::array<std::uint8_t, 16> badMac{};   // all-zero: not a valid tag
     const aether::Bytes forged = aether::serializePacket(aether::Packet{
         aether::PacketHeader{ aether::PacketType::ConnectionRequest, aether::SequenceNum{ 0 }, aether::SequenceNum{ 0 }, 0 },
-        aether::encodeConnectionRequest({}, aether::encodeResume(*token, 0x1234u, badMac)) });
+        aether::encodeConnectionRequest({}, aether::Bytes(32, 0)) });
     t += 1000000;
     const auto rf = aether::peerProcess(B, aether::MonoTime{ t }, { aether::IncomingPacket{ idF, forged } });
     for (const auto& e : rf.events) assert(e.kind != aether::PeerEvent::Reconnected);
@@ -1611,7 +1609,7 @@ void testResumeProof() {
 }
 
 void testHalfOpenCapacity() {
-    aether::NetworkConfig cfg;
+    aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     cfg.maxPending = 3;
     cfg.maxClients = 64;                                          // deliberately != maxPending, to prove which one caps pending
     aether::NetPeer S = aether::newPeerState(aether::addrAny(7200), cfg, aether::MonoTime{ 0 });
@@ -1649,7 +1647,7 @@ void testRendezvousCapacity() {
 }
 
 void testMigrationRateLimit() {
-    aether::NetworkConfig cfg;
+    aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     cfg.rateLimitPerSecond = 5;
     aether::NetPeer S = aether::newPeerState(aether::addrAny(7300), cfg, aether::MonoTime{ 0 });
     const aether::PeerId from{ aether::addrV4(0x0D000001u, 7000) };
@@ -1667,7 +1665,7 @@ void testMigrationRateLimit() {
 }
 
 void testSelectiveFragmentRetransmission() {
-    aether::NetworkConfig cfg;                      // default 1200 MTU -> ~1156-byte chunks
+    aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();                      // default 1200 MTU -> ~1156-byte chunks
     aether::ChannelConfig cc = aether::reliableOrderedChannel();
     cc.maxMessageSize = 16384;
     cfg.defaultChannelConfig = cc;
@@ -1715,7 +1713,7 @@ void testSelectiveFragmentRetransmission() {
 }
 
 void testFragmentPacing() {
-    aether::NetworkConfig cfg;
+    aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     cfg.sendRate      = 5.0;    // bucket: 6KB at base rate...
     cfg.maxPacketRate = 10.0;   // ...12KB at the AIMD peak
     aether::ChannelConfig cc = aether::reliableOrderedChannel();
@@ -1762,7 +1760,7 @@ void testFragmentPacing() {
 }
 
 void testPacedMessageDelivery() {
-    aether::NetworkConfig cfg;
+    aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     cfg.sendRate      = 20.0;   // 24KB bucket
     cfg.maxPacketRate = 40.0;
     aether::ChannelConfig cc = aether::reliableOrderedChannel();
@@ -1858,7 +1856,7 @@ void testAssemblyIdleExpiry() {
 }
 
 void testOrderedBufferBackpressure() {
-    aether::NetworkConfig cfg;
+    aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     cfg.defaultChannelConfig                      = aether::reliableOrderedChannel();
     cfg.defaultChannelConfig.maxOrderedBufferSize = 4;       // small, so the overrun is reached at once
     cfg.defaultChannelConfig.orderedBufferTimeout = 1.0e9;   // never: the give-up flush must not mask it
@@ -1913,7 +1911,7 @@ void testOrderedBufferBackpressure() {
 }
 
 void testDisconnectReason() {
-    const aether::NetworkConfig cfg;
+    const aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     const aether::Address addrS = aether::addrLocalhost(7501), addrC = aether::addrLocalhost(7502);
     const aether::PeerId  idS{ addrS }, idC{ addrC };
     aether::NetPeer S = aether::newPeerState(addrS, cfg, aether::MonoTime{ 0 });
@@ -1937,7 +1935,7 @@ void testDisconnectReason() {
 }
 
 void testBandwidthDecay() {
-    const aether::NetworkConfig cfg;
+    const aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();
     aether::Connection conn = aether::newConnection(cfg, 1, aether::MonoTime{ 0 });
     aether::markConnected(conn, aether::MonoTime{ 0 });
 

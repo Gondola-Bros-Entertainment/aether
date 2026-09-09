@@ -7,9 +7,11 @@
 #include <bcrypt.h>
 
 #include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <memory>
 
 #pragma comment(lib, "ws2_32.lib")   // also linked via CMake; harmless to repeat
 #pragma comment(lib, "bcrypt.lib")   // BCryptGenRandom
@@ -24,16 +26,30 @@ namespace {
 // WSACleanup is deliberately absent -- it would have to run at process exit, where it can tear
 // Winsock down while another thread still holds a socket, and the OS reclaims it at exit regardless.
 std::once_flag winsockOnce;
+int winsockError = 0;
 
 void winsockStartup() {
     WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
+    winsockError = WSAStartup(MAKEWORD(2, 2), &wsa);
 }
-void winsockEnsureInit() { std::call_once(winsockOnce, winsockStartup); }
+int winsockEnsureInit() { std::call_once(winsockOnce, winsockStartup); return winsockError; }
+int addressRuntimeError() { return winsockEnsureInit(); }
 
 sockaddr*       sa(Address& a)       { return reinterpret_cast<sockaddr*>(a.storage.data()); }
 const sockaddr* sa(const Address& a) { return reinterpret_cast<const sockaddr*>(a.storage.data()); }
+
+SocketError socketError(int error) {
+    if (error == WSAEWOULDBLOCK) return {SocketErrorCode::WouldBlock, error};
+    if (error == WSAEMSGSIZE) return {SocketErrorCode::MessageTooLarge, error};
+    if (error == WSAENOTSOCK) return {SocketErrorCode::Closed, error};
+    return {SocketErrorCode::System, error};
+}
 } // namespace
+
+bool addressValid(const Address& a) noexcept {
+    return (a.len == sizeof(sockaddr_in) && sa(a)->sa_family == AF_INET)
+        || (a.len == sizeof(sockaddr_in6) && sa(a)->sa_family == AF_INET6);
+}
 
 Address addrV4(std::uint32_t ip, std::uint16_t port) {
     Address a{};
@@ -58,17 +74,19 @@ Address addrAny6(std::uint16_t port) {
 }
 
 std::uint16_t addrPort(const Address& a) {
+    if (!addressValid(a)) return 0;
     if (sa(a)->sa_family == AF_INET6)
         return ntohs(reinterpret_cast<const sockaddr_in6*>(a.storage.data())->sin6_port);
     return ntohs(reinterpret_cast<const sockaddr_in*>(a.storage.data())->sin_port);
 }
 
 bool addrEqual(const Address& a, const Address& b) {
-    return a.len == b.len && std::memcmp(a.storage.data(), b.storage.data(), a.len) == 0;
+    return a.len == b.len && std::memcmp(a.storage.data(), b.storage.data(), std::min<std::size_t>(a.len, addrStorageSize)) == 0;
 }
 
 Bytes serializeAddr(const Address& a) {
     Bytes b;
+    if (!addressValid(a)) return b;
     if (sa(a)->sa_family == AF_INET6) {
         const auto* in   = reinterpret_cast<const sockaddr_in6*>(a.storage.data());
         const auto  port = ntohs(in->sin6_port);
@@ -114,7 +132,8 @@ std::optional<Address> deserializeAddr(const std::uint8_t* p, std::size_t n) {
 }
 
 std::optional<Socket> openUdp(const Address& bindAddr) {
-    winsockEnsureInit();   // every socket in the library is born here, so this is the one gate needed
+    if (!addressValid(bindAddr)) return std::nullopt;
+    if (winsockEnsureInit() != 0) return std::nullopt;   // every socket in the library is born here, so this is the one gate needed
     const int          family = sa(bindAddr)->sa_family;
     const SocketHandle fd     = static_cast<SocketHandle>(::socket(family, SOCK_DGRAM, 0));
     if (fd == invalidSocket) return std::nullopt;
@@ -147,9 +166,18 @@ Address localAddr(const Socket& s) {
 }
 
 int sendTo(Socket& s, std::span<const std::uint8_t> data, const Address& to) {
+    s.lastSendError = {};
+    if (!addressValid(to)) s.lastSendError = {SocketErrorCode::InvalidAddress, 0};
+    else if (data.size() > maxUdpPayloadSize) s.lastSendError = {SocketErrorCode::MessageTooLarge, 0};
+    if (s.lastSendError.code != SocketErrorCode::None) { ++s.sendErrors; return -1; }
     const int n = ::sendto(static_cast<SOCKET>(s.fd), reinterpret_cast<const char*>(data.data()),
                            static_cast<int>(data.size()), 0, sa(to), static_cast<int>(to.len));
-    if (n < 0) return -1;
+    if (n < 0) {
+        s.lastSendError = socketError(WSAGetLastError());
+        if (s.lastSendError.code == SocketErrorCode::WouldBlock) ++s.sendWouldBlock;
+        else ++s.sendErrors;
+        return -1;
+    }
     s.bytesSent   += static_cast<std::uint64_t>(n);
     s.packetsSent += 1;
     return n;
@@ -160,11 +188,16 @@ int sendTo(Socket& s, std::span<const std::uint8_t> data, const Address& to) {
 // while n >= 0, so folding the two together ends the tick's drain at the first 0-byte datagram and
 // leaves the rest of the queue sitting in the kernel until the next tick.
 int recvFrom(Socket& s, std::span<std::uint8_t> buf, Address& from) {
+    s.lastReceiveError = {};
     from = Address{};
     int       len = sizeof(from.storage);
     const int n   = ::recvfrom(static_cast<SOCKET>(s.fd), reinterpret_cast<char*>(buf.data()),
-                               static_cast<int>(buf.size()), 0, sa(from), &len);
-    if (n < 0) return -1;
+                               static_cast<int>(std::min<std::size_t>(buf.size(), maxUdpPacketSize)), 0, sa(from), &len);
+    if (n < 0) {
+        s.lastReceiveError = socketError(WSAGetLastError());
+        if (s.lastReceiveError.code != SocketErrorCode::WouldBlock) ++s.receiveErrors;
+        return -1;
+    }
     from.len      = static_cast<std::uint32_t>(len);
     s.bytesRecv   += static_cast<std::uint64_t>(n);
     s.packetsRecv += 1;
@@ -181,3 +214,5 @@ void secureRandomBytes(std::uint8_t* out, std::size_t len) {
 }
 
 } // namespace aether
+
+#include "address_resolution.inc"

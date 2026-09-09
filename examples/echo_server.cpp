@@ -1,5 +1,5 @@
 // Bind a UDP port and echo messages on their original channels until interrupted.
-#include "common.hpp"
+#include "credentials.hpp"
 #include <aether/net.hpp>
 
 #include <csignal>
@@ -12,12 +12,16 @@ void requestStop(int) { stopping = 1; }
 } // namespace
 
 int main(int argc, char** argv) {
-    const auto port = aether_example::parsePort(argc > 1 ? argv[1] : "7777");
-    if (argc > 2 || !port) {
-        std::fprintf(stderr, "usage: echo_server [port]; port must be 1..65535\n");
+    const auto port = aether_example::parsePort(argc > 2 ? argv[2] : "7777");
+    const auto key = argc >= 2 ? aether_example::readServerKey(argv[1]) : std::nullopt;
+    if (argc > 3 || !port || !key) {
+        std::fprintf(stderr, "usage: echo_server SERVER_KEY_FILE [port]\n");
         return 1;
     }
-    auto host = aether::openHost(aether::addrAny(*port), aether::NetworkConfig{}, aether_example::monoNow());
+    aether::NetworkConfig config;
+    config.tokenKey = *key;
+    config.tokenAudience = aether_example::echoAudience;
+    auto host = aether::openHost(aether::addrAny(*port), config, aether_example::monoNow());
     if (!host) {
         std::fprintf(stderr, "echo_server: could not bind UDP port %u\n", static_cast<unsigned>(*port));
         return 1;
@@ -42,9 +46,12 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        if (!aether_example::reportDiagnostics(*host)) { aether::closeHost(*host); return 1; }
         std::fflush(stdout);
         std::this_thread::sleep_for(aether_example::tickInterval);
     }
+    aether::hostShutdown(*host, aether_example::monoNow());
+    const bool ok = aether_example::reportDiagnostics(*host);
     aether::closeHost(*host);
-    return 0;
+    return ok ? 0 : 1;
 }

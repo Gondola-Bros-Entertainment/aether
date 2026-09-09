@@ -1,3 +1,4 @@
+#include "check.hpp"
 // aether - receiver flow control: the advertised receive window (issue #3).
 //
 // Backpressure alone never loses data silently, but the sender only discovers the receiver's limit by
@@ -75,7 +76,7 @@ bool queuedWindowUpdateSince(const Connection& c, std::size_t from) {
 }
 
 NetworkConfig cappedConfig(int cap) {
-    NetworkConfig cfg;
+    NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
     ChannelConfig cc          = reliableOrderedChannel();
     cc.maxReceiveBufferSize   = cap;
     cfg.channelConfigs        = { cc };
@@ -282,7 +283,7 @@ int main() {
     // orderedBufferTimeout -- an order of magnitude longer than a retry budget lasts -- and the run of
     // messages behind the gap was destroyed rather than delayed.
     {
-        NetworkConfig cfg;
+        NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         ChannelConfig cc        = reliableOrderedChannel();
         cc.maxOrderedBufferSize = 4;
         cc.maxReceiveBufferSize = 8192;

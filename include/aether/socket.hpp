@@ -9,10 +9,14 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace aether {
 
 inline constexpr std::size_t maxUdpPacketSize = 65536;
+inline constexpr std::size_t maxUdpPayloadSize = 65507; // supported by both IPv4 and IPv6
 inline constexpr std::size_t addrStorageSize  = 128;   // >= sizeof(sockaddr_storage)
 
 // Limits raw socket work before validation, allocation or decryption. Invalid and empty
@@ -39,6 +43,18 @@ Address       addrLocalhost(std::uint16_t port);   // 127.0.0.1:port
 Address       addrV4(std::uint32_t ip, std::uint16_t port);
 std::uint16_t addrPort(const Address& a);
 bool          addrEqual(const Address& a, const Address& b);
+bool          addressValid(const Address& a) noexcept;
+
+enum class AddressFamily { Any, IPv4, IPv6 };
+enum class ResolveErrorCode { InvalidInput, LookupFailed, NoAddresses, RuntimeUnavailable };
+struct ResolveError { ResolveErrorCode code = ResolveErrorCode::LookupFailed; int nativeCode = 0; };
+struct ResolveResult { std::vector<Address> addresses; std::optional<ResolveError> error; };
+inline constexpr std::size_t maxResolvedAddresses = 16;
+// Blocking name lookup: call during setup or on an application worker, never in hostTick.
+// Results retain OS preference order, are deduplicated, and preserve IPv6 scope IDs.
+ResolveResult resolveAddresses(std::string_view host, std::uint16_t port, AddressFamily family = AddressFamily::Any);
+// Numeric endpoint only; never performs reverse DNS. IPv6 is bracketed.
+std::optional<std::string> addressToString(const Address& address);
 
 // --- address hashing (rate-limit keys) ---
 inline constexpr std::uint64_t fnvOffsetBasis = 14695981039346656037ull;
@@ -80,13 +96,25 @@ using SocketHandle = int;
 inline constexpr SocketHandle invalidSocket = -1;
 #endif
 
+enum class SocketErrorCode { None, WouldBlock, MessageTooLarge, InvalidAddress, Closed, System };
+struct SocketError {
+    SocketErrorCode code = SocketErrorCode::None;
+    int nativeCode = 0; // errno or WSAGetLastError; zero for validation failures
+};
+
 // A non-blocking UDP socket. fd == invalidSocket means invalid. Stats are plain counters.
+// An empty receive queue is WouldBlock, not a hard error. Each operation replaces its last error.
 struct Socket {
     SocketHandle  fd{ invalidSocket };
     std::uint64_t bytesSent{};
     std::uint64_t bytesRecv{};
     std::uint64_t packetsSent{};
     std::uint64_t packetsRecv{};
+    std::uint64_t sendErrors{};
+    std::uint64_t receiveErrors{};
+    std::uint64_t sendWouldBlock{};
+    SocketError lastSendError{};
+    SocketError lastReceiveError{};
 };
 
 std::optional<Socket> openUdp(const Address& bindAddr);   // socket + reuseaddr + bind + non-blocking
