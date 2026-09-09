@@ -11,6 +11,15 @@
 
 int main() {
     constexpr double eps = 1e-6;
+    // A clock step between observations leaves the EMA behind; reported uncertainty includes that lag.
+    {
+        aether::ClockSync cs;
+        aether::clockSyncObserve(cs, 0.0, 5.0, 10.0); // true offset 0
+        aether::clockSyncObserve(cs, 100.0, 205.0, 110.0); // true offset now 100
+        assert(std::abs(cs.offsetMs - 10.0) < eps);
+        assert(aether::clockOffsetErrorBoundMs(cs) >= std::abs(100.0 - cs.offsetMs));
+        assert(cs.lastSampleTimeMs == 110.0);
+    }
 
     // bestRttMs upward decay: one fluke-low RTT sets the best, then many higher RTTs relax it UP.
     {

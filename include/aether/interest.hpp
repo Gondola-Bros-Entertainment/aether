@@ -5,18 +5,21 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <cstdint>
 
 namespace aether {
 
 struct Position { float x = 0.0f; float y = 0.0f; float z = 0.0f; };
 
 // --- radius-based: entities within `radius` are relevant; closer = higher priority ---
-struct RadiusInterest { float radius = 0.0f; float radiusSq = 0.0f; };
-inline RadiusInterest newRadiusInterest(float radius) { return { radius, radius * radius }; }
+struct RadiusInterest { float radius = 0.0f; double radiusSq = 0.0; };
+inline RadiusInterest newRadiusInterest(float radius) { return { radius, static_cast<double>(radius) * radius }; }
 
 inline bool relevant(const RadiusInterest& ri, Position entity, Position observer) noexcept {
-    const float dx = entity.x - observer.x, dy = entity.y - observer.y, dz = entity.z - observer.z;
-    return dx * dx + dy * dy + dz * dz <= ri.radiusSq;
+    const double dx = static_cast<double>(entity.x) - observer.x;
+    const double dy = static_cast<double>(entity.y) - observer.y;
+    const double dz = static_cast<double>(entity.z) - observer.z;
+    return std::isfinite(ri.radiusSq) && dx * dx + dy * dy + dz * dz <= ri.radiusSq;
 }
 // Total for every float input, and cutting at the same place relevant() does. A non-finite position
 // (a physics blowup reaches here as readily as it reaches the grid) fails the range test, since every
@@ -24,11 +27,13 @@ inline bool relevant(const RadiusInterest& ri, Position entity, Position observe
 // travel through priorityApplyModifier into the drain comparator, where it compares false both ways
 // and stops being the strict weak ordering stable_sort requires.
 inline float priorityMod(const RadiusInterest& ri, Position entity, Position observer) noexcept {
-    const float dx = entity.x - observer.x, dy = entity.y - observer.y, dz = entity.z - observer.z;
-    const float distSq = dx * dx + dy * dy + dz * dz;
-    if (!(distSq <= ri.radiusSq)) return 0.0f;       // out of range, or non-finite
+    const double dx = static_cast<double>(entity.x) - observer.x;
+    const double dy = static_cast<double>(entity.y) - observer.y;
+    const double dz = static_cast<double>(entity.z) - observer.z;
+    const double distSq = dx * dx + dy * dy + dz * dz;
+    if (!std::isfinite(ri.radiusSq) || !(distSq <= ri.radiusSq)) return 0.0f;       // out of range, or non-finite
     if (ri.radiusSq <= 0.0f) return 1.0f;            // a zero radius has no falloff, and only distSq 0 is in range
-    return 1.0f - std::sqrt(distSq / ri.radiusSq);   // linear falloff, exactly 0 at the boundary relevant() includes
+    return static_cast<float>(1.0 - std::sqrt(distSq / ri.radiusSq));   // linear falloff, exactly 0 at the boundary relevant() includes
 }
 
 // --- grid-based: entities in the same or a neighboring cell are relevant ---
@@ -50,7 +55,7 @@ inline int cellIndex(float coord, float invCellSize) noexcept {
 inline bool relevant(const GridInterest& gi, Position entity, Position observer) noexcept {
     const int ex = detail::cellIndex(entity.x, gi.invCellSize),   ey = detail::cellIndex(entity.y, gi.invCellSize),   ez = detail::cellIndex(entity.z, gi.invCellSize);
     const int ox = detail::cellIndex(observer.x, gi.invCellSize), oy = detail::cellIndex(observer.y, gi.invCellSize), oz = detail::cellIndex(observer.z, gi.invCellSize);
-    return std::abs(ex - ox) <= 1 && std::abs(ey - oy) <= 1 && std::abs(ez - oz) <= 1;
+    return std::abs(static_cast<std::int64_t>(ex) - ox) <= 1 && std::abs(static_cast<std::int64_t>(ey) - oy) <= 1 && std::abs(static_cast<std::int64_t>(ez) - oz) <= 1;
 }
 inline float priorityMod(const GridInterest&, Position, Position) noexcept { return 1.0f; }
 

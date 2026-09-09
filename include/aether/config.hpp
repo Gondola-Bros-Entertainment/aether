@@ -8,6 +8,7 @@
 #include "aether/packet.hpp"
 #include "aether/reliability.hpp"
 #include "aether/security.hpp"
+#include "aether/socket.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -52,6 +53,7 @@ inline constexpr int packetWireOverhead  = static_cast<int>(packetHeaderBytes) +
 struct NetworkConfig {
     std::uint32_t protocolId                  = defaultProtocolId;
     int           maxClients                  = defaultMaxClients;
+    ReceiveBudget receiveBudget{};   // raw intake per hostTick, including malformed datagrams
     double        connectionTimeoutMs         = defaultConnectionTimeoutMs;
     double        keepaliveIntervalMs         = defaultKeepaliveIntervalMs;
     double        connectionRequestTimeoutMs  = defaultConnectionRequestTimeoutMs;
@@ -59,7 +61,7 @@ struct NetworkConfig {
     int           mtu                         = defaultMtu;                   // the FLOOR: everything is sized + validated against it
     int           mtuProbeCeiling             = defaultMtuProbeCeiling;       // discovery probes up to this (== mtu turns discovery off)
     bool          enableMtuDiscovery          = true;                         // probe the path for headroom above mtu (mtu.hpp)
-    double        fragmentTimeoutMs           = defaultFragmentTimeoutMs;         // drop a partial reassembly after this
+    double        fragmentTimeoutMs           = defaultFragmentTimeoutMs;         // fail stalled reliable assemblies; expire best-effort partials
     int           maxFragments                = defaultMaxFragments;              // concurrent in-flight fragmented messages
     int           maxReassemblyBufferSize     = defaultMaxReassemblyBufferSize;   // cap on total buffered fragment bytes
     std::uint16_t maxSequenceDistance         = defaultMaxSequenceDistance;       // largest sequence jump still treated as a reorder
@@ -83,6 +85,7 @@ struct NetworkConfig {
 
 enum class ConfigError {
     InvalidChannelCount,
+    InvalidReceiveBudget,
     InvalidMtu,
     TimeoutNotGreaterThanKeepalive,
     InvalidMaxClients,
@@ -128,12 +131,14 @@ inline long maxFragmentableMessage(const NetworkConfig& c) noexcept {
 // (see maxMessageBufferSize).
 inline bool channelConfigValid(const ChannelConfig& c) noexcept {
     return c.maxMessageSize > 0 && c.messageBufferSize > 0 && c.messageBufferSize <= maxMessageBufferSize
-        && c.maxOrderedBufferSize > 0 && c.maxReliableRetries >= 0 && c.maxReceiveBufferSize > 0;
+        && c.maxOrderedBufferSize > 0 && c.maxReliableRetries >= 0 && c.maxReceiveBufferSize > 0
+        && std::isfinite(c.orderedBufferTimeout) && c.orderedBufferTimeout >= 0.0;
 }
 
 // Validate a config; nullopt means valid.
 inline std::optional<ConfigError> validateConfig(const NetworkConfig& c) {
     const auto validPositive = [](double x) { return x > 0.0 && !std::isnan(x); };
+    if (!receiveBudgetValid(c.receiveBudget)) return ConfigError::InvalidReceiveBudget;
     if (c.maxChannels <= 0 || c.maxChannels > maxChannelCount)        return ConfigError::InvalidChannelCount;
     if (c.mtu < minMtu || c.mtu > maxMtu)                             return ConfigError::InvalidMtu;
     // The probe ceiling brackets the discovery search: at least the floor (== mtu disables the
@@ -165,10 +170,20 @@ inline std::optional<ConfigError> validateConfig(const NetworkConfig& c) {
     if (!channelConfigValid(c.defaultChannelConfig))                 return ConfigError::InvalidChannelConfig;
     for (const ChannelConfig& cc : c.channelConfigs)
         if (!channelConfigValid(cc))                                 return ConfigError::InvalidChannelConfig;
+    const auto canReassemble = [&](const ChannelConfig& channel) {
+        const auto inner = static_cast<std::size_t>(channel.maxMessageSize) + channelWireSeqBytes;
+        const auto chunk = maxFragmentChunk(c);
+        if (inner <= static_cast<std::size_t>(chunk)) return true;
+        const auto count = fragmentCountFor(inner, chunk);
+        return count > 0 && inner + count * fragmentOverheadBytes <= static_cast<std::size_t>(c.maxReassemblyBufferSize);
+    };
     const long maxMsg = maxFragmentableMessage(c);   // a message must fit maxFragmentCount fragments at this MTU, else channelSend would accept it and the send path drop it
     if (c.defaultChannelConfig.maxMessageSize > maxMsg)              return ConfigError::MessageTooLargeToFragment;
     for (const ChannelConfig& cc : c.channelConfigs)
         if (cc.maxMessageSize > maxMsg)                              return ConfigError::MessageTooLargeToFragment;
+    if (!canReassemble(c.defaultChannelConfig)) return ConfigError::InvalidReassemblyBufferSize;
+    for (const auto& channel : c.channelConfigs)
+        if (!canReassemble(channel)) return ConfigError::InvalidReassemblyBufferSize;
     return std::nullopt;
 }
 

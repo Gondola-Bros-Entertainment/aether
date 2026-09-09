@@ -1,3 +1,4 @@
+#include "check.hpp"
 // Cross-layer transport tests: the RTT/loss signal must not depend on a connection carrying
 // RELIABLE traffic, and the congestion window must bound what a single tick emits.
 // assert() is the check, so build WITHOUT NDEBUG.
@@ -312,7 +313,7 @@ int main() {
         cfg.maxPacketRate  = 8.0;
         cfg.channelConfigs = { reliableOrderedChannel() };
         cfg.channelConfigs[0].maxMessageSize     = 16384;
-        cfg.channelConfigs[0].maxReliableRetries = 3;   // a short budget, so disposal is reachable in sim time
+        cfg.channelConfigs[0].maxReliableRetries = 3;   // a short budget, so delivery failure is reachable in sim time
         cfg.maxChannels    = 1;
         assert(!validateConfig(cfg));
 
@@ -321,13 +322,13 @@ int main() {
         markConnected(c, now);
         c.peerCredit[0] = 64;   // the receiver is not the constraint under test here
 
-        assert(!sendMessage(c, ChannelId{ 0 }, Bytes(4000, 0x7E), now));   // ~4 fragments: over one bucket
-        assert(!sendMessage(c, ChannelId{ 0 }, Bytes(40, 0x11), now));     // a small one queued BEHIND it
+        aether::test::require(!sendMessage(c, ChannelId{ 0 }, Bytes(4000, 0x7E), now));   // ~4 fragments: over one bucket
+        aether::test::require(!sendMessage(c, ChannelId{ 0 }, Bytes(40, 0x11), now));     // a small one queued BEHIND it
 
         // Nothing is ever acked, so both keep qualifying for retransmit until their budgets run out.
         const std::uint64_t tick = 16000000;
         int ticks = 0;
-        for (; ticks < 12000 && !c.channels[0].sendBuffer.empty(); ++ticks) {
+        for (; ticks < 12000 && !c.channels[0].failure; ++ticks) {
             now = MonoTime{ now.ns + tick };
             updateConnectedPure(c, now);
             drainSendQueue(c);   // the wire goes nowhere: only the send-side accounting is under test
@@ -335,9 +336,10 @@ int main() {
         const Channel& ch = c.channels[0];
         assert(ticks < 12000);                    // it terminated rather than spinning forever
         assert(ch.totalRetransmits > 0);          // the over-budget message DOES retransmit...
-        assert(ch.sendBuffer.empty());            // ...and the retry limit finally disposes of both
-        assert(ch.totalReliableDropped == 2);     // including the small one, which was never frozen behind it
-        assert(c.stats.reliableDropped == 2);     // ...and the application can SEE the broken guarantee
+        assert(ch.failure == ChannelFailure::RetryLimitExceeded);
+        assert(!ch.sendBuffer.empty());           // retained for failure reporting; never silently discarded
+        assert(ch.totalReliableDropped >= 1);
+        assert(c.stats.reliableDropped == ch.totalReliableDropped);
     }
 
     // ---- an idle connection must not trade an ack-only every tick ----

@@ -3,217 +3,203 @@
 [![ci](https://github.com/Gondola-Bros-Entertainment/aether/actions/workflows/ci.yml/badge.svg)](https://github.com/Gondola-Bros-Entertainment/aether/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Reliable, encrypted UDP netcode for games. C++20, header-only, zero dependencies.
+A C++20 library for reliable UDP transport, serialization, and state replication helpers.
+It has no external runtime dependencies. Most implementation is in headers; a small static
+library provides sockets and system randomness on Linux, macOS, and Windows.
 
-Define a plain struct, and aether sends only the fields that changed since the last snapshot:
-an automatic delta, computed by reflection. No macros, no codegen, no annotations.
+Applications own their message schemas, account integration, simulation, and persistence.
+Aether provides the networking mechanisms without depending on an application or engine.
+
+## Development status
+
+The current handshake encrypts traffic but does **not** authenticate the key exchange against an
+active man-in-the-middle. Connect tokens provide bearer-token admission, not proof that the
+presenter is the intended client. A captured, valid resume request can also win a replay race.
+Authenticated key exchange and fresh proof during resumption remain required security work.
+
+Packet format version 1 uses a 17-byte header, including an authenticated session routing ID.
+It is incompatible with the earlier unversioned 9-byte header. Upgrade both endpoints together.
+
+See [the behavior reference](docs/behavior.md) for delivery guarantees, resource bounds, and
+current handshake behavior.
+
+## Build and test
+
+Requires CMake 3.23 or later and a C++20 compiler.
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DAETHER_WERROR=ON
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
+```
+
+CI runs cppcheck, ASan/UBSan, compiler tests with GCC, Clang, and MSVC, and an installed-package
+consumer on Linux, macOS, and Windows. Keep test builds in Debug: some existing tests use
+`assert`, which Release builds disable.
+
+The [echo server](examples/echo_server.cpp) and [echo client](examples/echo_client.cpp) show the
+socket API with a network loop and connection events. Run them in separate terminals:
+
+```sh
+./build/aether_echo_server
+./build/aether_echo_client
+```
+
+They default to port 7777 and localhost. With a multi-configuration generator, the executables
+are in the configuration directory, such as `build/Debug`.
+
+### Use from CMake
+
+For a source checkout:
+
+```cmake
+add_subdirectory(path/to/aether)
+target_link_libraries(my_app PRIVATE aether::aether)
+```
+
+For an installed package:
+
+```cmake
+find_package(aether CONFIG REQUIRED)
+target_link_libraries(my_app PRIVATE aether::aether)
+```
+
+The target exports its C++20 requirement and platform link dependencies. Tests, header checks,
+benchmarks, examples, and install rules are off by default in an `add_subdirectory` build.
+
+| Option | Default when built directly | Purpose |
+| --- | --- | --- |
+| `AETHER_BUILD_TESTS` | On, unless `BUILD_TESTING=OFF` | Tests and header/ODR checks |
+| `AETHER_BUILD_BENCHMARKS` | Value of `AETHER_BUILD_TESTS` | Local benchmark |
+| `AETHER_EXAMPLES` | On | Echo client and server |
+| `AETHER_INSTALL` | On | Package installation and export rules |
+| `AETHER_WERROR` | Off | Treat compiler warnings as errors |
+| `AETHER_BENCH_COMPARE` | Off | Comparison benchmark; downloads zpp::bits and bitsery |
+
+## Transport
+
+A `Host` owns a UDP socket and peer state. `openHost` validates configuration and binds the socket;
+check its optional result before use. Call `hostTick` regularly with monotonic time. It receives
+a bounded batch, advances transport timers, sends queued traffic, and returns events.
+
+Use `hostConnect` to start a connection. After a `Connected` event, `hostSend` queues a message
+for one peer. Its optional error reports local rejection; success means queued, not remotely
+delivered. `hostTick` also accepts messages to broadcast. Call `closeHost` when finished with
+the socket. The [examples](examples/) demonstrate this sequence.
+
+Each channel chooses its delivery mode:
+
+| Mode | Behavior |
+| --- | --- |
+| Reliable ordered | Retransmits missing messages and delivers in order; a gap is recovered or fails the connection. |
+| Reliable unordered | Retransmits missing messages and suppresses duplicate deliveries without waiting for earlier messages. |
+| Reliable sequenced | Retransmits while a message remains current; newer messages supersede older ones. |
+| Unreliable | Sends without retransmission or ordering. |
+| Unreliable sequenced | Sends without retransmission and discards messages older than the latest received sequence. |
+
+The packet layer rejects replayed datagrams. Small messages can share a datagram. Large messages
+use fragmentation, selective retransmission, and pacing across ticks. Reliable receive pressure
+withholds acknowledgements; acknowledged fragments retain assembly storage until the channel
+accepts the completed message. Retry exhaustion or an unrecoverable reliable assembly timeout
+reports `DeliveryFailed` instead of silently losing a message and continuing.
+
+Other transport modules provide RTT/RTO estimation, loss-based rate control, an optional
+congestion window, path-MTU probes, encrypted address-migration challenges, and rendezvous
+pairing with hole punching and relay fallback. These are custom UDP mechanisms; the congestion
+controller does not claim TCP NewReno conformance.
+
+`peerProcess` exposes the transport without sockets. `testnet.hpp` drives two peers with seeded
+loss, latency, jitter, duplication, and reordering for deterministic application tests.
+
+## Serialization and field deltas
+
+The delta codec compares aggregate fields against a baseline and writes a change mask followed
+by changed values. The caller must supply the same baseline to both operations:
 
 ```cpp
-struct PlayerState {
-    float x, y, z;
-    float yaw;
-    int   health;
-    bool  firing;
-};
+#include <aether/delta.hpp>
+#include <cstdint>
 
-std::uint8_t buf[256];
-aether::Writer w{ buf, sizeof buf };
-aether::deltaPack(w, prev, current);          // only the changed fields hit the wire
+int main() {
+    struct State { float x, y; int health; };
+    const State previous{0.0f, 0.0f, 100};
+    const State current{1.5f, 0.0f, 95};
+    std::uint8_t buffer[256]{};
+    aether::Writer writer{buffer, sizeof buffer};
+    aether::deltaPack(writer, previous, current);
+    if (!writer.ok) return 1;
 
-aether::Reader r{ buf, w.pos };
-auto restored = aether::deltaUnpack(r, prev); // std::optional<PlayerState>; unchanged fields carried from prev
-```
-
-On a 12-field snapshot with two fields changed, aether writes 8 bytes where zpp::bits and bitsery
-both write 40. The diff costs a few nanoseconds of CPU, and on a bandwidth-bound network fewer
-bytes on the wire is the trade that matters. Past 16 fields the changemask adapts: a small number
-of changes is sent as sparse indices rather than a full bitmap, so one changed field in a 32-field
-struct costs a 2-byte mask instead of 5. To reproduce:
-
-```sh
-cmake -B build -DAETHER_BENCH_COMPARE=ON
-cmake --build build --target aether_bench_compare && ./build/aether_bench_compare
-```
-
-## The stack
-
-On top of the delta core, aether is a full reliable-UDP transport.
-
-**Delivery.** Five per-channel guarantees (reliable-ordered, reliable-unordered,
-reliable-sequenced, unreliable, unreliable-sequenced) share one packet stream, so a single
-connection carries mixed semantics. Every mode delivers a message at most once: a retransmit whose
-ack was lost, or a datagram the network duplicated, is recognized and dropped rather than handed to
-the application twice. Small messages coalesce into one datagram under a single header and auth
-tag. Messages over the MTU are fragmented and reassembled with selective retransmit, so a lost
-fragment costs one fragment rather than the whole message, and a large message is paced across as
-many ticks as the send budget needs. Nothing is acknowledged until the receiving channel has taken
-it, so a full buffer becomes backpressure the sender feels rather than data it loses, and the
-receiver advertises its remaining room per channel so the sender throttles before it starts
-retransmitting into a buffer with no space.
-
-**Reliability and congestion.** Sequence and ack-bitfield tracking, Jacobson/Karels RTT and RTO
-estimation, and fast retransmit on a triple NACK. Rate control is a binary AIMD controller driven
-by measured loss and RTT; a TCP New Reno window is available behind `useCwndCongestion`. Path-MTU
-discovery is probe-based in the style of RFC 8899 and never depends on ICMP, raising the usable
-datagram size above the 1200-byte floor when the path carries more and falling back immediately
-when it stops.
-
-**Security.** An X25519 handshake derives per-direction ChaCha20-Poly1305 keys with no pre-shared
-secret. The packet header is authenticated as associated data, and replays are rejected by a
-sliding window. Both primitives are written from scratch and checked against the RFC 7748 and RFC
-8439 test vectors; a degenerate peer public key is rejected rather than keyed from. The handshake is
-challenge/response with per-source rate limiting, keyed entirely from the OS CSPRNG: the client
-echoes the server's challenge salt, so a peer spoofing its source address never receives the
-challenge and cannot complete a handshake. Before any of that, the server answers a connection
-request with a stateless retry cookie it does not remember, so a spoofed source cannot make it
-commit a half-open slot or generate a keypair either. Rate limits are keyed per host, so varying a
-source port buys no extra budget.
-
-**Staying connected.** A dropped session resumes from a token without a full re-handshake, carrying
-its verified `playerId` across the resume. The session master ratchets on each resume, so a resume
-request authenticates once and never again. A live connection follows a peer across an IP change,
-such as a NAT rebind; the new address is confirmed by an encrypted challenge before the connection
-moves, so possession of the keys alone cannot redirect a session. Two peers behind NATs join a
-shared room on a rendezvous server, which pairs them so they can hole-punch a direct path, and
-relays through itself as a fallback when the punch fails, as it does on symmetric NATs.
-
-**Replication and tooling.** Delta encoding with baseline tracking, interest management, priority
-accumulation, snapshot interpolation, and a ping/pong estimate of the peer's clock offset.
-`testnet.hpp` runs two real peers against each other with configurable loss, latency, jitter,
-duplication and reordering, reproducible from a fixed seed and with no sockets involved. aether's
-own tests drive it, so your CI can test your netcode the same way.
-
-## Build
-
-```sh
-cmake -B build
-cmake --build build
-ctest --test-dir build
-```
-
-aether needs a C++20 compiler: clang, gcc, or MSVC. CMake selects the one platform file, either
-`src/socket_posix.cpp` for BSD sockets or `src/socket_win.cpp` for Winsock. CI runs cppcheck, then
-ASan and UBSan, then a build-and-test matrix across gcc, clang and MSVC on Linux, macOS and
-Windows, warning-clean under `-Werror`, plus a job that installs the package and builds a consumer
-against it.
-
-The build includes a runnable echo pair in `examples/`. Start the server, type lines at it through
-the client, and watch them come back over an encrypted reliable channel:
-
-```sh
-./build/aether_echo_server            # terminal 1: listens on 7777
-./build/aether_echo_client            # terminal 2: connects to 127.0.0.1:7777
-```
-
-## Getting started
-
-A `Host` is a socket plus its peers, and the same type serves as client or server. Bind it, then
-pump one step per frame: `hostTick` drains incoming datagrams, sends what you queued, and returns
-the events that occurred.
-
-```cpp
-#include <aether/net.hpp>
-
-aether::NetworkConfig cfg;
-
-// server: bind a port, tick each frame
-auto server = aether::openHost(aether::addrAny(9000), cfg, now);
-std::vector<std::pair<aether::ChannelId, aether::Bytes>> broadcast;
-for (const aether::PeerEvent& ev : aether::hostTick(*server, broadcast, now)) {
-    switch (ev.kind) {
-        case aether::PeerEvent::Connected:    break;   // ev.peer joined
-        case aether::PeerEvent::Reconnected:  break;   // ev.peer resumed a dropped session
-        case aether::PeerEvent::Message:      break;   // ev.data arrived on ev.channel
-        case aether::PeerEvent::Disconnected: break;
-        case aether::PeerEvent::Migrated:     break;   // ev.peer rebound to ev.other (NAT)
-    }
+    aether::Reader reader{buffer, writer.pos};
+    const auto restored = aether::deltaUnpack(reader, previous);
+    if (!restored || reader.pos != writer.pos) return 1;
+    return restored->x == current.x && restored->y == current.y
+        && restored->health == current.health ? 0 : 1;
 }
-
-// client: connect, then send to a peer on a channel
-auto client = aether::openHost(aether::addrLocalhost(0), cfg, now);
-aether::hostConnect(*client, serverAddr, now);
-aether::hostSend(*client, serverAddr, aether::ChannelId{ 0 }, payload, now);
 ```
 
-Each channel picks its own guarantee, one of reliable-ordered, reliable-unordered,
-reliable-sequenced, unreliable, or unreliable-sequenced, so one packet stream carries mixed
-delivery semantics.
+Reflection uses compile-time aggregate decomposition and structured bindings, with a central
+binding ladder for up to 32 fields per aggregate. It binds members directly; it does not guess
+memory offsets. Supported fields include nested aggregates, `std::array`, `std::string`,
+`std::vector`, and `std::optional`. Raw C-array members are unsupported; use `std::array`.
+Changing member order or types changes the wire schema.
 
-Two peers behind NATs do not need each other's address. They join a shared room on a rendezvous
-server, and aether establishes the link by hole-punching a direct path, or by relaying through the
-rendezvous if the punch fails.
+Integers use varints; floating-point values preserve their bits. Above 16 fields, change masks
+use sparse indices when smaller. Changed vectors are encoded in full. The codec does not infer
+numeric tolerances, object identities, or element-level vector edits.
+
+`DeltaTracker` stores sender baselines and `BaselineManager` stores receiver baselines. The
+application assigns snapshot IDs and acknowledges successful reconstruction. Packet receipt
+alone is insufficient. Full-state fallback is enabled by default when snapshot acknowledgements
+stop advancing. Interest management, priority accumulation, snapshot interpolation, and clock
+offset estimation are separate helpers.
+
+### Explicit bit packing
+
+Use `Ranged` and `Quantized` when the application knows a field's range and acceptable precision:
 
 ```cpp
-aether::hostJoinRoom(host, rendezvousAddr, roomId, now);   // paired by room, then punched or relayed
+#include <aether/bitserialize.hpp>
+#include <cstdint>
+
+int main() {
+    struct Input {
+        aether::Ranged<int, 0, 1023> move;
+        aether::Quantized<-1.0f, 1.0f, 12> aim;
+        bool firing;
+    };
+    const Input input{{512}, {0.25f}, true};
+    std::uint8_t buffer[3]{};
+    aether::BitWriter writer{buffer, sizeof buffer};
+    const auto size = aether::packBits(writer, input); // 10 + 12 + 1 bits, padded to 3 bytes
+    return writer.ok && size == sizeof buffer ? 0 : 1;
+}
 ```
 
-## Authentication
+This is a separate codec from `deltaPack`. Quantization trades precision for fewer bits.
 
-Gate connections behind a signed token from your own auth backend, whether that is Firebase, Steam,
-OIDC or something custom. Your backend holds a secret key `K` shared with the game servers and
-seals a token after a login; the server verifies it during the handshake. aether never talks to the
-provider, so it works with any of them, and the provider only ever touches your backend's seal
-step.
+## Connect tokens
 
-```cpp
-// your backend, after the player logs in (Firebase/Steam/...), holding the shared key K:
-aether::Bytes token = aether::sealConnectToken(K, aether::ConnectToken{ playerId, expiresAt, userData });
-//                    ...hand the token bytes to the client over HTTPS...
+An application credential issuer uses `sealConnectToken` to seal an application-issued numeric
+`playerId`, expiry, and opaque data. The issuer and admitting servers share an `EncryptionKey`;
+the client receives only the sealed bytes through the application's authenticated service.
 
-// server: require a token by setting the key; the verified playerId arrives on Connected
-cfg.tokenKey = K;   // open the server host with this config; ev.playerId is the authenticated id
+Set `NetworkConfig::tokenKey` before opening the server host to require tokens. Clients present
+the bytes with `hostConnectWithToken`. The admitted identity arrives in `PeerEvent::playerId`.
+This admission check does not yet authenticate the ephemeral key exchange.
 
-// client: present the token your backend gave you
-aether::hostConnectWithToken(*client, serverAddr, token, now);
-```
+Credential expiry uses `UnixTime` in Unix epoch nanoseconds. Transport timers use `MonoTime`.
+`hostTick` obtains Unix time from the system; callers of `peerProcess` supply it as the fourth
+argument when accepting tokens. Omitting it rejects token admission.
 
-The server validates the token before generating any keys, which also shields the handshake from
-spoofed-source floods. A token is single-use and replay-protected, so mint a fresh one per connect.
+The replay validator retains each spent nonce until its token expires and rejects new admissions
+when storage is full. `validateConnectToken` exposes `TokenError::ReplayCapacity`. A time high
+watermark prevents backward clock corrections from reviving expired credentials.
 
-## Squeezing the wire
+Replay protection belongs to the authority retaining that table. Preserve its state across
+restarts or rotate the sealing key when state is lost. Independent validators sharing a key do
+not enforce global single use. Token scope binding and authenticated resumption remain part of
+the unfinished authentication work described above.
 
-Optional: when you know a field's range, wrap it and it costs exactly the bits that range needs.
+## License
 
-```cpp
-struct Input {
-    aether::Ranged<int, 0, 1023>       move;     // 10 bits, not 32
-    aether::Quantized<-1.0f, 1.0f, 12> aimYaw;   // 12 bits, not a 32-bit float
-    bool                               firing;   // 1 bit
-};
-
-aether::BitWriter bw{ buf, sizeof buf };
-aether::packBits(bw, input);                      // 23 bits -> 3 bytes on the wire
-```
-
-## Design
-
-Data-first: plain structs and free functions, with no inheritance or virtuals. State is mutated in
-place. One focused header per module under `include/aether/`, so you can include only what you use
-or pull in the whole library with `<aether/aether.hpp>`. The only translation units are the
-platform layer, `src/socket_posix.cpp` and `src/socket_win.cpp`; everything else is header-only.
-
-## Trade-offs
-
-Deliberate design decisions, and what they cost you.
-
-- The X25519 handshake is unauthenticated: it resists eavesdropping but not an active
-  man-in-the-middle. Connect tokens add identity and access control, but a token is a bearer
-  credential. Full MITM resistance needs a keys-in-token model, which is not a trade this library
-  makes.
-- `maxMessageSize` is bounded by the fragment count, roughly 295KB at a 1200-byte MTU, and rejected
-  at `validateConfig` rather than at send. Messages larger than one send-rate bucket are paced across
-  ticks, so a big message costs latency and never a config rejection.
-- Replication ships the codec, not the protocol. Numbering your snapshots and telling the sender
-  which one the peer received stays yours, because only the application knows what a snapshot is.
-- `net.hpp` drains the socket once per tick with no dedicated receive thread, so inbound traffic sits
-  in the kernel socket buffer between ticks and one core handles all packet processing.
-- The serializer reflects `std::array`, `string`, `vector`, `optional` and nested aggregates. Raw
-  C-array members are not, which is a C++20 limitation; use `std::array<T, N>` instead. Misuse is a
-  compile error, not silent breakage.
-- A rendezvous room id is a bearer credential: anyone presenting it is paired into the room and
-  learns the other peer's public address, so mint them as unguessable secrets, not lobby numbers.
-- Clock sync uses Cristian's algorithm, which assumes symmetric one-way delays. An asymmetric path
-  biases the offset by half the difference: 5ms out and 145ms back reads exactly 70ms off. Check
-  `clockOffsetErrorMs` before lag compensation -- a large bound means the shared timeline is a guess.
-
-Handshake, delivery, sizing and decoding behaviour in detail: [docs/behavior.md](docs/behavior.md).
+[MIT](LICENSE).

@@ -1,8 +1,7 @@
 // aether - wire packet header.
-// The header is 68 bits packed MSB-first into 9 bytes: a 4-bit type, a 16-bit
-// sequence, a 16-bit ack (most recent sequence received), and a 32-bit ack bitfield
-// (the 32 preceding acks) -- the sequence + ack-bitfield reliable-UDP scheme. Plain data + free
-// functions; the bit layout is a fixed, stable wire format.
+// A 9-byte reliability prefix carries type, sequence, ACK, ACK bits, and wire version.
+// An 8-byte session routing ID follows. The complete 17-byte header is authenticated as AEAD
+// associated data; the public routing ID selects a key but never substitutes for authentication.
 #pragma once
 
 #include "aether/serialize.hpp"
@@ -40,14 +39,16 @@ struct PacketHeader {
     SequenceNum   sequence{};
     SequenceNum   ack{};       // most recent sequence received from the peer
     std::uint32_t ackBits{};   // the 32 acks preceding `ack`
+    std::uint64_t connectionId{}; // session identity, independent of address and packet sequence
 };
 
-inline constexpr std::size_t packetHeaderBytes = 9;   // (68 + 7) / 8
+inline constexpr std::uint8_t packetWireVersion = 1;
+inline constexpr std::size_t packetHeaderBytes = 17; // 9-byte prefix + 8-byte session ID
 
 // Pack the header MSB-first into a fixed stable wire format:
 //   b0 [type:4][seq>>12:4]   b1 [seq>>4]            b2 [seq&F<<4][ack>>12]
 //   b3 [ack>>4]              b4 [ack&F<<4][abf>>28] b5 [abf>>20]
-//   b6 [abf>>12]             b7 [abf>>4]            b8 [abf&F<<4]
+//   b6 [abf>>12]             b7 [abf>>4]            b8 [abf&F<<4][version:4]; b9..16 connection ID (little-endian)
 inline void writeHeader(Writer& w, const PacketHeader& h) noexcept {
     const std::uint8_t  pt  = static_cast<std::uint8_t>(h.type);
     const std::uint16_t sn  = h.sequence.value;
@@ -61,7 +62,8 @@ inline void writeHeader(Writer& w, const PacketHeader& h) noexcept {
     write(w, static_cast<std::uint8_t>( abf >> 20));
     write(w, static_cast<std::uint8_t>( abf >> 12));
     write(w, static_cast<std::uint8_t>( abf >> 4));
-    write(w, static_cast<std::uint8_t>((abf & 0x0F) << 4));
+    write(w, static_cast<std::uint8_t>(((abf & 0x0F) << 4) | packetWireVersion));
+    write(w, h.connectionId);
 }
 
 // Read a header, or nullopt if too short / the type tag is out of range.
@@ -69,7 +71,7 @@ inline std::optional<PacketHeader> readHeader(Reader& r) noexcept {
     if (!has(r, packetHeaderBytes)) return std::nullopt;
     const std::uint8_t* b = r.buf + r.pos;
     const std::uint8_t pt = static_cast<std::uint8_t>(b[0] >> 4);
-    if (pt > packetTypeMax) return std::nullopt;
+    if (pt > packetTypeMax || (b[8] & 0x0F) != packetWireVersion) return std::nullopt;
     const std::uint16_t sn = static_cast<std::uint16_t>(
         (std::uint16_t(b[0] & 0x0F) << 12) | (std::uint16_t(b[1]) << 4) | (b[2] >> 4));
     const std::uint16_t ak = static_cast<std::uint16_t>(
@@ -78,10 +80,10 @@ inline std::optional<PacketHeader> readHeader(Reader& r) noexcept {
         (std::uint32_t(b[4] & 0x0F) << 28) | (std::uint32_t(b[5]) << 20) |
         (std::uint32_t(b[6]) << 12)        | (std::uint32_t(b[7]) << 4)  | (b[8] >> 4);
     r.pos += packetHeaderBytes;
-    return PacketHeader{ static_cast<PacketType>(pt), SequenceNum{sn}, SequenceNum{ak}, abf };
+    return PacketHeader{ static_cast<PacketType>(pt), SequenceNum{sn}, SequenceNum{ak}, abf, getU64(b + 9) };
 }
 
-// A complete packet: the 9-byte header followed by its payload bytes.
+// A complete packet: the 17-byte header followed by its payload bytes.
 struct Packet {
     PacketHeader header{};
     Bytes        payload;

@@ -1,6 +1,7 @@
+#include "check.hpp"
 // aether - security + handshake unit tests that need the static lib (the connect-token seal draws an
-// OS-CSPRNG nonce; the handshake draws CSPRNG salts). Pins audit-flagged edges: replay-table eviction
-// order, the inclusive token-expiry boundary, the fail-closed unkeyed-accept branch (no plaintext
+// OS-CSPRNG nonce; the handshake draws CSPRNG salts). Pins audit-flagged edges: replay-table capacity
+// rejection, the inclusive token-expiry boundary, the fail-closed unkeyed-accept branch (no plaintext
 // zombie), the hoisted per-source rate gate that bounds the connect-request reflection surface, and
 // who the rate limiter sheds when its table is full.
 #include <aether/aether.hpp>
@@ -11,28 +12,28 @@
 #include <cstdio>
 
 int main() {
-    // token replay-table eviction: past the cap the OLDEST nonce is evicted, the most-recent survives.
-    // Pins the documented bounded-cache tradeoff -- an evicted nonce's token can replay once, while a
-    // just-burned recent token stays rejected.
+    // Full replay storage rejects new admissions and preserves every unexpired spent token.
     {
-        aether::EncryptionKey K{};
-        for (std::size_t i = 0; i < K.size(); ++i) K[i] = static_cast<std::uint8_t>(i * 7 + 1);
-        aether::TokenValidator tv = aether::newTokenValidator(/*lifetimeMs=*/1.0e12, /*maxTracked=*/2);
-        const aether::ConnectToken tk{ 1, aether::MonoTime{ 1000000000000000000ull }, {} };
-        const aether::Bytes a = aether::sealConnectToken(K, tk);   // each seal draws a fresh random
-        const aether::Bytes b = aether::sealConnectToken(K, tk);   // nonce, so a/b/c are distinct
-        const aether::Bytes c = aether::sealConnectToken(K, tk);   // replay identities
-
-        const auto ra = aether::validateConnectToken(K, tv, a, aether::MonoTime{ 100 });
-        const auto rb = aether::validateConnectToken(K, tv, b, aether::MonoTime{ 200 });
-        const auto rc = aether::validateConnectToken(K, tv, c, aether::MonoTime{ 300 });   // size 3 > cap 2 -> evict oldest (a)
-        assert(!ra.error && !rb.error && !rc.error);
-
-        const auto rcReplay  = aether::validateConnectToken(K, tv, c, aether::MonoTime{ 400 });   // newest, still tracked
-        assert(rcReplay.error && *rcReplay.error == aether::TokenError::Replayed);
-        const auto raEvicted = aether::validateConnectToken(K, tv, a, aether::MonoTime{ 400 });   // oldest, was evicted
-        assert(!raEvicted.error);
-        std::printf("aether token-eviction OK: oldest nonce evicted past cap, newest still rejected as replay\n");
+        aether::EncryptionKey key{};
+        auto tv = aether::newTokenValidator(2);
+        const aether::ConnectToken token{1, aether::UnixTime{1000}, {}};
+        const auto a = aether::sealConnectToken(key, token);
+        const auto b = aether::sealConnectToken(key, token);
+        const auto c = aether::sealConnectToken(key, {1, aether::UnixTime{2000}, {}});
+        aether::test::require(!aether::validateConnectToken(key, tv, a, {100}).error);
+        aether::test::require(!aether::validateConnectToken(key, tv, b, {200}).error);
+        aether::test::require(aether::validateConnectToken(key, tv, c, {300}).error == aether::TokenError::ReplayCapacity);
+        aether::test::require(aether::validateConnectToken(key, tv, a, {400}).error == aether::TokenError::Replayed);
+        aether::test::require(aether::validateConnectToken(key, tv, b, {400}).error == aether::TokenError::Replayed);
+        assert(tv.usedNonces.size() == 2);
+        // Actual expiry frees capacity; a wall-clock rollback cannot revive the forgotten token.
+        aether::test::require(!aether::validateConnectToken(key, tv, c, {1000}).error);
+        assert(tv.usedNonces.size() == 1);
+        aether::test::require(aether::validateConnectToken(key, tv, a, {500}).error == aether::TokenError::Invalid);
+        aether::test::require(aether::validateConnectToken(key, tv, c, {1100}).error == aether::TokenError::Replayed);
+        auto disabled = aether::newTokenValidator(0);
+        aether::test::require(aether::validateConnectToken(key, disabled, c, {1000}).error == aether::TokenError::ReplayCapacity);
+        assert(disabled.usedNonces.empty());
     }
 
     // token expiry is inclusive: rejected at exactly expiresAt (now.ns >= expiresAt.ns).
@@ -40,9 +41,9 @@ int main() {
         aether::EncryptionKey K{};
         for (std::size_t i = 0; i < K.size(); ++i) K[i] = static_cast<std::uint8_t>(i * 3 + 9);
         const std::uint64_t exp = 5000000;
-        const aether::Bytes sealed = aether::sealConnectToken(K, aether::ConnectToken{ 7, aether::MonoTime{ exp }, {} });
-        const auto before = aether::openConnectToken(K, sealed, aether::MonoTime{ exp - 1 });
-        const auto atExp  = aether::openConnectToken(K, sealed, aether::MonoTime{ exp });
+        const aether::Bytes sealed = aether::sealConnectToken(K, aether::ConnectToken{ 7, aether::UnixTime{ exp }, {} });
+        const auto before = aether::openConnectToken(K, sealed, aether::UnixTime{ exp - 1 });
+        const auto atExp  = aether::openConnectToken(K, sealed, aether::UnixTime{ exp });
         assert(before.has_value());     // one ns before -> valid
         assert(!atExp.has_value());     // exactly at expiry -> rejected
         std::printf("aether token-expiry OK: valid at expiresAt-1, rejected at expiresAt (inclusive)\n");

@@ -12,7 +12,7 @@
 namespace aether {
 
 // An integer constrained to [Lo, Hi]. On the wire it costs exactly bitsForMax(Hi-Lo) bits.
-// Implicitly converts to/from T, so it reads like a plain field at the call site.
+// Access the underlying integer through value.
 template <class T, T Lo, T Hi>
 struct Ranged {
     static_assert(std::is_integral_v<T>, "Ranged<T>: T must be integral");

@@ -15,6 +15,16 @@ namespace aether {
 inline constexpr std::size_t maxUdpPacketSize = 65536;
 inline constexpr std::size_t addrStorageSize  = 128;   // >= sizeof(sockaddr_storage)
 
+// Limits raw socket work before validation, allocation or decryption. Invalid and empty
+// datagrams count too. The byte budget must admit any one socket datagram.
+struct ReceiveBudget {
+    std::size_t maxDatagrams = 256;
+    std::size_t maxBytes = 256 * 1024;
+};
+inline bool receiveBudgetValid(const ReceiveBudget& budget) noexcept {
+    return budget.maxDatagrams > 0 && budget.maxBytes >= maxUdpPacketSize;
+}
+
 // An IP endpoint (v4 or v6). Opaque bytes; build it with the helpers below.
 // std::array, not a C array: reflection counts a C array element-by-element, so a user struct
 // embedding an Address would field-count as addrStorageSize + 1 and blow the field cap.

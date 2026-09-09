@@ -1,3 +1,4 @@
+#include "check.hpp"
 // Foundation smoke test: round-trip a struct through the little-endian cursor (free
 // functions, data-first), and check sequence-number wraparound. No allocation.
 #include "aether/bitserialize.hpp"
@@ -107,11 +108,11 @@ int main() {
                     static_cast<unsigned>(restored.health), static_cast<unsigned>(restored.seq.value), writer.pos);
     }
 
-    // packet header: the bit-packed 9-byte header round-trips byte-exact
+    // packet header: the versioned 17-byte header round-trips byte-exact
     {
         const aether::PacketHeader h{ aether::PacketType::Payload, aether::SequenceNum{40000},
                                       aether::SequenceNum{39999}, 0xDEADBEEFu };
-        std::uint8_t pbuf[16];
+        std::uint8_t pbuf[aether::packetHeaderBytes];
         aether::Writer pw{ pbuf, sizeof pbuf, 0, true };
         aether::writeHeader(pw, h);
         assert(pw.ok && pw.pos == aether::packetHeaderBytes);
@@ -396,10 +397,10 @@ int main() {
         aether::updateConnectedPure(conn, aether::MonoTime{ 1000000 });
         const aether::Channel& ch = conn.channels[0];
         assert(ch.totalDropped == 1);
-        assert(ch.sendBuffer.empty());                                 // disposed, not committed-and-kept
+        assert(ch.failure == aether::ChannelFailure::MessageTooLarge && ch.sendBuffer.size() == 1);
         aether::updateConnectedPure(conn, aether::MonoTime{ 400000000 });   // past the RTO: nothing re-qualifies
         assert(ch.totalDropped == 1 && conn.pendingWires.empty());
-        std::printf("aether oversized-backstop OK: an unfragmentable reliable message is disposed, not a retransmit zombie\n");
+        std::printf("aether oversized-backstop OK: an unfragmentable reliable message fails delivery explicitly\n");
     }
 
     // config: the caps that used to be validated and then ignored are actually WIRED -- a config value
@@ -409,6 +410,7 @@ int main() {
         cfg.maxInFlight         = 8;
         cfg.maxSequenceDistance = 1000;
         cfg.fragmentTimeoutMs   = 250.0;
+        cfg.defaultChannelConfig.maxMessageSize = 4096;
         assert(!aether::validateConfig(cfg));
 
         const aether::Connection conn = aether::newConnection(cfg, 1, aether::MonoTime{ 0 });
@@ -430,9 +432,12 @@ int main() {
         const aether::Address addrS = aether::addrLocalhost(7401);
         aether::NetPeer S = aether::newPeerState(addrS, cfg, aether::MonoTime{ 0 });
         const aether::PeerId from{ aether::addrLocalhost(7402) };
-        std::uint8_t frag[aether::fragmentHeaderSize + 4]{};
-        aether::writeFragmentHeader(frag, aether::FragmentHeader{ aether::MessageId{ 1 }, 0, 2 });   // 1 of 2, never completes
-        aether::handleFragment(S, from, aether::ChannelId{ 0 }, aether::ByteSpan(frag, sizeof frag), aether::MonoTime{ 0 });
+        auto source = aether::newConnection(cfg, 1, aether::MonoTime{0});
+        aether::markConnected(source, aether::MonoTime{0});
+        S.connections.emplace(from, std::move(source));
+        aether::Bytes frag(aether::fragmentHeaderSize + aether::maxFragmentChunk(cfg));
+        aether::writeFragmentHeader(frag.data(), aether::FragmentHeader{ aether::MessageId{ 1 }, 0, 2 });
+        aether::test::require(aether::handleFragment(S, from, aether::ChannelId{ 0 }, frag, aether::MonoTime{ 0 }));
         assert(S.fragmentAssemblers.at(from).timeoutMs == 250.0);
         assert(S.fragmentAssemblers.at(from).maxBufferSize == cfg.maxReassemblyBufferSize);
         std::printf("aether config-wiring OK: maxInFlight + maxSequenceDistance + fragmentTimeoutMs reach their objects\n");
@@ -907,24 +912,24 @@ int main() {
 
         aether::EncryptionKey tk{};
         for (int i = 0; i < 32; ++i) tk[static_cast<std::size_t>(i)] = std::uint8_t(i * 3 + 7);
-        aether::TokenValidator tv = aether::newTokenValidator(5000.0, 100);
-        const aether::Bytes sealed = aether::sealConnectToken(tk, aether::ConnectToken{ 7, aether::MonoTime{ 5ull * 1000000000 }, {} });
+        aether::TokenValidator tv = aether::newTokenValidator(100);
+        const aether::Bytes sealed = aether::sealConnectToken(tk, aether::ConnectToken{ 7, aether::UnixTime{ 5ull * 1000000000 }, {} });
         assert(sealed.size() == aether::connectTokenNonceBytes + 16u + static_cast<std::size_t>(aether::authTagSize));   // [nonce:12][pt:16][tag:16]
-        const aether::Bytes sealedAgain = aether::sealConnectToken(tk, aether::ConnectToken{ 7, aether::MonoTime{ 5ull * 1000000000 }, {} });
+        const aether::Bytes sealedAgain = aether::sealConnectToken(tk, aether::ConnectToken{ 7, aether::UnixTime{ 5ull * 1000000000 }, {} });
         assert(sealedAgain != sealed);                                       // fresh 96-bit random nonce per seal -> no reuse
-        const auto v1 = aether::validateConnectToken(tk, tv, sealed, aether::MonoTime{ 1000000 });
+        const auto v1 = aether::validateConnectToken(tk, tv, sealed, aether::UnixTime{ 1000000 });
         assert(!v1.error && v1.playerId == 7);                                // opens + authenticates
-        const auto v2 = aether::validateConnectToken(tk, tv, sealed, aether::MonoTime{ 2000000 });
+        const auto v2 = aether::validateConnectToken(tk, tv, sealed, aether::UnixTime{ 2000000 });
         assert(v2.error == aether::TokenError::Replayed);                     // same sealed bytes -> replay
 
         aether::Bytes tampered = sealed; tampered[tampered.size() - 1] ^= 0x01;
-        const auto openTampered = aether::openConnectToken(tk, tampered, aether::MonoTime{ 1000000 });
+        const auto openTampered = aether::openConnectToken(tk, tampered, aether::UnixTime{ 1000000 });
         assert(!openTampered);                                               // tampered tag -> rejected
         aether::EncryptionKey wrongKey{}; wrongKey[0] = 1;
-        const auto openWrongKey = aether::openConnectToken(wrongKey, sealed, aether::MonoTime{ 1000000 });
+        const auto openWrongKey = aether::openConnectToken(wrongKey, sealed, aether::UnixTime{ 1000000 });
         assert(!openWrongKey);                                               // wrong key -> rejected
-        const aether::Bytes shortLived = aether::sealConnectToken(tk, aether::ConnectToken{ 9, aether::MonoTime{ 1000 }, {} });
-        const auto openExpired = aether::openConnectToken(tk, shortLived, aether::MonoTime{ 2000 });
+        const aether::Bytes shortLived = aether::sealConnectToken(tk, aether::ConnectToken{ 9, aether::UnixTime{ 1000 }, {} });
+        const auto openExpired = aether::openConnectToken(tk, shortLived, aether::UnixTime{ 2000 });
         assert(!openExpired);                                                // expired -> rejected
         std::printf("aether security OK: CRC32C vector + corruption detect + rate limit + sealed token (open/replay/tamper/expiry)\n");
     }
@@ -980,14 +985,14 @@ int main() {
         // same player (new nonce) is not -- a legit reconnect still works, a captured token cannot.
         aether::EncryptionKey tk2{};
         for (int i = 0; i < 32; ++i) tk2[static_cast<std::size_t>(i)] = std::uint8_t(i * 5 + 1);
-        aether::TokenValidator tv = aether::newTokenValidator(10000.0, 64);
-        const aether::Bytes s1 = aether::sealConnectToken(tk2, aether::ConnectToken{ 42, aether::MonoTime{ 5ull * 1000000000 }, {} });
-        const auto a1 = aether::validateConnectToken(tk2, tv, s1, aether::MonoTime{ 1 });
+        aether::TokenValidator tv = aether::newTokenValidator(64);
+        const aether::Bytes s1 = aether::sealConnectToken(tk2, aether::ConnectToken{ 42, aether::UnixTime{ 5ull * 1000000000 }, {} });
+        const auto a1 = aether::validateConnectToken(tk2, tv, s1, aether::UnixTime{ 1 });
         assert(!a1.error && a1.playerId == 42);                              // first use OK
-        const auto a2 = aether::validateConnectToken(tk2, tv, s1, aether::MonoTime{ 2 });
+        const auto a2 = aether::validateConnectToken(tk2, tv, s1, aether::UnixTime{ 2 });
         assert(a2.error == aether::TokenError::Replayed);                    // same bytes -> replay
-        const aether::Bytes s2 = aether::sealConnectToken(tk2, aether::ConnectToken{ 42, aether::MonoTime{ 5ull * 1000000000 }, {} });
-        const auto a3 = aether::validateConnectToken(tk2, tv, s2, aether::MonoTime{ 3 });
+        const aether::Bytes s2 = aether::sealConnectToken(tk2, aether::ConnectToken{ 42, aether::UnixTime{ 5ull * 1000000000 }, {} });
+        const auto a3 = aether::validateConnectToken(tk2, tv, s2, aether::UnixTime{ 3 });
         assert(!a3.error);                                                   // fresh seal (new nonce) OK
 
         // wire: Quantized at the full 32-bit width must round-trip a value at Hi (the old code
@@ -1237,7 +1242,7 @@ int main() {
         aether::NetPeer C = aether::newPeerState(addrC, clientCfg, aether::MonoTime{ 1 });
 
         // the "backend" mints a token for player 12345, the client presents it
-        const aether::Bytes token = aether::sealConnectToken(K, aether::ConnectToken{ 12345, aether::MonoTime{ 3600ull * 1000000000 }, {} });
+        const aether::Bytes token = aether::sealConnectToken(K, aether::ConnectToken{ 12345, aether::UnixTime{ 3600ull * 1000000000 }, {} });
         aether::peerConnectWithToken(C, idS, token, aether::MonoTime{ 0 });
 
         aether::TestLink link = aether::newTestLink(C, idC, S, idS);
@@ -1532,8 +1537,10 @@ int main() {
         aether::onMessageReceived(ch, aether::SequenceNum{ 0xFFFE }, aether::Bytes{ 1 }, aether::MonoTime{ 0 });   // before the wrap
         aether::onMessageReceived(ch, aether::SequenceNum{ 0x0001 }, aether::Bytes{ 2 }, aether::MonoTime{ 0 });   // after the wrap (logically newest)
         aether::channelUpdate(ch, aether::MonoTime{ 200'000'000 });   // 200ms > 100ms timeout -> flush
-        assert(ch.orderedExpected.value == 0x0002);   // next(0x0001), the wrap-aware max -- not next(0xFFFE)
-        std::printf("aether ordered-flush-wrap OK: timeout flush advances past the wrap-aware max\n");
+        assert(ch.orderedExpected.value == 0xFFFD);
+        assert(ch.failure == aether::ChannelFailure::OrderedGapTimeout);
+        assert(aether::channelReceive(ch).empty());
+        std::printf("aether ordered timeout OK: explicit failure preserves the missing sequence across wrap\n");
     }
 
     // fragmentation e2e: a reliable message larger than the MTU is split on send, reassembled on the

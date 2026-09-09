@@ -249,7 +249,7 @@ int main() {
     // changed while the two sides hold different bits; it calls NaN unequal to itself, so a field
     // that never changed is re-sent every tick; and it does not exist at all for a plain aggregate.
     {
-        struct Vf { std::vector<float> v; int tag; };
+        struct Vf { std::vector<float> v; int tag{}; };
 
         const Vf   plusZero{ { 0.0f }, 1 };
         const Vf   minusZero{ { -0.0f }, 1 };
@@ -268,7 +268,7 @@ int main() {
         assert(nanDelta.size() == 1);   // changemask only, no field payload
 
         // optional<T> is the same comparison one level down.
-        struct Of { std::optional<float> o; int tag; };
+        struct Of { std::optional<float> o; int tag{}; };
         const bool optZerosEqual = fieldEqual(Of{ 0.0f, 1 }, Of{ -0.0f, 1 });
         const bool optNoneEqual  = fieldEqual(Of{ 0.0f, 1 }, Of{ std::nullopt, 1 });
         const bool optSameEqual  = fieldEqual(Of{ std::nullopt, 1 }, Of{ std::nullopt, 1 });
@@ -277,7 +277,7 @@ int main() {
         // A vector of plain aggregates has no operator== to fall through to at all: the comparison
         // has to recurse into the element's fields, and the delta has to round-trip what it finds.
         struct Item { int id; float w; };
-        struct Bag { std::vector<Item> items; int tag; };
+        struct Bag { std::vector<Item> items; int tag{}; };
         const Bag  before{ { Item{ 1, 2.0f }, Item{ 2, 3.0f } }, 7 };
         const Bag  after{ { Item{ 1, 2.0f }, Item{ 2, 4.0f } }, 7 };
         const bool bagSame    = fieldEqual(before, before);
@@ -292,7 +292,7 @@ int main() {
         assert(bagUnchanged.size() == 1);   // changemask only
 
         // A string field is bytes, with no element to recurse into.
-        struct Sf { std::string s; int tag; };
+        struct Sf { std::string s; int tag{}; };
         const bool strSame    = fieldEqual(Sf{ "abc", 1 }, Sf{ "abc", 1 });
         const bool strChanged = fieldEqual(Sf{ "abc", 1 }, Sf{ "abd", 1 });
         assert(strSame && !strChanged);
@@ -307,7 +307,7 @@ int main() {
     // payloads -- the encoder cannot produce the non-canonical form, which is the whole point.
     {
         // Layout for a 2-field struct: [changemask 0x01 = field 0 changed][field 0 payload].
-        struct Bf { bool flag; int tag; };
+        struct Bf { bool flag{}; int tag{}; };
         const Bf    prevB{ false, 7 };
         const Bytes boolTrue{ 0x01, 0x01 };
         const Bytes boolFalse{ 0x01, 0x00 };
@@ -323,7 +323,7 @@ int main() {
         assert(!decBoolBad);   // 0x02 is not a bool
 
         // The optional's present flag is the same byte with the same rule.
-        struct Op { std::optional<int> o; int tag; };
+        struct Op { std::optional<int> o; int tag{}; };
         const Op    prevO{ std::nullopt, 7 };
         const Bytes optPresent{ 0x01, 0x01, 0x2A };   // flag 1, then zigzag(21)
         const Bytes optAbsent{ 0x01, 0x00 };

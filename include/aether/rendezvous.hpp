@@ -85,6 +85,7 @@ struct RendezvousSession { Address a; Address b; MonoTime at; };   // the paired
 inline constexpr int rendezvousMaxRequestsPerSecond = 10;
 
 struct RendezvousServer {
+    ReceiveBudget receiveBudget{};
     std::map<std::uint64_t, std::pair<Address, MonoTime>> waiting;    // roomId -> (first peer, when it registered)
     std::map<std::uint64_t, RendezvousSession>            sessions;   // roomId -> the paired peers, for relaying
     int                                                   maxRooms = rendezvousMaxRooms;   // hard cap on each table (flood shield)
@@ -131,8 +132,14 @@ inline std::vector<std::pair<Address, Bytes>> rendezvousProcess(
             // anyone holding the room id could silently kill an established relay. Only an existing
             // member may register again (a reconnect); anyone else waits out the session TTL as for a
             // new room. A member whose own address changed is in the same position, the safe direction.
-            if (const auto sit = rv.sessions.find(*room);
-                sit != rv.sessions.end() && !addrEqual(src, sit->second.a) && !addrEqual(src, sit->second.b)) continue;
+            if (const auto session = rv.sessions.find(*room); session != rv.sessions.end()) {
+                const bool first = addrEqual(src, session->second.a);
+                if (!first && !addrEqual(src, session->second.b)) continue;
+                session->second.at = now;
+                out.emplace_back(src, encodePaired(first ? PunchRole::Accept : PunchRole::Connect,
+                                                   first ? session->second.b : session->second.a));
+                continue; // A lost Paired reply must be recoverable without the partner re-registering.
+            }
             const auto it = rv.waiting.find(*room);
             if (it == rv.waiting.end()) {
                 if (static_cast<int>(rv.waiting.size()) >= rv.maxRooms) evictOldestWaiting(rv);   // at the cap: shed the stalest waiter
@@ -167,15 +174,20 @@ inline std::vector<std::pair<Address, Bytes>> rendezvousProcess(
     return out;
 }
 
-// Drive the server over a real socket: drain Registers, send the Paired replies.
+// Drive the server over a real socket: receive a bounded batch and send replies.
 inline void rendezvousTick(RendezvousServer& rv, Socket& sock, MonoTime now) {
     static thread_local std::vector<std::uint8_t> scratch(maxUdpPacketSize);
     std::vector<std::pair<Address, Bytes>> incoming;
-    for (;;) {
+    const auto& budget = rv.receiveBudget;
+    std::size_t receivedBytes = 0;
+    for (std::size_t packets = 0; packets < budget.maxDatagrams && receivedBytes < budget.maxBytes; ++packets) {
         Address from{};
         const int n = recvFrom(sock, std::span<std::uint8_t>(scratch.data(), scratch.size()), from);
         if (n < 0) break;   // -1 == no more data; a 0-byte datagram returns 0 and is drained so it cannot stall the queue
-        incoming.emplace_back(from, Bytes(scratch.begin(), scratch.begin() + static_cast<std::ptrdiff_t>(n)));
+        const auto len = static_cast<std::size_t>(n);
+        if (len > budget.maxBytes - receivedBytes) break;
+        receivedBytes += len;
+        incoming.emplace_back(from, Bytes(scratch.begin(), scratch.begin() + n));
     }
     for (const auto& [addr, data] : rendezvousProcess(rv, incoming, now))
         sendTo(sock, std::span<const std::uint8_t>(data.data(), data.size()), addr);

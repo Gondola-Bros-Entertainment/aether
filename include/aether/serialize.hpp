@@ -55,13 +55,16 @@ inline void writeBytes(Writer& w, const std::uint8_t* p, std::size_t n) noexcept
     if (fits(w, n)) { std::memcpy(w.buf + w.pos, p, n); w.pos += n; }
 }
 
-// Resident bytes ONE decode may commit. Wire length bounds the element COUNT of a container but never
-// its memory: a `vector<optional<Pod>>` element is a single wire byte when disengaged yet costs
+// Resident element storage ONE decode may commit. Wire length alone does not bound
+// decoded memory: a `vector<optional<Pod>>` element is a single wire byte when disengaged yet costs
 // sizeof(Pod) resident, and a vector of zero-field aggregates consumes no wire bytes at all -- measured
 // at 519x and 4089x expansion out of a 1200-byte datagram, which no count-based check can catch.
 // Charging what a decode actually allocates is the only bound that holds whatever the element type is.
 // Generous by default so ordinary payloads never notice; lower it on the Reader for a tighter limit.
 inline constexpr std::size_t defaultDecodeAllocBudget = std::size_t{ 8 } * 1024 * 1024;
+// Independently bound recursive value visits, including zero-byte empty aggregates. A wire-byte
+// count cannot bound that work. Callers may tune both budgets on a Reader for their message schema.
+inline constexpr std::size_t defaultDecodeWorkBudget = std::size_t{ 1 } * 1024 * 1024;
 
 // ---- read cursor: plain data; read<T> consumes it, nullopt past the end ----
 struct Reader {
@@ -69,7 +72,14 @@ struct Reader {
     std::size_t         len{};
     std::size_t         pos{};
     std::size_t         allocBudget = defaultDecodeAllocBudget;
+    std::size_t         workBudget = defaultDecodeWorkBudget;
 };
+
+inline bool chargeDecodeWork(Reader& r) noexcept {
+    if (r.workBudget == 0) return false;
+    --r.workBudget;
+    return true;
+}
 
 // Charge `count` elements of `each` bytes against this decode's budget. False (decode fails) if it
 // would exceed it. The division form cannot overflow the way `count * each` would for a hostile count.

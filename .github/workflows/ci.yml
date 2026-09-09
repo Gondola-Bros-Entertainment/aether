@@ -64,9 +64,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
-      # Debug, not Release: Release defines NDEBUG, which compiles out every assert() -- the whole
-      # test suite checks through assert(), so a Release run is a build check, not a test run. /WX
-      # makes MSVC warnings errors, matching the -Werror the gcc/clang legs use.
+      # Existing tests still use assert(), so run them in Debug to keep those checks active.
+      # AETHER_WERROR enables /WX, matching the GCC and Clang jobs.
       - name: Configure
         run: cmake -B build -DAETHER_WERROR=ON
       - name: Build

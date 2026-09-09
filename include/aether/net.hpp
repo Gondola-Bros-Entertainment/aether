@@ -1,6 +1,6 @@
-// aether - real UDP IO loop. A Host owns a socket and a NetPeer; hostTick drains all pending
-// datagrams (non-blocking), validates+strips their CRC, runs the pure peerProcess, and sends the
-// replies. One non-blocking drain per tick, on the caller's thread.
+// aether - real UDP IO loop. A Host owns a socket and a NetPeer; hostTick receives a bounded
+// non-blocking batch, validates+strips CRC, runs peerProcess, and sends replies on the caller's
+// thread. Packet and byte budgets ensure intake returns even when the socket stays readable.
 // Data-first: a plain Host struct + free functions.
 #pragma once
 
@@ -13,6 +13,7 @@
 #include "aether/types.hpp"
 
 #include <cstdint>
+#include <chrono>
 #include <optional>
 #include <span>
 #include <utility>
@@ -45,20 +46,27 @@ inline std::optional<Host> openHost(const Address& bindAddr, const NetworkConfig
     return h;
 }
 
-// One game-loop step: receive everything pending, queue outgoing messages to all peers, process,
+// One game-loop step: receive a bounded batch, queue outgoing messages to all peers, process,
 // then send. Returns the events that occurred this tick.
 inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<ChannelId, Bytes>>& messages, MonoTime now) {
     static thread_local std::vector<std::uint8_t> scratch(maxUdpPacketSize);
 
     std::vector<IncomingPacket> incoming;
-    for (;;) {
+    const auto& budget = h.peer.config.receiveBudget;
+    std::size_t receivedBytes = 0;
+    for (std::size_t packets = 0; packets < budget.maxDatagrams && receivedBytes < budget.maxBytes; ++packets) {
         Address   from{};
         const int n = recvFrom(h.socket, std::span<std::uint8_t>(scratch.data(), scratch.size()), from);
         if (n < 0) break;   // -1 == no more data (or a hard socket error); a 0-byte datagram returns 0 and is drained (CRC-rejected) so it cannot stall the queue
         const std::size_t len = static_cast<std::size_t>(n);
+        // A boundary datagram that does not fit is discarded before CRC/copying. It is UDP loss,
+        // recoverable by reliable channels; the rest remains queued for a future tick.
+        if (len > budget.maxBytes - receivedBytes) break;
+        receivedBytes += len;
         if (h.rendezvousAddr && addrEqual(from, *h.rendezvousAddr)) {
             const Bytes raw(scratch.begin(), scratch.begin() + n);   // rendezvous frames are rare (pairing + relay), so the owned copy costs nothing here
             if (const auto paired = decodePaired(raw)) {   // a pairing reply from the rendezvous
+                if (!h.pendingRoom) continue; // A duplicated/stale reply must not restart an established session.
                 if (h.pendingRoom) h.roomId = *h.pendingRoom;   // the room we joined -- used to wrap relayed packets
                 h.pendingRoom = std::nullopt;                   // paired -- stop re-registering
                 h.partnerAddr = paired->second;
@@ -87,7 +95,10 @@ inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<Chan
 
     for (const auto& [ch, msg] : messages) peerBroadcast(h.peer, ch, msg, std::nullopt, now);
 
-    auto result = peerProcess(h.peer, now, incoming);
+    const auto epochNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const UnixTime tokenTime{epochNs > 0 ? static_cast<std::uint64_t>(epochNs) : 0};
+    auto result = peerProcess(h.peer, now, incoming, tokenTime);
     for (const RawPacket& rp : result.outgoing) {
         if (h.relaying && h.partnerAddr && h.rendezvousAddr && addrEqual(rp.to.addr, *h.partnerAddr)) {
             // Relaying wraps each packet with a 9-byte [tag][roomId] header, so the effective MTU on the

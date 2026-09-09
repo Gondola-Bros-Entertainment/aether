@@ -48,6 +48,9 @@ constexpr int sequenceDiff(SequenceNum a, SequenceNum b) noexcept {
     return static_cast<std::int16_t>(static_cast<std::uint16_t>(a.value - b.value));
 }
 
+// Unix epoch time, nanoseconds, for credentials shared across machines. Never use for transport timers.
+struct UnixTime { std::uint64_t ns{}; };
+
 // Monotonic time, nanoseconds.
 struct MonoTime { std::uint64_t ns{}; };
 // Saturates at 0 when now precedes start: callers compare against positive timeouts, and an

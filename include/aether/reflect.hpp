@@ -60,8 +60,8 @@ template <class U>           inline constexpr bool isStdOptional<std::optional<U
 
 // Cap the up-front reserve when decoding a length-prefixed vector from untrusted bytes, so a hostile
 // element COUNT cannot inflate the allocation: reserve at most ~64KB worth of elements (one minimum),
-// then grow as elements actually decode. The caller bounds the count to the remaining byte budget, so
-// element count is bounded by input size. This caps only the RESERVE; total decoded object memory is
+// then grow as elements actually decode. The caller bounds the count by the remaining work budget.
+// This caps only the RESERVE; total decoded element storage is
 // bounded separately by the Reader's allocBudget (serialize.hpp), because element count says nothing
 // about resident size once an element can cost more memory than it costs wire.
 inline constexpr std::size_t decodeReserveByteBudget = std::size_t{ 64 } * 1024;
@@ -180,6 +180,7 @@ template <class T> void writeAny(Writer& w, const T& v) {
     }
 }
 template <class T> bool readAny(Reader& r, T& v) {
+    if (!chargeDecodeWork(r)) return false;
     if constexpr (std::is_enum_v<T>) {
         // A fixed underlying type is what makes the cast below total: the enum can hold every bit
         // pattern of that type, so no wire value is out of range. Reject the other form at compile
@@ -202,9 +203,9 @@ template <class T> bool readAny(Reader& r, T& v) {
         return true;
     } else if constexpr (detail::isStdVector<T>) {
         const auto n = read<std::uint32_t>(r);
-        // Count <= remaining bytes bounds the LOOP; charging sizeof(element) bounds the MEMORY, which
-        // the byte count alone does not once one wire byte can materialize an arbitrarily large element.
-        if (!n || *n > r.len - r.pos) return false;
+        // Each element consumes at least one value visit, even when its wire representation is empty.
+        // Check that lower bound before reserving; recursive element decodes charge the actual work.
+        if (!n || *n > r.workBudget) return false;
         if (!chargeAlloc(r, *n, sizeof(typename T::value_type))) return false;
         v.clear();
         v.reserve(detail::decodeReserveCount<typename T::value_type>(*n));   // bounded up-front alloc; grow as elements parse
@@ -310,16 +311,17 @@ template <class T> constexpr bool hasNonMemcpyField() noexcept {
 template <class T> constexpr bool canMemcpySerialize() noexcept {
     using U = std::remove_cvref_t<T>;
     if constexpr (std::is_trivially_copyable_v<U> && std::is_aggregate_v<U>
-                  && std::endian::native == std::endian::little && !hasNonMemcpyField<U>())
-        return sizeof(U) == serializedSize<U>();
-    else
-        return false;
+                  && std::endian::native == std::endian::little) {
+        if constexpr (!hasNonMemcpyField<U>()) return sizeof(U) == serializedSize<U>();
+    }
+    return false;
 }
 
 // The framework API. Any plain struct, in or out, no boilerplate.
 template <class T> void serialize(Writer& w, const T& v) {
     if constexpr (canMemcpySerialize<T>()) {
-        if (fits(w, sizeof(T))) { std::memcpy(w.buf + w.pos, &v, sizeof(T)); w.pos += sizeof(T); }
+        static_assert(std::is_trivially_copyable_v<T>);
+        writeBytes(w, reinterpret_cast<const std::uint8_t*>(&v), sizeof(T));
     } else {
         writeAny(w, v);
     }
@@ -327,10 +329,9 @@ template <class T> void serialize(Writer& w, const T& v) {
 
 template <class T> std::optional<T> deserialize(Reader& r) {
     if constexpr (canMemcpySerialize<T>()) {
-        if (!has(r, sizeof(T))) return std::nullopt;
+        static_assert(std::is_trivially_copyable_v<T>);
         T v{};
-        std::memcpy(&v, r.buf + r.pos, sizeof(T));
-        r.pos += sizeof(T);
+        if (!readBytes(r, reinterpret_cast<std::uint8_t*>(&v), sizeof(T))) return std::nullopt;
         return v;
     } else {
         T v{};
