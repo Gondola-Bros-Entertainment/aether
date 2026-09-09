@@ -1,67 +1,127 @@
-# Behaviour reference
+# Behavior reference
 
-Current behaviour of the transport, for when you hit it and want the detail. The README's Trade-offs
-section carries what you need before adopting aether; this is the rest.
+This describes the current implementation. Authentication gaps are listed explicitly; they are
+not guarantees provided by the current protocol.
 
-## Handshake
+## Handshake and resumption
 
-Connecting costs three round trips. The stateless retry cookie always runs rather than engaging only
-once the half-open table fills, because a path that engages only under attack is untested when the
-attack arrives. Reconnects skip it and stay 0-RTT.
+A new connection takes three round trips: request/retry cookie, cookied request/key challenge,
+then key response/acceptance. The cookie runs on every new connection before allocating a pending
+slot or generating an ephemeral keypair. Requests are padded to at least the retry response size;
+shorter requests receive no retry. Per-source rate limits are keyed by host, not source port.
+Client challenge processing also bounds expensive key attempts, including rejected public keys.
 
-A connection request datagram is zero-padded to at least the size of the retry it draws, so the reply
-is never larger than the request. A shorter request gets no reply at all: the server would otherwise
-be a bandwidth multiplier pointed at whatever source address the request claimed. Clients pad
-automatically, so this only matters to another implementation of the wire format.
+The exchange uses X25519 to derive directional ChaCha20-Poly1305 traffic keys. Packet headers
+are authenticated as associated data, and a sliding window rejects packet replays. Randomness
+comes from the operating system. Crypto tests include RFC 7748 and RFC 8439 vectors.
 
-A fast reconnect is a 0-RTT resume and inherits the usual 0-RTT cost: an attacker who captures a live
-resume request can replay it and beat the real client to it. Closing that needs a challenge round
-trip, which is what 0-RTT exists to avoid. Two things bound it. The session master ratchets on each
-accepted resume, so captured bytes authenticate at most once. And a resumed connection may send only
-three times what it has received until a packet decrypts from its address, so a resume replayed with
-a forged source cannot aim the server's output at a third party. The real client lifts that cap with
-its first packet.
+**The exchange is unauthenticated.** A connect token authenticates its issuer's sealed claims,
+but possession of those bearer bytes is not bound to a client's handshake key. Cookies prove
+return reachability, not peer identity. An active intermediary is outside the current handshake's
+security guarantees. The planned repair must bind credentials and protocol context to the key
+exchange and confirm possession before admitting the session.
 
-Connection migration costs one round trip: a new address must echo an encrypted challenge before the
-connection follows a peer there. Decryption alone proves the sender holds the key, not that it is
-reachable where it claims to be.
+Current resumption skips the new-connection handshake. It authenticates a request with the cached
+session master and ratchets that master on acceptance. This prevents reuse after acceptance but
+does not prevent a captured valid request from winning a race against the legitimate client.
+Fresh challenge proof before committing a resume remains required work. Until an encrypted packet
+arrives from the resumed address, server output is capped at three times bytes received.
 
-## Delivery
+Address migration uses the explicit session routing ID to select a candidate connection, verifies
+the packet's authentication tag, and requires an encrypted path challenge round trip before moving
+the connection. A forged routing ID does not authorize migration.
 
-A reliable-ordered channel's ordering is bounded by `orderedBufferTimeout`. A gap that never fills is
-eventually skipped rather than stalling the channel forever, and those sequences become a permanent
-hole.
+Connect-token replay state is retained until actual expiry. Storage exhaustion rejects new tokens
+rather than evicting live replay records. Its scope is one admission authority; applications must
+preserve the validator state or rotate the sealing key after state loss. The current token format
+does not bind an application audience or protocol ID. Do not share a sealing key across unrelated
+trust domains.
 
-`maxReceiveBufferSize` is a per-collection capacity, not a standing queue depth. `peerProcess` hands
-every buffered message to the application each tick, so occupancy outlives a tick only if you drive
-`Connection` directly and skip that collection.
+## Delivery and backpressure
 
-The receive window is advertised once as the connection comes up, then again when the figure moves by
-a quarter of the buffer or the receiver becomes restricted, and repeated on a 250ms persist timer
-until a header acknowledges it. A link whose receiver keeps up costs one flow-control packet for the
-whole session.
+Reliable ordered channels preserve order until delivery or explicit failure. `orderedBufferTimeout`
+defaults to zero, disabling a separate gap deadline. A positive deadline makes an unresolved gap
+fail the channel; it never skips the missing message. Retry exhaustion waits through the final
+attempt's acknowledgement deadline before failing. `NetPeer` reports a `DeliveryFailed` disconnect.
 
-## Sizing
+Reliable unordered delivery tracks a contiguous receive frontier and a bounded window beyond it.
+Senders backpressure before an outstanding reliable message spans that sequence window. Initial
+sequence zero is valid in both sequenced modes; reset clears sequence initialization. Sequenced
+modes intentionally discard messages superseded by a newer received sequence.
 
-`config.mtu` (default 1200) is the floor everything is sized against. Path-MTU discovery raises the
-usable datagram size up to `mtuProbeCeiling` (default 1500), but that headroom feeds message
-coalescing only. Fragmentation stays chunked at the floor, so a path that shrinks back can never
-strand a fragmented message.
+Acknowledged reliable fragments reserve their complete assembly capacity. Another message cannot
+evict that reservation. A completed assembly facing channel backpressure is retained for retry.
+An unrecoverable partial-assembly timeout fails the connection. Lower-level best-effort assembly
+may evict or expire unreserved partial messages.
 
-## Decoding
+`maxReceiveBufferSize` limits messages waiting for collection. `peerProcess` collects them into its
+returned events each tick; applications driving `Connection` directly must collect them themselves.
+`hostSend` reports local queue rejection, not remote processing. Application-level acknowledgements
+are still needed when a caller requires confirmation that a command was applied.
 
-Decoding a struct from the wire is capped at `Reader::allocBudget`, 8MB by default, of resident
-objects. Wire length bounds how many elements a container can claim but not what they cost in memory,
-since one wire byte can materialize an element of any size. Raise it for genuinely large payloads,
-lower it to tighten the bound on untrusted input.
+Receive credit is advertised on connection, when capacity changes by a quarter of the buffer, or
+when the receiver becomes restricted. Unacknowledged updates repeat on a 250 ms persist timer.
+
+## Resource bounds and sizing
+
+`receiveBudget.maxDatagrams` and `receiveBudget.maxBytes` default to 256 and 256 KiB per socket tick.
+Malformed and empty datagrams consume the datagram budget. A datagram crossing the remaining byte
+budget is discarded before CRC validation or allocation; later datagrams remain queued. This
+bounds socket intake, not total tick time. Connection count, queued work, and application scheduling
+also affect tick cost. Aether does not start a receive thread.
+
+`config.mtu` defaults to 1200 bytes and is the sizing floor. Path-MTU probes can raise the usable
+datagram size up to `mtuProbeCeiling` (default 1500), but this headroom is used for coalescing.
+Fragments remain sized to the floor so a drop in discovered MTU does not strand an assembly.
+
+`maxFragmentableMessage(config)` computes the message ceiling from the floor and 255-fragment wire
+limit. `validateConfig` rejects channel message sizes above that ceiling or assembly budgets too
+small to reserve a maximum-sized message. Large messages are paced across ticks; they do not need
+to fit in one send-rate bucket. Send-buffer and sequence-window caps make backpressure explicit.
+
+Rendezvous relay requests add a 9-byte wrapper. Leave that headroom when choosing MTU settings for
+a relay path. Room IDs act as bearer credentials: a matching registrant learns its partner's public
+address. Applications must generate unguessable room IDs and distribute them through their own
+authenticated service. Rendezvous pairing does not authenticate a user's account.
+
+## Decoding and replication
+
+`Reader::allocBudget` charges container element storage and string bytes, with an 8 MiB default.
+It is not an exact heap ceiling: allocator overhead and container capacity growth may add memory.
+Up-front vector reserves are separately limited.
+
+`Reader::workBudget` limits recursive value visits to 1,048,576 by default. Empty aggregates use
+zero wire bytes but still consume decode work. Tune both budgets for accepted message shapes.
+Varint values outside the destination integer type's range fail before narrowing.
+
+The aggregate codec supports up to 32 members. Nested aggregates and supported containers recurse;
+the field ladder binds members directly using structured bindings. Raw C-array fields are unsupported.
+The codec does not transmit a schema version or field names. Both endpoints must agree on types and
+member order. A changed field carries its complete value, including complete changed vectors.
+
+`DeltaTracker` only promotes a baseline after `deltaOnAck`. The application must send that
+acknowledgement after successful `deltaDecode` and storage at the receiver, and provide matching
+snapshot sequence IDs. Receiving an outer packet is insufficient if reconstruction failed.
+`maxBaselineAge` enables full-state fallback when acknowledgements stall; setting it to zero or
+less disables that recovery. `noBaseline` is a reserved sequence value, not a usable baseline ID.
 
 ## Clock sync
 
-Cristian's algorithm assumes the two one-way delays are equal. An asymmetric path biases the offset by
-half the difference between them: 5ms out and 145ms back reads exactly 70ms off, where a symmetric
-path has no error at all.
+The offset estimate uses the midpoint of a local round trip and the remote reply timestamp.
+Unequal one-way delays bias that midpoint estimate by half their difference.
 
-`clockOffsetErrorMs` reports the bound, which is half the recent-best round-trip. That best decays
-upward toward the prevailing RTT rather than holding a lifetime minimum, so it stays honest as a path
-changes instead of quoting a tightness a stale sample once had. Check it before doing lag
-compensation: a large bound means the shared timeline is a guess.
+`clockOffsetErrorMs` includes the distance between the smoothed estimate and latest measured
+offset, plus half that measurement's RTT. This accounts for smoothing lag after an offset change.
+The bound applies at the latest measurement, assuming nonnegative network delays and an offset
+constant during that round trip. It cannot bound future drift or a clock step within that trip.
+`ClockSync::lastSampleTimeMs` exposes sample age. Before any sample, the error bound is infinite.
+
+## Metrics and socket errors
+
+Connection `packetsSent` counts framed datagrams placed in the outgoing queue, including control
+packets. `bytesSent` counts their bytes. These counters do not prove socket transmission or receipt.
+Socket counters separately record successful local I/O.
+
+The low-level `sendTo` returns a byte count or `-1`. The current `hostTick` adapter discards that
+return value; it does not emit socket-send error events. Reliable retries can recover transient
+loss, but the adapter does not distinguish a local send failure from network loss.

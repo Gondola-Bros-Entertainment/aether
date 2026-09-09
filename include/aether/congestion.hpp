@@ -81,9 +81,10 @@ inline CongestionController newCongestionController(double baseSendRate, double 
 // Earn tokens for the time since the last refill at currentSendRate packets/sec of mtu bytes each.
 // The first call has no elapsed time to earn against, so it seeds a full bucket and starts the clock.
 inline void ccRefillBudget(CongestionController& cc, int mtu, MonoTime now) {
-    cc.burstBytes = cc.currentSendRate * static_cast<double>(mtu);
+    const double bytesPerSecond = cc.currentSendRate * static_cast<double>(mtu);
+    cc.burstBytes = std::max(static_cast<double>(mtu), bytesPerSecond);
     if (!cc.lastRefill) { cc.budgetBytes = cc.burstBytes; cc.lastRefill = now; return; }
-    const double earned = elapsedMs(*cc.lastRefill, now) / 1000.0 * cc.burstBytes;
+    const double earned = elapsedMs(*cc.lastRefill, now) / 1000.0 * bytesPerSecond;
     cc.budgetBytes = std::min(cc.budgetBytes + earned, cc.burstBytes);
     cc.lastRefill  = now;
 }
@@ -101,7 +102,7 @@ inline void ccUpdate(CongestionController& cc, double packetLoss, double rttMs, 
             const double recoveryMult = (cc.lastGoodEntry && elapsedMs(*cc.lastGoodEntry, now) < quickDropThresholdSecs * 1000.0) ? 2.0 : 1.0;
             cc.mode                 = CongestionMode::Bad;
             cc.lastBadEntry         = now;
-            cc.currentSendRate      = std::max(minSendRate, cc.currentSendRate * congestionRateReduction);
+            cc.currentSendRate      = std::min(ccMaxSendRate(cc), std::max(minSendRate, cc.currentSendRate * congestionRateReduction));
             cc.goodConditionsStart  = std::nullopt;
             cc.adaptiveRecoverySecs = std::min(maxRecoverySecs, cc.adaptiveRecoverySecs * recoveryMult);
         } else {

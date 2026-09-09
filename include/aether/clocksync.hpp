@@ -16,6 +16,9 @@ struct ClockSync {
     double offsetMs  = 0.0;     // estimate of (remoteClock - localClock), milliseconds
     double bestRttMs = 0.0;     // smallest round-trip seen -> its offset sample is the most trusted
     bool   hasSample = false;
+    double latestOffsetMs = 0.0;
+    double latestRttMs = 0.0;
+    double lastSampleTimeMs = 0.0; // local receive timestamp; caller can assess sample age
 };
 
 // Fold in one round-trip: localSendMs (t0, our clock when we asked), remoteMs (t1, their clock when
@@ -25,16 +28,17 @@ struct ClockSync {
 // EMA-smoothed to ride out jitter.
 inline void clockSyncObserve(ClockSync& cs, double localSendMs, double remoteMs, double localRecvMs) {
     // remoteMs is a peer-supplied number and the local stamps come from the app, so no input is
-    // trusted to be finite. One non-finite sample is permanent damage: the EMA folds a NaN offset
-    // into every later estimate and never folds it back out, while clockOffsetErrorBoundMs reads
-    // bestRttMs and keeps reporting a healthy bound over an offset that is not a number. A rejected
-    // sample costs one round-trip; an absorbed one costs the connection its timeline.
+    // trusted to be finite. Reject invalid samples before they contaminate the smoothed offset
+    // and all later estimates.
     if (!std::isfinite(localSendMs) || !std::isfinite(remoteMs) || !std::isfinite(localRecvMs)) return;
     const double rtt = localRecvMs - localSendMs;
     if (rtt < 0.0) return;                                       // out-of-order / bogus sample
     const double offset = remoteMs - (localSendMs + localRecvMs) / 2.0;
     // Finite inputs at the extremes can still overflow the subtraction, so check the results too.
     if (!std::isfinite(rtt) || !std::isfinite(offset)) return;
+    cs.latestOffsetMs = offset;
+    cs.latestRttMs = rtt;
+    cs.lastSampleTimeMs = localRecvMs;
     if (!cs.hasSample || rtt < cs.bestRttMs) {
         cs.offsetMs  = offset;
         cs.bestRttMs = rtt;
@@ -48,22 +52,15 @@ inline void clockSyncObserve(ClockSync& cs, double localSendMs, double remoteMs,
     }
 }
 
-// How far the offset could be wrong, in milliseconds. Cristian's algorithm assumes the two one-way
-// delays are equal; when they are not, the estimate is off by exactly (forward - reverse) / 2, and
-// since forward + reverse is the round-trip, that error is at most rtt / 2 in magnitude. Half the
-// round-trip is therefore a true bound rather than a heuristic: a 5ms-out / 145ms-back path reads
-// exactly 70ms off, inside the 75ms its 150ms round-trip allows.
-//
-// The rtt used is bestRttMs, which is the DECAYING recent best (see clockSyncObserve), not a lifetime
-// minimum. That keeps the bound honest as a path changes -- a fluke-low sample from minutes ago would
-// otherwise report a tightness the current path no longer has -- at the cost of the bound widening
-// toward the prevailing RTT once the low sample stops recurring.
-//
-// Asymmetric routing is ordinary on real paths, so check this before doing lag compensation against
-// the offset: a large bound means the shared timeline is a guess. Infinity until a sample exists, so
-// a caller comparing against a threshold fails closed.
+// Error bound at the latest measurement, assuming the clock offset is constant during that
+// round trip and network delays are nonnegative. The true offset lies within latestOffset +/-
+// latestRtt/2. Include the distance from our smoothed estimate to that interval's centre: RTT/2
+// alone would under-report error while the EMA catches up after an offset change.
+// This cannot bound later unobserved clock drift or steps. lastSampleTimeMs exposes sample age;
+// the caller decides when to request a fresh measurement. Infinity until a sample exists.
 inline double clockOffsetErrorBoundMs(const ClockSync& cs) noexcept {
-    return cs.hasSample ? cs.bestRttMs / 2.0 : std::numeric_limits<double>::infinity();
+    return cs.hasSample ? std::abs(cs.offsetMs - cs.latestOffsetMs) + cs.latestRttMs / 2.0
+                        : std::numeric_limits<double>::infinity();
 }
 
 // Convert between the two timelines once an offset is known.

@@ -1,3 +1,4 @@
+#include "check.hpp"
 // aether - handshake security properties, each pinned by the case that would otherwise break it.
 //
 //  1. The connection challenge is a RETURN-ROUTABILITY proof. The server's challenge salt was sent
@@ -22,6 +23,10 @@ using namespace aether;
 
 namespace {
 
+PeerProcessResult processAt(NetPeer& peer, MonoTime now, const std::vector<IncomingPacket>& packets) {
+    return peerProcess(peer, now, packets, UnixTime{now.ns});
+}
+
 // One cleartext control packet from `from`, as peerProcess consumes it (CRC already stripped).
 IncomingPacket control(const PeerId& from, PacketType type, const Bytes& payload) {
     const PacketHeader header{ type, SequenceNum{ 0 }, SequenceNum{ 0 }, 0 };
@@ -42,7 +47,7 @@ std::optional<Packet> replyPacket(const RawPacket& raw) {
 // anything -- which is also exactly what a real client sends.
 Bytes retryCookieFor(NetPeer& S, const PeerId& from, const Bytes& body, MonoTime now) {
     std::vector<IncomingPacket> in{ control(from, PacketType::ConnectionRequest, encodeConnectionRequest({}, body)) };
-    const auto r = peerProcess(S, now, in);
+    const auto r = processAt(S, now, in);
     assert(S.pending.count(from) == 0);   // nothing committed for an unproven address
     Bytes cookie;
     int   replies = 0;                    // ...and one cookie is the whole of what this address earns
@@ -73,13 +78,13 @@ std::uint64_t challengeSaltFor(const NetPeer& peer, const PeerId& pid) {
 // test can stand up a connection carrying the clientSalt it chooses.
 void handshakeRaw(NetPeer& S, const PeerId& from, std::uint64_t clientSalt, const Bytes& body, MonoTime now) {
     std::vector<IncomingPacket> req{ cookiedRequest(S, from, body, now) };
-    peerProcess(S, now, req);
+    processAt(S, now, req);
     X25519Key priv{}, pub{};
     genEphemeralKeypair(priv, pub);
     const std::uint64_t salt = challengeSaltFor(S, from);
     std::vector<IncomingPacket> resp{ control(from, PacketType::ConnectionResponse,
                                               encodeConnectionResponse(clientSalt, pub, salt)) };
-    peerProcess(S, now, resp);
+    processAt(S, now, resp);
 }
 
 // A cleartext datagram dropped straight into the link, addressed to `to` -- what an off-path attacker
@@ -116,7 +121,7 @@ int main() {
             NetPeer S2 = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
             const Bytes forA = retryCookieFor(S2, idA, {}, MonoTime{ 1000000 });
             std::vector<IncomingPacket> in{ control(idB, PacketType::ConnectionRequest, encodeConnectionRequest(forA, {})) };
-            peerProcess(S2, MonoTime{ 2000000 }, in);
+            processAt(S2, MonoTime{ 2000000 }, in);
             assert(S2.pending.count(idB) == 0);   // no pending, no keygen: it just earned idB its own cookie
         }
 
@@ -125,14 +130,14 @@ int main() {
             NetPeer S3 = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
             const Bytes junk(retryCookieSize, 0xAB);
             std::vector<IncomingPacket> in{ control(idA, PacketType::ConnectionRequest, encodeConnectionRequest(junk, {})) };
-            peerProcess(S3, MonoTime{ 2000000 }, in);
+            processAt(S3, MonoTime{ 2000000 }, in);
             assert(S3.pending.count(idA) == 0);
         }
 
         // the real cookie, from the address it was minted for, is what opens the pending
         {
             std::vector<IncomingPacket> in{ control(idA, PacketType::ConnectionRequest, encodeConnectionRequest(cookie, {})) };
-            const auto r = peerProcess(S, MonoTime{ 2000000 }, in);
+            const auto r = processAt(S, MonoTime{ 2000000 }, in);
             assert(S.pending.count(idA) == 1);
             assert(r.outgoing.size() == 1);   // ...and now the challenge goes out
         }
@@ -151,7 +156,7 @@ int main() {
         {
             NetPeer S5 = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
             std::vector<IncomingPacket> in{ control(idA, PacketType::ConnectionRequest, Bytes{}) };
-            const auto r = peerProcess(S5, MonoTime{ 1000000 }, in);
+            const auto r = processAt(S5, MonoTime{ 1000000 }, in);
             assert(r.outgoing.empty());
             assert(S5.pending.empty());
         }
@@ -165,7 +170,7 @@ int main() {
         NetPeer S = newPeerState(addrS, NetworkConfig{}, MonoTime{ 0 });
 
         std::vector<IncomingPacket> in{ cookiedRequest(S, idA, {}, MonoTime{ 500000 }) };
-        const auto challenge = peerProcess(S, MonoTime{ 1000000 }, in);
+        const auto challenge = processAt(S, MonoTime{ 1000000 }, in);
         assert(challenge.outgoing.size() == 1);          // the server answered with a challenge
         assert(S.pending.count(idA) == 1);               // ...and opened a pending for it
 
@@ -176,7 +181,7 @@ int main() {
         const std::uint64_t wrongSalt = realSalt ^ 1ull;   // off by one bit: still a pure guess
         std::vector<IncomingPacket> blind{
             control(idA, PacketType::ConnectionResponse, encodeConnectionResponse(0xDEADBEEFCAFEull, pub, wrongSalt)) };
-        const auto after = peerProcess(S, MonoTime{ 2000000 }, blind);
+        const auto after = processAt(S, MonoTime{ 2000000 }, blind);
 
         assert(!peerIsConnected(S, idA));                // no connection slot committed
         for (const auto& e : after.events) assert(e.kind != PeerEvent::Connected);
@@ -188,7 +193,7 @@ int main() {
         // some unrelated rejection.
         std::vector<IncomingPacket> good{
             control(idA, PacketType::ConnectionResponse, encodeConnectionResponse(0xDEADBEEFCAFEull, pub, realSalt)) };
-        const auto ok = peerProcess(S, MonoTime{ 3000000 }, good);
+        const auto ok = processAt(S, MonoTime{ 3000000 }, good);
         bool connected = false;
         for (const auto& e : ok.events) if (e.kind == PeerEvent::Connected) connected = true;
         assert(connected && peerIsConnected(S, idA));
@@ -237,11 +242,11 @@ int main() {
         const PeerId ghost{ addrLocalhost(9442) };
 
         std::vector<IncomingPacket> in{ cookiedRequest(S, ghost, {}, MonoTime{ tickNs / 2 }) };
-        peerProcess(S, MonoTime{ tickNs }, in);
+        processAt(S, MonoTime{ tickNs }, in);
         assert(S.pending.count(ghost) == 1);
 
         const std::uint64_t past = static_cast<std::uint64_t>(S.config.connectionRequestTimeoutMs) * tickNs * 2;
-        const auto expired = peerProcess(S, MonoTime{ past }, {});
+        const auto expired = processAt(S, MonoTime{ past }, {});
         assert(S.pending.empty());                              // swept
         for (const auto& e : expired.events) assert(e.kind != PeerEvent::Disconnected);
 
@@ -250,7 +255,7 @@ int main() {
         const PeerId dead{ addrLocalhost(9444) };               // nothing is listening
         peerConnect(C, dead, MonoTime{ 0 });
         bool timedOut = false;
-        const auto attempt = peerProcess(C, MonoTime{ past }, {});   // named: a range-for over a temporary's
+        const auto attempt = processAt(C, MonoTime{ past }, {});   // named: a range-for over a temporary's
         for (const auto& e : attempt.events)                         // member does not extend its lifetime
             if (e.kind == PeerEvent::Disconnected && e.reason == DisconnectReason::Timeout) timedOut = true;
         assert(timedOut);
@@ -280,7 +285,7 @@ int main() {
             pubs.push_back(pub);
             requests.push_back(cookiedRequest(S, ids.back(), {}, MonoTime{ tickNs / 2 }));
         }
-        peerProcess(S, MonoTime{ tickNs }, requests);            // all challenged in one tick: 6 pendings, 0 connections
+        processAt(S, MonoTime{ tickNs }, requests);            // all challenged in one tick: 6 pendings, 0 connections
         assert(S.pending.size() == clients);
 
         std::vector<IncomingPacket> responses;                  // ...then every one of them responds at once
@@ -290,7 +295,7 @@ int main() {
                                         encodeConnectionResponse(0x1000ull + static_cast<std::uint64_t>(i),
                                                                  pubs[static_cast<std::size_t>(i)],
                                                                  challengeSaltFor(S, ids[static_cast<std::size_t>(i)]))));
-        peerProcess(S, MonoTime{ 2 * tickNs }, responses);
+        processAt(S, MonoTime{ 2 * tickNs }, responses);
         assert(peerCount(S) == cfg.maxClients);                 // held at 2, not 6
         std::printf("handshake_test: maxClients holds at admission (%d of %d responses accepted)\n",
                     peerCount(S), clients);
@@ -308,7 +313,7 @@ int main() {
         NetPeer C = newPeerState(addrC, NetworkConfig{}, MonoTime{ 0 });
 
         constexpr std::uint64_t player = 424242;
-        const Bytes token = sealConnectToken(K, ConnectToken{ player, MonoTime{ 3600ull * 1000000000ull }, {} });
+        const Bytes token = sealConnectToken(K, ConnectToken{ player, UnixTime{ 3600ull * 1000000000ull }, {} });
         peerConnectWithToken(C, idS, token, MonoTime{ 0 });
 
         TestLink      link        = newTestLink(C, idC, S, idS);
@@ -326,8 +331,8 @@ int main() {
         // Blackhole the link so both ends time out and stash a resumable session.
         for (int k = 0; k < 30; ++k) {
             t = MonoTime{ t.ns + 1000000000ull };   // 1s per step, past the 10s connection timeout
-            peerProcess(C, t, {});
-            peerProcess(S, t, {});
+            processAt(C, t, {});
+            processAt(S, t, {});
         }
         assert(peerCount(S) == 0 && peerCount(C) == 0);
 
@@ -517,7 +522,7 @@ int main() {
     }
 
     // --- 6. an admission cap must not burn the client's single-use connect token ---
-    // Recording a token nonce is what makes the token single-use, and it lasts tokenReplayLifetimeMs.
+    // Recording a token nonce is what makes the token single-use, and it lasts until that token's expiry.
     // Doing it before the caps burns the token of every client the server turns away, so the retry it
     // makes once a slot frees is answered as a replay -- a full server locking clients out for a day.
     {
@@ -529,7 +534,7 @@ int main() {
         NetPeer      S = newPeerState(addrLocalhost(9471), cfg, MonoTime{ 0 });
         const PeerId idA{ addrV4(0x0A000010u, 9472) }, idOther{ addrV4(0x0A000011u, 9473) };
 
-        const MonoTime expires{ 3600ull * 1000000000ull };
+        const UnixTime expires{ 3600ull * 1000000000ull };
         const Bytes    otherToken = sealConnectToken(K, ConnectToken{ 1, expires, {} });
         handshakeRaw(S, idOther, 0x9999ull, otherToken, MonoTime{ tickNs });   // the single client slot is taken
         assert(peerCount(S) == 1);
@@ -537,7 +542,7 @@ int main() {
         constexpr std::uint64_t player = 909;
         const Bytes token = sealConnectToken(K, ConnectToken{ player, expires, {} });
         std::vector<IncomingPacket> full{ cookiedRequest(S, idA, token, MonoTime{ 2 * tickNs }) };
-        const auto denied = peerProcess(S, MonoTime{ 2 * tickNs }, full);
+        const auto denied = processAt(S, MonoTime{ 2 * tickNs }, full);
         assert(denied.outgoing.size() == 1);
         const auto deny = replyPacket(denied.outgoing[0]);
         assert(deny && deny->header.type == PacketType::ConnectionDenied);
@@ -546,7 +551,7 @@ int main() {
 
         S.connections.clear();   // a slot frees...
         std::vector<IncomingPacket> again{ cookiedRequest(S, idA, token, MonoTime{ 4 * tickNs }) };
-        peerProcess(S, MonoTime{ 4 * tickNs }, again);
+        processAt(S, MonoTime{ 4 * tickNs }, again);
         assert(S.pending.count(idA) == 1);                    // ...and the SAME token still works
         assert(S.pending.at(idA).playerId == player);
         std::printf("handshake_test: a cap-rejected request does not spend the client's connect token\n");
@@ -566,16 +571,16 @@ int main() {
 
         const Bytes garbage(48, 0xCD);   // longer than a resume blob, and not a token either
         std::vector<IncomingPacket> junk{ control(idA, PacketType::ConnectionRequest, encodeConnectionRequest({}, garbage)) };
-        const auto rejected = peerProcess(S, MonoTime{ tickNs }, junk);
+        const auto rejected = processAt(S, MonoTime{ tickNs }, junk);
         assert(rejected.outgoing.size() == 1);
         const auto deny = replyPacket(rejected.outgoing[0]);
         assert(deny && deny->header.type == PacketType::ConnectionDenied);
         assert(decodeDenyReason(deny->payload) == DenyReason::InvalidToken);
-        assert(!decodeResume(garbage));   // ...because a 48-byte body is not a resume
+        aether::test::require(!decodeResume(garbage));   // ...because a 48-byte body is not a resume
 
-        const Bytes token = sealConnectToken(K, ConnectToken{ 5, MonoTime{ 3600ull * 1000000000ull }, {} });
+        const Bytes token = sealConnectToken(K, ConnectToken{ 5, UnixTime{ 3600ull * 1000000000ull }, {} });
         std::vector<IncomingPacket> real{ control(idA, PacketType::ConnectionRequest, encodeConnectionRequest({}, token)) };
-        const auto accepted = peerProcess(S, MonoTime{ 2 * tickNs }, real);
+        const auto accepted = processAt(S, MonoTime{ 2 * tickNs }, real);
         assert(accepted.outgoing.size() == 1);
         const auto retry = replyPacket(accepted.outgoing[0]);
         assert(retry && retry->header.type == PacketType::ConnectionRetry);   // a real token still earns its cookie
@@ -591,12 +596,12 @@ int main() {
         peerConnect(C, dead, MonoTime{ 0 });
 
         std::vector<IncomingPacket> kill{ control(dead, PacketType::Disconnect, {}) };
-        const auto killed = peerProcess(C, MonoTime{ tickNs }, kill);
+        const auto killed = processAt(C, MonoTime{ tickNs }, kill);
         assert(C.pending.count(dead) == 1);   // the handshake is untouched
         assert(killed.events.empty());
 
         const std::uint64_t past = static_cast<std::uint64_t>(C.config.connectionRequestTimeoutMs) * tickNs * 2;
-        const auto expired = peerProcess(C, MonoTime{ past }, {});
+        const auto expired = processAt(C, MonoTime{ past }, {});
         bool timedOut = false;
         for (const auto& e : expired.events)
             if (e.kind == PeerEvent::Disconnected && e.reason == DisconnectReason::Timeout) timedOut = true;
@@ -605,10 +610,10 @@ int main() {
         NetPeer      S = newPeerState(addrLocalhost(9493), NetworkConfig{}, MonoTime{ 0 });
         const PeerId idA{ addrV4(0x0A000013u, 9494) };
         std::vector<IncomingPacket> req{ cookiedRequest(S, idA, {}, MonoTime{ tickNs / 2 }) };
-        peerProcess(S, MonoTime{ tickNs }, req);
+        processAt(S, MonoTime{ tickNs }, req);
         assert(S.pending.count(idA) == 1);
         std::vector<IncomingPacket> spoof{ control(idA, PacketType::Disconnect, {}) };
-        peerProcess(S, MonoTime{ 2 * tickNs }, spoof);
+        processAt(S, MonoTime{ 2 * tickNs }, spoof);
         assert(S.pending.count(idA) == 1);    // the server's half-open handshake survives it too
         std::printf("handshake_test: a cleartext Disconnect leaves half-open handshakes alone\n");
     }
@@ -682,12 +687,12 @@ int main() {
         const X25519Key masterB = *S.connections.at(idB).resumeMaster;
         assert(masterA != masterB);
 
-        peerProcess(S, MonoTime{ 12000ull * tickNs }, {});   // A idles out; B is still live
+        processAt(S, MonoTime{ 12000ull * tickNs }, {});   // A idles out; B is still live
         assert(peerCount(S) == 1 && S.connections.count(idB) == 1);
         assert(S.resumableTokens.count(shared) == 1);
         assert(*S.resumableTokens.at(shared).master == masterA);
 
-        peerProcess(S, MonoTime{ 20000ull * tickNs }, {});   // now B idles out too
+        processAt(S, MonoTime{ 20000ull * tickNs }, {});   // now B idles out too
         assert(peerCount(S) == 0);
         assert(*S.resumableTokens.at(shared).master == masterA);   // A's entry survives, still A's master
         assert(S.resumableTokens.at(shared).owner == idA);
@@ -708,7 +713,7 @@ int main() {
         NetPeer C = newPeerState(addrC, NetworkConfig{}, MonoTime{ 0 });
 
         constexpr std::uint64_t player  = 777;
-        const MonoTime          expires{ 3600ull * 1000000000ull };
+        const UnixTime          expires{ 3600ull * 1000000000ull };
         const Bytes first  = sealConnectToken(K, ConnectToken{ player, expires, {} });
         const Bytes second = sealConnectToken(K, ConnectToken{ player, expires, {} });   // a token is single-use
         peerConnectWithToken(C, idS, first, MonoTime{ 0 });
@@ -721,8 +726,8 @@ int main() {
 
         for (int k = 0; k < 30; ++k) {   // blackhole both ends so each stashes a resumable
             t = MonoTime{ t.ns + 1000000000ull };
-            peerProcess(C, t, {});
-            peerProcess(S, t, {});
+            processAt(C, t, {});
+            processAt(S, t, {});
         }
         assert(peerCount(S) == 0 && peerCount(C) == 0);
         S.resumableTokens.clear();      // the server forgot the session (grace expired, or it restarted)
@@ -748,14 +753,14 @@ int main() {
 
         const Bytes tiny{ 0 };   // framing-valid: no cookie, no body -- and far below the minimum
         std::vector<IncomingPacket> small{ control(idA, PacketType::ConnectionRequest, tiny) };
-        const auto shed = peerProcess(S, MonoTime{ tickNs }, small);
+        const auto shed = processAt(S, MonoTime{ tickNs }, small);
         assert(shed.outgoing.empty());
         assert(S.pending.empty());
 
         const Bytes padded = encodeConnectionRequest({}, {});   // what a real client sends
         assert(requestDatagramBytes(padded) >= minConnectionRequestBytes);
         std::vector<IncomingPacket> ok{ control(idA, PacketType::ConnectionRequest, padded) };
-        const auto answered = peerProcess(S, MonoTime{ 2 * tickNs }, ok);
+        const auto answered = processAt(S, MonoTime{ 2 * tickNs }, ok);
         assert(answered.outgoing.size() == 1);
         const auto retry = replyPacket(answered.outgoing[0]);
         assert(retry && retry->header.type == PacketType::ConnectionRetry);
@@ -781,7 +786,7 @@ int main() {
         Bytes datagram;   // captured before the link carries it, so the server has never seen it
         for (int k = 0; k < 32 && datagram.empty(); ++k) {
             t = MonoTime{ t.ns + tickNs };
-            const auto sent = peerProcess(C, t, {});
+            const auto sent = processAt(C, t, {});
             for (const RawPacket& p : sent.outgoing) {
                 const auto pk = replyPacket(p);
                 if (!pk || (pk->header.type != PacketType::Payload && pk->header.type != PacketType::PayloadBatch)) continue;
@@ -794,12 +799,12 @@ int main() {
         Bytes tampered = datagram;
         tampered[8] = static_cast<std::uint8_t>(tampered[8] ^ 0x0F);   // the four bits readHeader throws away
         t = MonoTime{ t.ns + tickNs };
-        const auto rejected = peerProcess(S, t, { IncomingPacket{ idMoved, tampered } });
+        const auto rejected = processAt(S, t, { IncomingPacket{ idMoved, tampered } });
         for (const RawPacket& p : rejected.outgoing) assert(p.to != idMoved);
         assert(S.pathValidations.empty());   // it never authenticated, so no path challenge went out
 
         t = MonoTime{ t.ns + tickNs };
-        const auto probed = peerProcess(S, t, { IncomingPacket{ idMoved, datagram } });
+        const auto probed = processAt(S, t, { IncomingPacket{ idMoved, datagram } });
         bool challenged = false;
         for (const RawPacket& p : probed.outgoing) if (p.to == idMoved) challenged = true;
         assert(challenged && S.pathValidations.count(idMoved) == 1);   // the untouched copy does

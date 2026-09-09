@@ -1,44 +1,27 @@
-// aether example: echo client. Connects to an echo_server, sends each line you type on the default
-// reliable-ordered channel, and prints what comes back.
-//
-// stdin blocks, and the network loop must not -- so a reader thread hands typed lines to the tick
-// loop through a small locked queue. That game-loop shape (tick every frame, never block on input)
-// is the part worth copying into a real app.
+// Connect, send one message on reliable ordered channel 0, and verify its echo.
+#include "common.hpp"
 #include <aether/net.hpp>
 
-#include <chrono>
 #include <cstdio>
-#include <cstdlib>
-#include <iostream>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
-#include <vector>
 
 namespace {
 
-aether::MonoTime monoNow() {
-    return aether::MonoTime{ static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count()) };
-}
-
-// Hand-rolled dotted-quad parse (sscanf is a C4996 warnings-as-errors failure under MSVC).
-std::optional<aether::Address> parseIpv4(const char* s, std::uint16_t port) {
+std::optional<aether::Address> parseIpv4(const char* text, std::uint16_t port) {
     std::uint32_t ip = 0;
-    const char*   p  = s;
+    const char* p = text;
     for (int octet = 0; octet < 4; ++octet) {
         if (*p < '0' || *p > '9') return std::nullopt;
-        unsigned v = 0;
+        unsigned value = 0;
         while (*p >= '0' && *p <= '9') {
-            v = v * 10 + static_cast<unsigned>(*p++ - '0');
-            if (v > 255) return std::nullopt;
+            value = value * 10 + static_cast<unsigned>(*p++ - '0');
+            if (value > 255) return std::nullopt;
         }
-        ip = (ip << 8) | v;
+        ip = (ip << 8) | value;
         if (octet < 3) {
-            if (*p != '.') return std::nullopt;
-            ++p;
+            if (*p++ != '.') return std::nullopt;
         } else if (*p != '\0') {
             return std::nullopt;
         }
@@ -46,69 +29,63 @@ std::optional<aether::Address> parseIpv4(const char* s, std::uint16_t port) {
     return aether::addrV4(ip, port);
 }
 
-constexpr int tickMs = 16;
+int runEcho(aether::Host& host, const aether::Address& server, const std::string& message) {
+    const aether::Bytes payload(message.begin(), message.end());
+    const auto start = aether_example::monoNow();
+    aether::hostConnect(host, server, start);
+    bool sent = false;
+    while (aether::elapsedMs(start, aether_example::monoNow()) < 10000.0) {
+        const auto now = aether_example::monoNow();
+        for (const auto& event : aether::hostTick(host, {}, now)) {
+            if (!aether::addrEqual(event.peer.addr, server)) continue;
+            if (event.kind == aether::PeerEvent::Connected && !sent) {
+                if (const auto error = aether::hostSend(host, server, aether::ChannelId{0}, payload, now)) {
+                    std::fprintf(stderr, "echo_client: send rejected (error %d)\n", static_cast<int>(error->kind));
+                    return 1;
+                }
+                sent = true;
+            } else if (event.kind == aether::PeerEvent::Message) {
+                if (!sent || event.channel != aether::ChannelId{0} || event.data != payload) {
+                    std::fprintf(stderr, "echo_client: reply did not match the request\n");
+                    return 1;
+                }
+                std::printf("echo: %s\n", message.c_str());
+                aether::hostDisconnect(host, server, now);
+                aether::hostTick(host, {}, now); // Send the disconnect before closing the socket.
+                return 0;
+            } else if (event.kind == aether::PeerEvent::Disconnected) {
+                std::fprintf(stderr, "echo_client: disconnected before receiving the echo\n");
+                return 1;
+            }
+        }
+        std::this_thread::sleep_for(aether_example::tickInterval);
+    }
+    std::fprintf(stderr, "echo_client: no echo within 10 seconds\n");
+    return 1;
+}
 
 } // namespace
 
 int main(int argc, char** argv) {
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);   // line-buffered even when piped, so echoes show as they land
-    const char* ip   = argc > 1 ? argv[1] : "127.0.0.1";
-    const auto  port = static_cast<std::uint16_t>(argc > 2 ? std::atoi(argv[2]) : 7777);
-    const auto  server = parseIpv4(ip, port);
-    if (!server) {
-        std::fprintf(stderr, "echo_client: not an IPv4 address: %s\nusage: echo_client [ip] [port]\n", ip);
+    const auto port = aether_example::parsePort(argc > 2 ? argv[2] : "7777");
+    const auto server = port ? parseIpv4(argc > 1 ? argv[1] : "127.0.0.1", *port) : std::nullopt;
+    if (argc > 4 || !server) {
+        std::fprintf(stderr, "usage: echo_client [IPv4 [port [message]]]; port must be 1..65535\n");
         return 1;
     }
-
-    auto host = aether::openHost(aether::addrAny(0), aether::NetworkConfig{}, monoNow());
+    const std::string message = argc > 3 ? argv[3] : "hello aether";
+    const aether::NetworkConfig config;
+    if (message.size() > static_cast<std::size_t>(config.defaultChannelConfig.maxMessageSize)) {
+        std::fprintf(stderr, "echo_client: message exceeds the default %d-byte channel limit\n",
+                     config.defaultChannelConfig.maxMessageSize);
+        return 1;
+    }
+    auto host = aether::openHost(aether::addrAny(0), config, aether_example::monoNow());
     if (!host) {
         std::fprintf(stderr, "echo_client: could not open a UDP socket\n");
         return 1;
     }
-    aether::hostConnect(*host, *server, monoNow());
-    std::printf("echo_client: connecting to %s:%u -- type a line to send it\n", ip, port);
-
-    std::mutex               linesMutex;
-    std::vector<std::string> typed;
-    std::thread reader([&] {
-        std::string line;
-        while (std::getline(std::cin, line)) {
-            const std::lock_guard<std::mutex> lock(linesMutex);
-            typed.push_back(std::move(line));
-        }
-    });
-    reader.detach();   // lives until the process exits; the loop below runs until ctrl-c or a disconnect
-
-    bool up = false;
-    for (;;) {
-        for (const aether::PeerEvent& ev : aether::hostTick(*host, {}, monoNow())) {
-            switch (ev.kind) {
-                case aether::PeerEvent::Connected:
-                    up = true;
-                    std::printf("connected\n");
-                    break;
-                case aether::PeerEvent::Disconnected:
-                    // Also how a failed connect reports itself (nothing listening -> timeout).
-                    std::printf("disconnected\n");
-                    return 0;
-                case aether::PeerEvent::Message:
-                    std::printf("echo: %.*s\n", static_cast<int>(ev.data.size()),
-                                reinterpret_cast<const char*>(ev.data.data()));
-                    break;
-                default:
-                    break;
-            }
-        }
-        if (up) {
-            std::vector<std::string> pending;
-            {
-                const std::lock_guard<std::mutex> lock(linesMutex);
-                pending.swap(typed);
-            }
-            for (const std::string& line : pending)
-                aether::hostSend(*host, *server, aether::ChannelId{ 0 },
-                                 aether::Bytes(line.begin(), line.end()), monoNow());
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(tickMs));
-    }
+    const int result = runEcho(*host, *server, message);
+    aether::closeHost(*host);
+    return result;
 }

@@ -58,9 +58,9 @@ static_assert(maxChannelCount <= channelWireChannelMask + 1, "channel id must fi
 enum class ConnectionState { Disconnected, Connected, Disconnecting };
 
 // Disconnect reason: the enum value IS the wire byte, so any code round-trips losslessly
-// (codes 0..4 are named; others are valid but unnamed).
+// (codes 0..5 are named; others are valid but unnamed).
 enum class DisconnectReason : std::uint8_t {
-    Timeout = 0, Requested = 1, Kicked = 2, ServerFull = 3, ProtocolMismatch = 4,
+    Timeout = 0, Requested = 1, Kicked = 2, ServerFull = 3, ProtocolMismatch = 4, DeliveryFailed = 5,
 };
 inline std::uint8_t      disconnectReasonCode(DisconnectReason r) noexcept { return static_cast<std::uint8_t>(r); }
 inline DisconnectReason  parseDisconnectReason(std::uint8_t code) noexcept { return static_cast<DisconnectReason>(code); }
@@ -93,7 +93,7 @@ struct Connection {
     NetworkConfig                config;
     ConnectionState              state      = ConnectionState::Disconnected;
     std::uint64_t                clientSalt = 0;
-    std::uint64_t                serverSalt = 0;
+    std::uint64_t                connectionId = 0; // key-derived public routing identity, refreshed on resume
     std::uint64_t                playerId   = 0;   // verified connect-token identity (server side); 0 when auth is off
     MonoTime                     lastSendTime{};
     MonoTime                     lastRecvTime{};
@@ -110,6 +110,7 @@ struct Connection {
     std::vector<PendingWire>     pendingWires;   // accumulated this tick, flushed (coalesced) at tick end
     NetworkStats                 stats{};
     std::optional<MonoTime>      disconnectTime;
+    DisconnectReason             disconnectReason = DisconnectReason::Requested;
     int                          disconnectRetries = 0;
     std::optional<EncryptionKey> sendKey;        // our send direction (c2s for the client, s2c for the server)
     std::optional<EncryptionKey> recvKey;        // the peer's send direction
@@ -233,7 +234,7 @@ inline void markPathValidated(Connection& c) noexcept {
 inline PacketHeader createHeaderInternal(Connection& conn) {
     const auto [ackSeq, ackBits64] = getAckInfo(conn.reliability);
     conn.pendingAck = false;
-    return PacketHeader{ PacketType::Payload, conn.localSeq, ackSeq, static_cast<std::uint32_t>(ackBits64) };
+    return PacketHeader{ PacketType::Payload, conn.localSeq, ackSeq, static_cast<std::uint32_t>(ackBits64), conn.connectionId };
 }
 // --- send-queue helpers ---
 inline void enqueueEmptyPacket(Connection& conn) {   // keepalive / ack-only share this wire form
@@ -361,7 +362,7 @@ inline void maybeAdvertiseWindow(Connection& conn, MonoTime now) {
         const int delta = free > adv ? free - adv : adv - free;
         // Ceiling form of (delta * 4 >= cap): the product overflows int for a cap above INT_MAX/4,
         // which validateConfig currently admits.
-        changed = changed || (isR != wasR) || (delta >= (ch.config.maxReceiveBufferSize + 3) / 4);
+        changed = changed || (isR != wasR) || (delta >= (ch.config.maxReceiveBufferSize / 4 + (ch.config.maxReceiveBufferSize % 4 != 0)));
     }
     // Re-send while UNCONFIRMED, not merely while restricted. A WindowUpdate is not in the sent ring,
     // so nothing retransmits it, and the reopen after a drain is a single datagram: once it is sent the
@@ -549,6 +550,7 @@ inline void disconnect(Connection& conn, DisconnectReason reason, MonoTime now) 
     conn.sendQueue.push_back(OutgoingPacket{ header, PacketType::Disconnect, Bytes{ disconnectReasonCode(reason) } });
     conn.state             = ConnectionState::Disconnecting;
     conn.disconnectTime    = now;
+    conn.disconnectReason  = reason;
     conn.disconnectRetries = 0;
     conn.localSeq          = next(conn.localSeq);
 }
@@ -701,6 +703,7 @@ inline bool emitPacedFragments(Connection& conn, Channel& channel, ChannelId chI
 inline void processChannelMessages(Connection& conn, MonoTime now, ChannelId chId) {
     const int chIdx   = toInt(chId);
     Channel&  channel = conn.channels[static_cast<std::size_t>(chIdx)];
+    if (channel.failure) return;
     // Receiver credit, counted once per tick and then tracked locally as messages are admitted:
     // recomputing the unacked count per message would make this loop quadratic in the send buffer.
     const bool creditGates = channelIsReliable(channel);
@@ -720,13 +723,16 @@ inline void processChannelMessages(Connection& conn, MonoTime now, ChannelId chI
 
         if (chunk > 0 && innerLen > static_cast<std::size_t>(chunk)) {   // fragmented: paced, may span ticks
             const std::size_t count = fragmentCountFor(innerLen, chunk);
-            // Beyond the fragmentable ceiling (see buildMessageWires): dispose + count, never stall.
-            // Erased, not committed -- commit KEEPS a reliable message for retransmit, and one that can
-            // never render would re-qualify as a retransmit candidate every tick forever.
-            if (count == 0) {   // unfragmentable: gone for good, and on a reliable channel that is a broken promise
-                channel.sendBuffer.erase(seq);
+            // Invalid configuration can reach this lower-level API without validateConfig.
+            // Preserve reliable-delivery semantics even then: report a terminal failure.
+            if (count == 0) {
                 channel.totalDropped += 1;
-                if (isReliable) channel.totalReliableDropped += 1;
+                if (isReliable) {
+                    channel.totalReliableDropped += 1;
+                    channel.failure = ChannelFailure::MessageTooLarge;
+                    return;
+                }
+                channel.sendBuffer.erase(seq);
                 continue;
             }
             if (!emitPacedFragments(conn, channel, chId, seq, count, chunk, now)) break;   // budget spent mid-message
@@ -937,6 +943,14 @@ inline void updateConnectedPure(Connection& conn, MonoTime now) {
 inline std::optional<ConnectionError> updateConnected(Connection& conn, MonoTime now) {
     if (elapsedMs(conn.lastRecvTime, now) > conn.config.connectionTimeoutMs) return ConnectionError{ ConnectionError::Timeout };
     updateConnectedPure(conn, now);
+    for (const auto& channel : conn.channels) {
+        if (channel.failure) {
+            conn.sendQueue.clear();
+            conn.pendingWires.clear();
+            disconnect(conn, DisconnectReason::DeliveryFailed, now);
+            break;
+        }
+    }
     return std::nullopt;
 }
 
@@ -950,7 +964,7 @@ inline std::optional<ConnectionError> updateDisconnecting(Connection& conn, Mono
     }
     PacketHeader header = createHeaderInternal(conn);
     header.type = PacketType::Disconnect;
-    conn.sendQueue.push_back(OutgoingPacket{ header, PacketType::Disconnect, Bytes{ disconnectReasonCode(DisconnectReason::Requested) } });
+    conn.sendQueue.push_back(OutgoingPacket{ header, PacketType::Disconnect, Bytes{ disconnectReasonCode(conn.disconnectReason) } });
     conn.disconnectRetries += 1;
     conn.disconnectTime     = now;
     conn.localSeq           = next(conn.localSeq);
@@ -981,9 +995,9 @@ inline void markConnected(Connection& conn, MonoTime now) {
     conn.localSeq  = firstSequence;   // the first keyed packet must not be sequence 0 (see firstSequence)
 }
 
-inline void recordBytesSent(Connection& conn, int bytes, MonoTime now) {
+inline void recordBytesSent(Connection& conn, int bytes, MonoTime now, std::uint64_t datagrams = 1) {
     btRecord(conn.bandwidthUp, bytes, now);
-    conn.stats.packetsSent += 1;
+    conn.stats.packetsSent += datagrams;
     conn.stats.bytesSent   += static_cast<std::uint64_t>(bytes);
     conn.lastSendTime       = now;
 }

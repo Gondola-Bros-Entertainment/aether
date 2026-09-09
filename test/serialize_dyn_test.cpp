@@ -95,7 +95,7 @@ int main() {
     {
         struct WithOpt  { std::optional<int> o; };
         struct Inner    { std::optional<int> o; };
-        struct Nested   { Inner inner; std::uint32_t tail; };
+        struct Nested   { Inner inner; std::uint32_t tail{}; };
         struct Pod      { std::uint32_t a; std::uint16_t b; std::uint8_t c, d; float e; };
         struct WithEnum { aether::ChannelId ch; std::uint8_t x, y, z; };
         static_assert(!aether::canMemcpySerialize<WithOpt>(), "an optional field must take the portable path");
@@ -184,7 +184,7 @@ int main() {
     // would never produce -- 255 wire forms for one bool. varint.hpp and delta.hpp already reject
     // their non-canonical forms; these two are the same rule.
     {
-        struct S { std::optional<std::uint16_t> o; bool b; };
+        struct S { std::optional<std::uint16_t> o; bool b{}; };
         const std::uint8_t engaged[]    = { 0x01, 0x34, 0x12, 0x01 };
         const std::uint8_t disengaged[] = { 0x00, 0x00 };
         const std::uint8_t badFlag[]    = { 0x02, 0x34, 0x12, 0x01 };

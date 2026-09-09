@@ -112,8 +112,8 @@ inline TestLinkStep testLinkStep(TestLink& link, MonoTime now) {
         else                  toB.push_back(IncomingPacket{ link.ida, std::move(*stripped) });
     }
 
-    PeerProcessResult ra = peerProcess(*link.a, now, toA);
-    PeerProcessResult rb = peerProcess(*link.b, now, toB);
+    PeerProcessResult ra = peerProcess(*link.a, now, toA, UnixTime{now.ns});
+    PeerProcessResult rb = peerProcess(*link.b, now, toB, UnixTime{now.ns});
     for (RawPacket& p : ra.outgoing) testLinkEmit(link, link.aToB, link.idb, std::move(p.data), now);
     for (RawPacket& p : rb.outgoing) testLinkEmit(link, link.bToA, link.ida, std::move(p.data), now);
     return { std::move(ra.events), std::move(rb.events) };

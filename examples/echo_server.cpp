@@ -1,58 +1,50 @@
-// aether example: echo server. Binds a UDP port, accepts connections, and echoes every message
-// straight back to its sender. Talk to it with echo_client.
-//
-// This is the whole consumer shape: openHost once, then hostTick every frame and act on the events
-// it returns. Time is caller-provided -- aether never reads a clock -- so a game passes its frame
-// clock; here it is the steady clock. The default config gives an encrypted connection and a
-// reliable-ordered channel 0 with nothing else to set up.
+// Bind a UDP port and echo messages on their original channels until interrupted.
+#include "common.hpp"
 #include <aether/net.hpp>
 
-#include <chrono>
+#include <csignal>
 #include <cstdio>
-#include <cstdlib>
 #include <thread>
 
 namespace {
-
-aether::MonoTime monoNow() {
-    return aether::MonoTime{ static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count()) };
-}
-
-constexpr int tickMs = 16;   // ~60Hz -- the tick rate is the app's choice, not the library's
-
+volatile std::sig_atomic_t stopping = 0;
+void requestStop(int) { stopping = 1; }
 } // namespace
 
 int main(int argc, char** argv) {
-    std::setvbuf(stdout, nullptr, _IOLBF, 0);   // line-buffered even when piped, so activity shows as it happens
-    const auto port = static_cast<std::uint16_t>(argc > 1 ? std::atoi(argv[1]) : 7777);
-
-    auto host = aether::openHost(aether::addrAny(port), aether::NetworkConfig{}, monoNow());
-    if (!host) {
-        std::fprintf(stderr, "echo_server: could not bind UDP port %u\n", port);
+    const auto port = aether_example::parsePort(argc > 1 ? argv[1] : "7777");
+    if (argc > 2 || !port) {
+        std::fprintf(stderr, "usage: echo_server [port]; port must be 1..65535\n");
         return 1;
     }
-    std::printf("echo_server: listening on %u\n", port);
+    auto host = aether::openHost(aether::addrAny(*port), aether::NetworkConfig{}, aether_example::monoNow());
+    if (!host) {
+        std::fprintf(stderr, "echo_server: could not bind UDP port %u\n", static_cast<unsigned>(*port));
+        return 1;
+    }
+    std::signal(SIGINT, requestStop);
+    std::signal(SIGTERM, requestStop);
+    std::printf("echo_server: listening on %u\n", static_cast<unsigned>(*port));
+    std::fflush(stdout);
 
-    for (;;) {
-        for (const aether::PeerEvent& ev : aether::hostTick(*host, {}, monoNow())) {
-            switch (ev.kind) {
-                case aether::PeerEvent::Connected:
-                    std::printf("+ peer connected (port %u)\n", aether::addrPort(ev.peer.addr));
-                    break;
-                case aether::PeerEvent::Disconnected:
-                    std::printf("- peer disconnected (port %u)\n", aether::addrPort(ev.peer.addr));
-                    break;
-                case aether::PeerEvent::Message:
-                    std::printf("> %u bytes from port %u, echoing\n",
-                                static_cast<unsigned>(ev.data.size()), aether::addrPort(ev.peer.addr));
-                    aether::hostSend(*host, ev.peer.addr, ev.channel, ev.data, monoNow());
-                    break;
-                default:   // Migrated / Reconnected: nothing extra to do for an echo
-                    break;
+    while (!stopping) {
+        const auto now = aether_example::monoNow();
+        for (const auto& event : aether::hostTick(*host, {}, now)) {
+            if (event.kind == aether::PeerEvent::Connected) {
+                std::printf("+ peer connected (port %u)\n", static_cast<unsigned>(aether::addrPort(event.peer.addr)));
+            } else if (event.kind == aether::PeerEvent::Disconnected) {
+                std::printf("- peer disconnected (port %u)\n", static_cast<unsigned>(aether::addrPort(event.peer.addr)));
+            } else if (event.kind == aether::PeerEvent::Message) {
+                if (const auto error = aether::hostSend(*host, event.peer.addr, event.channel, event.data, now)) {
+                    std::fprintf(stderr, "echo_server: cannot queue echo (error %d), disconnecting peer\n",
+                                 static_cast<int>(error->kind));
+                    aether::hostDisconnect(*host, event.peer.addr, now);
+                }
             }
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(tickMs));
+        std::fflush(stdout);
+        std::this_thread::sleep_for(aether_example::tickInterval);
     }
+    aether::closeHost(*host);
+    return 0;
 }

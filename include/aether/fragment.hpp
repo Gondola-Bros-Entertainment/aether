@@ -79,6 +79,7 @@ struct FragmentBuffer {
     std::uint8_t count{};
     MonoTime     lastFragmentAt{};   // when the last NEW fragment landed -- expiry is idle-based (see cleanupFragments)
     std::size_t  totalSize{};   // size_t so the running total cannot overflow at a large cap
+    std::size_t  reservedBytes{};   // nonzero: reliable assembly owns this capacity until delivery or disconnect
 };
 struct FragmentAssembler {
     std::map<MessageId, FragmentBuffer> buffers;
@@ -98,7 +99,7 @@ inline constexpr std::size_t fragmentOverheadBytes = 80;
 // What a buffer costs against the cap. totalSize stays pure payload because the assembled message is
 // sized from it; the overhead is derived from the fragment count so the two can never drift.
 inline std::size_t fragmentBufferCharge(const FragmentBuffer& b) noexcept {
-    return b.totalSize + b.fragments.size() * fragmentOverheadBytes;
+    return b.reservedBytes ? b.reservedBytes : b.totalSize + b.fragments.size() * fragmentOverheadBytes;
 }
 inline FragmentAssembler newFragmentAssembler(double timeoutMs, int maxSize, int maxBuffers) {
     return { {}, timeoutMs, maxSize, maxBuffers, 0 };
@@ -112,7 +113,7 @@ inline FragmentAssembler newFragmentAssembler(double timeoutMs, int maxSize, int
 // maxBufferSize and maxBuffers cap it regardless of how slowly an assembly advances.
 inline void cleanupFragments(FragmentAssembler& a, MonoTime now) {
     for (auto it = a.buffers.begin(); it != a.buffers.end(); ) {
-        if (elapsedMs(it->second.lastFragmentAt, now) >= a.timeoutMs) {
+        if (!it->second.reservedBytes && elapsedMs(it->second.lastFragmentAt, now) >= a.timeoutMs) {
             a.currentSize -= fragmentBufferCharge(it->second);
             it = a.buffers.erase(it);
         } else {
@@ -124,69 +125,87 @@ inline void cleanupFragments(FragmentAssembler& a, MonoTime now) {
 inline bool expireOldestFragment(FragmentAssembler& a) {
     auto oldest = a.buffers.end();
     for (auto it = a.buffers.begin(); it != a.buffers.end(); ++it)
-        if (oldest == a.buffers.end() || it->second.lastFragmentAt.ns < oldest->second.lastFragmentAt.ns) oldest = it;
+        if (!it->second.reservedBytes
+            && (oldest == a.buffers.end() || it->second.lastFragmentAt.ns < oldest->second.lastFragmentAt.ns)) oldest = it;
     if (oldest == a.buffers.end()) return false;
     a.currentSize -= fragmentBufferCharge(oldest->second);
     a.buffers.erase(oldest);
     return true;
 }
 
-// Feed one fragment; returns the reassembled message if this fragment completed it.
-inline std::optional<Bytes> processFragment(FragmentAssembler& a, const std::uint8_t* data, std::size_t len, MonoTime now) {
+// Removing a retained reliable assembly is legal only after channel acceptance or connection failure.
+inline void releaseFragment(FragmentAssembler& a, MessageId id) {
+    const auto it = a.buffers.find(id);
+    if (it == a.buffers.end()) return;
+    a.currentSize -= fragmentBufferCharge(it->second);
+    a.buffers.erase(it);
+}
+struct FragmentReceipt {
+    bool accepted = false;
+    std::optional<Bytes> message;
+};
+inline std::optional<Bytes> assembledMessage(const FragmentBuffer& buffer) {
+    if (buffer.fragments.size() != buffer.count) return std::nullopt;
+    Bytes out;
+    out.reserve(buffer.totalSize);
+    for (const auto& [index, bytes] : buffer.fragments) {
+        (void)index;
+        out.insert(out.end(), bytes.begin(), bytes.end());
+    }
+    return out;
+}
+
+// A nonzero reservation pins all accepted pieces, including a complete message awaiting channel
+// capacity. Ordinary partial reassembly can expire or be evicted; acknowledged reliable data cannot.
+inline FragmentReceipt acceptFragment(FragmentAssembler& a, const std::uint8_t* data, std::size_t len,
+                                      MonoTime now, std::size_t reservationBytes = 0) {
+    const auto header = readFragmentHeader(data, len);
+    if (!header || header->count == 0 || header->index >= header->count
+        || len == fragmentHeaderSize || a.maxBufferSize <= 0 || a.maxBuffers <= 0) return {};
     cleanupFragments(a, now);
-    const auto hdr = readFragmentHeader(data, len);
-    if (!hdr) return std::nullopt;
-    // Both header fields are checked before anything is created or evicted: an index at or past the
-    // count belongs to no message, so it must not reach the eviction loop below (it would throw out a
-    // live assembly) or the buffer creation (the entry would hold no data, cost 0 against the byte cap,
-    // and still occupy one of maxBuffers slots).
-    if (hdr->count == 0) return std::nullopt;            // a 0-fragment message can never complete
-    if (hdr->index >= hdr->count) return std::nullopt;   // out of range for the message it claims to be part of
-    const std::uint8_t* fragData = data + fragmentHeaderSize;
-    const std::size_t   fragSize = len - static_cast<std::size_t>(fragmentHeaderSize);   // len >= fragmentHeaderSize (readFragmentHeader checked)
-    // A fragment with no data is malformed: a real split always puts at least one byte in every piece. It
-    // would otherwise occupy a slot and count toward completion, letting a peer assemble a message out of
-    // nothing.
-    if (fragSize == 0) return std::nullopt;
-    const MessageId     msgId    = hdr->messageId;
-
-    auto it = a.buffers.find(msgId);
-    if (it != a.buffers.end() && it->second.count != hdr->count) return std::nullopt;   // count disagreement
-
-    const std::size_t cap    = static_cast<std::size_t>(a.maxBufferSize);              // maxBufferSize > 0 (validateConfig)
-    const std::size_t charge = fragSize + fragmentOverheadBytes;                       // what holding it really costs
-    if (charge > cap) return std::nullopt;                                             // one fragment larger than the whole cap -> reject
-    while (a.currentSize + charge > cap && expireOldestFragment(a)) {}                 // evict oldest until it fits (the cap is enforced, not advisory)
-
-    it = a.buffers.find(msgId);
+    const auto* payload = data + fragmentHeaderSize;
+    const auto size = len - fragmentHeaderSize;
+    const auto charge = size + fragmentOverheadBytes;
+    const auto cap = static_cast<std::size_t>(a.maxBufferSize);
+    if (charge > cap || reservationBytes > cap || (reservationBytes && charge > reservationBytes)) return {};
+    auto it = a.buffers.find(header->messageId);
+    if (it != a.buffers.end()) {
+        auto& buffer = it->second;
+        if (buffer.count != header->count || buffer.reservedBytes != reservationBytes) return {};
+        if (const auto old = buffer.fragments.find(header->index); old != buffer.fragments.end()) {
+            if (old->second.size() != size || !std::equal(old->second.begin(), old->second.end(), payload)) return {};
+            return {true, assembledMessage(buffer)}; // Duplicates neither evict data nor extend idle expiry.
+        }
+        if (reservationBytes && buffer.totalSize + (buffer.fragments.size() + 1) * fragmentOverheadBytes + size > reservationBytes)
+            return {};
+    }
+    const auto additional = reservationBytes ? (it == a.buffers.end() ? reservationBytes : 0) : charge;
+    while (additional > cap - a.currentSize) {
+        if (!expireOldestFragment(a)) return {}; // Backpressure; every remaining assembly is retained.
+    }
+    it = a.buffers.find(header->messageId);
     if (it == a.buffers.end()) {
-        if (a.maxBuffers > 0 && static_cast<int>(a.buffers.size()) >= a.maxBuffers) expireOldestFragment(a);   // bound concurrent messages
-        FragmentBuffer nb;
-        nb.count = hdr->count;
-        nb.lastFragmentAt = now;
-        it = a.buffers.emplace(msgId, std::move(nb)).first;
+        if (a.buffers.size() >= static_cast<std::size_t>(a.maxBuffers) && !expireOldestFragment(a)) return {};
+        FragmentBuffer buffer;
+        buffer.count = header->count;
+        buffer.lastFragmentAt = now;
+        buffer.reservedBytes = reservationBytes;
+        it = a.buffers.emplace(header->messageId, std::move(buffer)).first;
+        a.currentSize += reservationBytes;
     }
-    FragmentBuffer& buf = it->second;
+    auto& buffer = it->second;
+    buffer.fragments.emplace(header->index, Bytes(payload, payload + size));
+    buffer.totalSize += size;
+    buffer.lastFragmentAt = now;
+    if (!reservationBytes) a.currentSize += charge;
+    auto message = assembledMessage(buffer);
+    if (message && !reservationBytes) releaseFragment(a, header->messageId);
+    return {true, std::move(message)};
+}
 
-    // index < count was checked at entry and buf.count == hdr->count (a disagreeing count is rejected
-    // above, and a fresh buffer takes its count from this header), so only the duplicate is left to
-    // rule out -- re-storing an index would double-count its bytes against the cap.
-    if (buf.fragments.find(hdr->index) == buf.fragments.end()) {
-        buf.fragments.emplace(hdr->index, Bytes(fragData, fragData + fragSize));
-        buf.totalSize      += fragSize;
-        a.currentSize      += charge;   // matches fragmentBufferCharge, so the running total cannot drift
-        buf.lastFragmentAt  = now;   // progress: the idle-expiry clock restarts
-    }
-
-    if (buf.count > 0 && buf.fragments.size() == static_cast<std::size_t>(buf.count)) {
-        Bytes out;
-        out.reserve(static_cast<std::size_t>(buf.totalSize));
-        for (const auto& kv : buf.fragments) out.insert(out.end(), kv.second.begin(), kv.second.end());
-        a.currentSize -= fragmentBufferCharge(buf);
-        a.buffers.erase(it);
-        return out;
-    }
-    return std::nullopt;
+// Standalone best-effort reassembly. Transports use acceptFragment's separate acceptance result.
+inline std::optional<Bytes> processFragment(FragmentAssembler& a, const std::uint8_t* data, std::size_t len, MonoTime now) {
+    return acceptFragment(a, data, len, now).message;
 }
 
 } // namespace aether

@@ -18,6 +18,22 @@ MonoTime atSec(double s) { return MonoTime{ static_cast<std::uint64_t>(s * 1.0e9
 } // namespace
 
 int main() {
+    // Only the newcomer receives Paired. The waiting peer's next Register recovers its same role.
+    {
+        aether::RendezvousServer rv;
+        const auto a = aether::addrLocalhost(17001), b = aether::addrLocalhost(17002);
+        const auto request = aether::encodeRegister(42);
+        assert(aether::rendezvousProcess(rv, {{a, request}}, aether::MonoTime{1}).empty());
+        const auto pair = aether::rendezvousProcess(rv, {{b, request}}, aether::MonoTime{2});
+        assert(pair.size() == 2);
+        for (std::uint64_t second = 1; second <= 10; ++second) {
+            const auto retry = aether::rendezvousProcess(rv, {{a, request}}, aether::MonoTime{second * 1000000000});
+            assert(retry.size() == 1 && aether::addrEqual(retry[0].first, a));
+            const auto paired = aether::decodePaired(retry[0].second);
+            assert(paired && paired->first == aether::PunchRole::Accept && aether::addrEqual(paired->second, b));
+            assert(rv.waiting.empty() && rv.sessions.size() == 1);
+        }
+    }
     const Address a = addrV4(0xC0A80005, 5555);
     const Address b = addrV4(0xC0A80006, 6666);
 

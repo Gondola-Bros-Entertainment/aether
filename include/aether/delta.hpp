@@ -74,12 +74,13 @@ template <class T> void packValue(Writer& w, const T& v) {
     else if constexpr (std::is_same_v<T, bool>)     write(w, static_cast<std::uint8_t>(v ? 1 : 0));
     else if constexpr (std::is_floating_point_v<T>) { static_assert(sizeof(T) == 4 || sizeof(T) == 8, "aether: only 32/64-bit floats are serializable"); write(w, v); }   // varint can't help a float
     else {
-        static_assert(std::is_integral_v<T>, "packValue: unsupported type");
+        static_assert(std::is_integral_v<T> && sizeof(T) <= sizeof(std::uint64_t), "packValue: expected an integer of at most 64 bits");
         if constexpr (std::is_signed_v<T>) writeVarU(w, zigzag(static_cast<std::int64_t>(v)));
         else                               writeVarU(w, static_cast<std::uint64_t>(v));
     }
 }
 template <class T> bool unpackValue(Reader& r, T& v) {
+    if (!chargeDecodeWork(r)) return false;
     if constexpr (std::is_enum_v<T>) {
         // A fixed underlying type is what makes the cast below total: the enum can hold every bit
         // pattern of that type, so no wire value is out of range. Reject the other form at compile
@@ -105,9 +106,9 @@ template <class T> bool unpackValue(Reader& r, T& v) {
         return true;
     } else if constexpr (detail::isStdVector<T>) {
         const auto n = readVarU(r);
-        // Count <= remaining bytes bounds the LOOP; charging sizeof(element) bounds the MEMORY, which
-        // the byte count alone does not once one wire byte can materialize an arbitrarily large element.
-        if (!n || *n > r.len - r.pos) return false;
+        // Each element consumes at least one value visit, even when its wire representation is empty.
+        // Check that lower bound before reserving; recursive element decodes charge the actual work.
+        if (!n || *n > r.workBudget) return false;
         if (!chargeAlloc(r, *n, sizeof(typename T::value_type))) return false;
         v.clear();
         v.reserve(detail::decodeReserveCount<typename T::value_type>(*n));   // bounded up-front alloc; grow as elements parse
@@ -142,8 +143,15 @@ template <class T> bool unpackValue(Reader& r, T& v) {
         static_assert(std::is_integral_v<T>, "unpackValue: unsupported type");
         const auto u = readVarU(r);
         if (!u) return false;
-        if constexpr (std::is_signed_v<T>) v = static_cast<T>(unzigzag(*u));
-        else                               v = static_cast<T>(*u);
+        static_assert(sizeof(T) <= sizeof(std::uint64_t), "aether: integers wider than 64 bits are unsupported");
+        if constexpr (std::is_signed_v<T>) {
+            const auto decoded = unzigzag(*u);
+            if (decoded < std::numeric_limits<T>::min() || decoded > std::numeric_limits<T>::max()) return false;
+            v = static_cast<T>(decoded);
+        } else {
+            if (*u > std::numeric_limits<T>::max()) return false;
+            v = static_cast<T>(*u);
+        }
         return true;
     }
 }

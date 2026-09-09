@@ -41,7 +41,17 @@ target_sources(aether PUBLIC
 target_compile_features(aether PUBLIC cxx_std_20)   # exported: consumers get C++20 without setting it themselves
 add_library(aether::aether ALIAS aether)   # same target name in-tree (add_subdirectory) and installed
 
-enable_testing()
+# Development targets stay out of parent builds unless explicitly requested. Respect CTest's
+# BUILD_TESTING switch when supplied, without defining or changing the parent's cache option.
+set(aether_tests_default ${PROJECT_IS_TOP_LEVEL})
+if(DEFINED BUILD_TESTING AND NOT BUILD_TESTING)
+    set(aether_tests_default OFF)
+endif()
+option(AETHER_BUILD_TESTS "Build Aether tests and header checks" ${aether_tests_default})
+option(AETHER_BUILD_BENCHMARKS "Build Aether benchmarks" ${AETHER_BUILD_TESTS})
+
+if(AETHER_BUILD_TESTS)
+    enable_testing()
 
 # --- header self-containment ---
 # Every public header must compile on its own (include what you use). One generated translation
@@ -79,13 +89,19 @@ foreach(t ${AETHER_MODULE_TESTS})
     add_test(NAME ${name} COMMAND ${name})
 endforeach()
 
+endif() # AETHER_BUILD_TESTS
+
+if(AETHER_BUILD_BENCHMARKS)
 # Benchmark: optimized (-O3, or /O2 on MSVC), since unoptimized timings are meaningless. /O2 is
 # skipped in an MSVC Debug config though -- it collides with Debug's /RTC1 (error D8016). CI smoke-
 # runs the bench in Debug (timings do not matter there); a real benchmark run uses a Release config.
 add_executable(aether_bench bench/bench.cpp)
 target_link_libraries(aether_bench PRIVATE aether)
 target_compile_options(aether_bench PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,$<$<NOT:$<CONFIG:Debug>>:/O2>,-O3>)
-add_test(NAME bench COMMAND aether_bench)   # smoke: the bench must actually run (catches a DCE/UB regression)
+if(AETHER_BUILD_TESTS)
+    add_test(NAME bench COMMAND aether_bench) # smoke: catch a DCE/UB regression
+endif()
+endif() # AETHER_BUILD_BENCHMARKS
 
 # Opt-in comparison benchmark: aether vs zpp::bits vs bitsery. Fetches external libs, so it is OFF
 # by default and never touches the library's zero-dependency build:
@@ -109,9 +125,8 @@ if(AETHER_BENCH_COMPARE)
 endif()
 
 # --- examples ---
-# The echo pair: real programs on the public API (run the server, then type at it through the
-# client). Default ON only when aether is the top-level build, same as the install rules, so a
-# parent project pulling aether in does not grow example binaries.
+# The echo pair uses the public API. Default ON only for top-level builds so dependency
+# consumers do not inherit example binaries.
 option(AETHER_EXAMPLES "Build the example programs" ${PROJECT_IS_TOP_LEVEL})
 if(AETHER_EXAMPLES)
     add_executable(aether_echo_server examples/echo_server.cpp)

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cmath>
 #include <deque>
 #include <optional>
 
@@ -55,8 +56,9 @@ template <class T> double snapshotRetentionMs(const SnapshotBuffer<T>& buf) noex
     return buf.playbackDelayMs > 0.0 ? buf.playbackDelayMs * snapshotRetentionFactor : 0.0;
 }
 
-// Push a snapshot with its server timestamp (ms). Out-of-order snapshots are dropped.
+// Push a snapshot with its server timestamp (ms). Non-finite and out-of-order timestamps are dropped.
 template <class T> void pushSnapshot(SnapshotBuffer<T>& buf, double timestamp, const T& state) {
+    if (!std::isfinite(timestamp)) return;
     if (!buf.snapshots.empty() && timestamp <= buf.snapshots.back().timestamp) return;
     buf.snapshots.push_back(TimestampedSnapshot<T>{ timestamp, state });
 
@@ -71,7 +73,7 @@ template <class T> void pushSnapshot(SnapshotBuffer<T>& buf, double timestamp, c
 
 // Sample an interpolated state at renderTime (ms); nullopt if fewer than two snapshots.
 template <class T> std::optional<T> sampleSnapshot(const SnapshotBuffer<T>& buf, double renderTime) {
-    if (buf.snapshots.size() < 2) return std::nullopt;
+    if (buf.snapshots.size() < 2 || !std::isfinite(renderTime) || !std::isfinite(buf.playbackDelayMs)) return std::nullopt;
     const double targetTime = renderTime - buf.playbackDelayMs;
     const auto&  s          = buf.snapshots;
     for (std::size_t i = 0; i + 1 < s.size(); ++i) {

@@ -13,6 +13,20 @@ using namespace aether;
 static constexpr MonoTime atMs(double ms) { return MonoTime{ static_cast<std::uint64_t>(ms * 1.0e6) }; }
 
 int main() {
+    // A fractional packet rate must eventually admit a full datagram without refilling faster
+    // than requested. Bucket capacity and refill rate are different quantities.
+    {
+        auto cc = aether::newCongestionController(.5, .5, .1, 250, 10000);
+        aether::ccRefillBudget(cc, 1200, aether::MonoTime{1});
+        assert(cc.budgetBytes == 1200);
+        aether::ccDeductBudget(cc, 1200);
+        aether::ccRefillBudget(cc, 1200, aether::MonoTime{1000000001});
+        assert(cc.budgetBytes == 600);
+        aether::ccRefillBudget(cc, 1200, aether::MonoTime{2000000001});
+        assert(cc.budgetBytes == 1200);
+        aether::ccUpdate(cc, 1, 1000, aether::MonoTime{2000000002});
+        assert(cc.currentSendRate <= .5);
+    }
     // --- ccUpdate: Good -> Bad multiplicative decrease ---
     // base=100 pkts/s, loss thresh 0.1, rtt thresh 100ms, recovery 2000ms (adaptive=2.0s).
     {
