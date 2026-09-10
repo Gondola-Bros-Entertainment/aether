@@ -97,6 +97,15 @@ constexpr std::uint64_t tickNs = 1000000;   // 1ms
 } // namespace
 
 int main() {
+    // A legacy anonymous salt can begin with the authenticated envelope marker.
+    // Established handshake state, not a random payload byte, selects the decoder.
+    {
+        auto peer = newPeerState(addrLocalhost(9600), aether::test::anonymousConfig<NetworkConfig>(), MonoTime{0});
+        const PeerId remote{addrLocalhost(9601)};
+        handshakeRaw(peer, remote, 0x01020304050607a2ull, {}, MonoTime{tickNs});
+        aether::test::require(peerIsConnected(peer, remote));
+    }
+
     // --- 0. the stateless retry cookie: nothing is allocated for an unproven address ---
     //
     // A ConnectionRequest used to buy a half-open slot and an X25519 keypair from an address that had

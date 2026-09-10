@@ -156,11 +156,15 @@ inline std::vector<PeerEvent> handleConnectionChallenge(NetPeer& peer, const Pee
     return {};
 }
 inline std::vector<PeerEvent> handleConnectionResponse(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
-    if (!pkt.payload.empty() && pkt.payload[0] == authEnvelopeTag)
-        return handleAuthResponse(peer, pid, pkt, now);
     const auto it = peer.pending.find(pid);
+    // The anonymous response begins with a random salt, which can match any tag.
+    // Select the protocol from saved state, including authenticated retransmissions.
+    if (it != peer.pending.end() && it->second.auth)
+        return handleAuthResponse(peer, pid, pkt, now);
+    if (const auto live = peer.connections.find(pid);
+        live != peer.connections.end() && live->second.handshakeReceipt)
+        return handleAuthResponse(peer, pid, pkt, now);
     if (it == peer.pending.end() || it->second.direction != ConnectionDirection::Inbound) return {};
-    if (it->second.auth) return {};
     const auto resp = decodeConnectionResponse(pkt.payload);
     if (!resp) return {};
     // Return-routability gate. A wrong echo is DROPPED silently -- no deny, and crucially the pending
