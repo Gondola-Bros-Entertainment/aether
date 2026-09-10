@@ -63,7 +63,8 @@ inline Bytes authReply(const detail::Digest256& requestId, ByteSpan payload) {
 
 inline std::optional<ByteSpan> decodeAuthReply(ByteSpan body, const detail::Digest256& requestId,
                                               std::size_t payloadSize) {
-    if (body.size() != authReplyPrefixBytes + payloadSize || body[0] != authEnvelopeTag
+    if (body.size() < authReplyPrefixBytes || body.size() - authReplyPrefixBytes != payloadSize
+        || body[0] != authEnvelopeTag
         || !detail::constTimeEq(body.data() + 1, requestId.data(), requestId.size())) return std::nullopt;
     return body.subspan(authReplyPrefixBytes);
 }

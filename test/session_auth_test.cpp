@@ -1,5 +1,6 @@
 #include "check.hpp"
 #include <aether/aether.hpp>
+#include <limits>
 
 using namespace aether;
 using aether::test::require;
@@ -84,6 +85,14 @@ struct Fixture {
 }
 
 int main() try {
+    // Expected lengths can also be caller-derived; overflow must not turn a short
+    // reply into an out-of-bounds request-ID comparison.
+    {
+        Bytes shortReply(authReplyPrefixBytes - 1, 0);
+        shortReply[0] = authEnvelopeTag;
+        require(!decodeAuthReply(shortReply, {}, std::numeric_limits<std::size_t>::max()));
+        require(!decodeAuthReply({}, {}, 0));
+    }
     // Secure defaults, strict credential shapes and scope are visible API errors.
     {
         Fixture f;
