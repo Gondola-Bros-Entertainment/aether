@@ -78,11 +78,11 @@ inline Digest256 sha256Finish(Sha256& hash) noexcept {
     const auto bits = hash.bytes * 8;
     hash.block[hash.used++] = 0x80;
     if (hash.used > 56) {
-        std::fill(hash.block.begin() + static_cast<std::ptrdiff_t>(hash.used), hash.block.end(), 0);
+        std::fill(hash.block.begin() + static_cast<std::ptrdiff_t>(hash.used), hash.block.end(), std::uint8_t{0});
         sha256Block(hash, hash.block.data());
         hash.used = 0;
     }
-    std::fill(hash.block.begin() + static_cast<std::ptrdiff_t>(hash.used), hash.block.begin() + 56, 0);
+    std::fill(hash.block.begin() + static_cast<std::ptrdiff_t>(hash.used), hash.block.begin() + 56, std::uint8_t{0});
     for (std::size_t i = 0; i < 8; ++i) hash.block[63 - i] = static_cast<std::uint8_t>(bits >> (i * 8));
     sha256Block(hash, hash.block.data());
     Digest256 out{};
