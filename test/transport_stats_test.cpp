@@ -51,7 +51,7 @@ int main() {
     // a bad sample. Every payload packet is registered now, with size 0 when it carries no reliable
     // bytes so window accounting is untouched.
     {
-        NetworkConfig cfg;
+        NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         cfg.channelConfigs = { unreliableChannel() };
         cfg.maxChannels    = 1;
 
@@ -89,7 +89,7 @@ int main() {
     // A clean link must still read as clean: the widened signal reports real conditions, it does
     // not manufacture loss.
     {
-        NetworkConfig cfg;
+        NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         cfg.channelConfigs = { unreliableChannel() };
         cfg.maxChannels    = 1;
 
@@ -119,7 +119,7 @@ int main() {
     // figure and one tick could admit many times cwnd (13.4x with a one-MTU window). Reserving the
     // bytes at admission is what makes the check bind.
     {
-        NetworkConfig cfg;
+        NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         cfg.useCwndCongestion = true;
         cfg.channelConfigs    = { reliableOrderedChannel() };
         cfg.maxChannels       = 1;
@@ -175,7 +175,7 @@ int main() {
     // snapshots -- New Reno sat at its initial size through 40% loss. The signal is the lost-packet
     // COUNT, because congestion is a property of the path, not of a delivery mode.
     {
-        NetworkConfig cfg;
+        NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         cfg.useCwndCongestion = true;
         cfg.channelConfigs    = { unreliableChannel() };
         cfg.maxChannels       = 1;
@@ -215,7 +215,7 @@ int main() {
     // judged with the phase already back in avoidance and a phase-based guard halves the window a
     // second time for a single congestion signal (four spread drops reach the cwnd floor).
     {
-        NetworkConfig cfg;
+        NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         cfg.useCwndCongestion = true;
         cfg.channelConfigs    = { unreliableChannel() };
         cfg.maxChannels       = 1;
@@ -265,7 +265,7 @@ int main() {
     // increases INTO the dead path, quality still grades Excellent, and the MTU black-hole rule -- which
     // needs a near-total loss fraction -- can never fire. Unresolved packets are written off by timeout.
     {
-        NetworkConfig cfg;
+        NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         cfg.channelConfigs = { unreliableChannel() };
         cfg.maxChannels    = 1;
 
@@ -308,7 +308,7 @@ int main() {
     // admits it NEVER: it does not retransmit, does not advance its retry count, and so never reaches
     // the retry-limit disposal either -- and breaking out of the pass froze everything queued behind it.
     {
-        NetworkConfig cfg;
+        NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         cfg.sendRate       = 2.0;    // bucket capacity == 2 * mtu == 2400 bytes, well under the message below
         cfg.maxPacketRate  = 8.0;
         cfg.channelConfigs = { reliableOrderedChannel() };
@@ -351,7 +351,7 @@ int main() {
     // the sender waits on (channel data, or an MTU probe whose ack is the discovery signal) earns a
     // prompt ack now; the sequence is still recorded either way, so the ack bitfield stays exact.
     {
-        NetworkConfig cfg;   // defaults: 1000ms keepalive, 1000ms time-sync, 10000ms timeout
+        NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();   // defaults: 1000ms keepalive, 1000ms time-sync, 10000ms timeout
         Pair     p;
         MonoTime now = connectPair(p, cfg, MonoTime{ 0 });
 
@@ -401,7 +401,7 @@ int main() {
     // is what makes the two cases distinguishable: no record ever exists at the sequence such a header
     // names.
     {
-        NetworkConfig cfg;
+        NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         const MonoTime now{ 0 };
 
         Connection c = newConnection(cfg, 1234, now);

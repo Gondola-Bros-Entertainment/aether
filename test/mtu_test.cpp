@@ -1,3 +1,4 @@
+#include "check.hpp"
 // Path-MTU discovery. Unit-tests the pure search (binary, optimistic-first, retry/timeout, re-probe,
 // black-hole collapse), then runs it END TO END: two real peers over a link that silently eats
 // datagrams above 1300 bytes -- exactly what a real path does -- must converge on 1300 exactly, and
@@ -124,7 +125,7 @@ int main() {
     // converge on exactly 1300, message traffic must keep flowing throughout (probe losses are not
     // data losses), and a fragmented message must still chunk at the FLOOR.
     {
-        NetworkConfig cfg;   // mtu 1200, ceiling 1500, discovery on -- the defaults
+        NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();   // mtu 1200, ceiling 1500, discovery on -- the defaults
         cfg.defaultChannelConfig.maxMessageSize = 8192;   // room for the fragmented probe-payload below
         assert(!validateConfig(cfg));
 
@@ -167,7 +168,7 @@ int main() {
 
     // An unrestricted link confirms the full ceiling with the optimistic first probe.
     {
-        NetworkConfig cfg;
+        NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         const Address addrA = addrLocalhost(9611), addrB = addrLocalhost(9612);
         const PeerId  idA{ addrA }, idB{ addrB };
         NetPeer A = newPeerState(addrA, cfg, MonoTime{ 0 });

@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <vector>
 
@@ -37,7 +38,7 @@ inline constexpr double        defaultCongestionRecoveryTimeMs     = 10000.0;
 inline constexpr int           defaultDisconnectRetries            = 3;
 inline constexpr double        defaultDisconnectRetryTimeoutMs     = 500.0;
 inline constexpr int           minMtu                              = 576;
-inline constexpr int           maxMtu                              = 65535;
+inline constexpr int           maxMtu                              = static_cast<int>(maxUdpPayloadSize);
 inline constexpr int           defaultMtuProbeCeiling              = 1500;   // ethernet: what most real paths carry
 inline constexpr int           maxChannelCount                     = 8;
 inline constexpr int           defaultMaxPending                   = 256;
@@ -53,6 +54,7 @@ inline constexpr int packetWireOverhead  = static_cast<int>(packetHeaderBytes) +
 struct NetworkConfig {
     std::uint32_t protocolId                  = defaultProtocolId;
     int           maxClients                  = defaultMaxClients;
+    int           maxResumableSessions        = defaultMaxClients; // 0 disables timeout resumption
     ReceiveBudget receiveBudget{};   // raw intake per hostTick, including malformed datagrams
     double        connectionTimeoutMs         = defaultConnectionTimeoutMs;
     double        keepaliveIntervalMs         = defaultKeepaliveIntervalMs;
@@ -81,6 +83,8 @@ struct NetworkConfig {
     bool          useCwndCongestion           = false;
     bool          enableConnectionMigration   = true;
     std::optional<EncryptionKey> tokenKey;   // server: the connect-token sealing key K; if set, a valid token is required to connect
+    std::uint64_t tokenAudience = 0;        // required with tokenKey; part of the authenticated credential scope
+    bool allowUnauthenticated = false;     // explicit development/P2P opt-in; never a secure-mode fallback
 };
 
 enum class ConfigError {
@@ -104,6 +108,12 @@ enum class ConfigError {
     InvalidChannelConfig,
     MessageTooLargeToFragment,
     InvalidMtuProbeCeiling,
+    InvalidTimeout,
+    InvalidRateLimit,
+    InvalidDisconnectRetries,
+    InvalidTokenScope,
+    InvalidTokenKey,
+    InvalidMaxResumableSessions,
 };
 
 // MTU-derived sizing. effectivePayloadBudget = the channel-message payload that fits one datagram;
@@ -130,21 +140,30 @@ inline long maxFragmentableMessage(const NetworkConfig& c) noexcept {
 // unacked count is advertised as a 16-bit credit, and both need it well inside the sequence space
 // (see maxMessageBufferSize).
 inline bool channelConfigValid(const ChannelConfig& c) noexcept {
-    return c.maxMessageSize > 0 && c.messageBufferSize > 0 && c.messageBufferSize <= maxMessageBufferSize
-        && c.maxOrderedBufferSize > 0 && c.maxReliableRetries >= 0 && c.maxReceiveBufferSize > 0
+    const auto mode = static_cast<int>(c.deliveryMode);
+    return mode >= static_cast<int>(DeliveryMode::Unreliable) && mode <= static_cast<int>(DeliveryMode::ReliableSequenced)
+        && c.maxMessageSize > 0 && c.messageBufferSize > 0 && c.messageBufferSize <= maxMessageBufferSize
+        && c.maxOrderedBufferSize > 0 && c.maxReliableRetries >= 0
+        && c.maxReliableRetries < std::numeric_limits<int>::max() && c.maxReceiveBufferSize > 0
         && std::isfinite(c.orderedBufferTimeout) && c.orderedBufferTimeout >= 0.0;
 }
 
 // Validate a config; nullopt means valid.
 inline std::optional<ConfigError> validateConfig(const NetworkConfig& c) {
-    const auto validPositive = [](double x) { return x > 0.0 && !std::isnan(x); };
+    const auto validPositive = [](double x) { return std::isfinite(x) && x > 0.0; };
     if (!receiveBudgetValid(c.receiveBudget)) return ConfigError::InvalidReceiveBudget;
+    if (c.protocolId == 0 || (c.tokenKey && c.tokenAudience == 0)) return ConfigError::InvalidTokenScope;
+    if (c.tokenKey && !nonzeroKey(*c.tokenKey)) return ConfigError::InvalidTokenKey;
     if (c.maxChannels <= 0 || c.maxChannels > maxChannelCount)        return ConfigError::InvalidChannelCount;
     if (c.mtu < minMtu || c.mtu > maxMtu)                             return ConfigError::InvalidMtu;
     // The probe ceiling brackets the discovery search: at least the floor (== mtu disables the
     // search), never past the largest datagram the transport handles.
     if (c.mtuProbeCeiling < c.mtu || c.mtuProbeCeiling > maxMtu)      return ConfigError::InvalidMtuProbeCeiling;
+    if (!validPositive(c.connectionTimeoutMs) || !validPositive(c.keepaliveIntervalMs)
+        || !validPositive(c.connectionRequestTimeoutMs) || !validPositive(c.disconnectRetryTimeoutMs)
+        || !validPositive(c.congestionRecoveryTimeMs))              return ConfigError::InvalidTimeout;
     if (c.connectionTimeoutMs <= c.keepaliveIntervalMs)              return ConfigError::TimeoutNotGreaterThanKeepalive;
+    if (c.maxResumableSessions < 0) return ConfigError::InvalidMaxResumableSessions;
     if (c.maxClients <= 0)                                            return ConfigError::InvalidMaxClients;
     if (static_cast<int>(c.channelConfigs.size()) > c.maxChannels)    return ConfigError::ChannelConfigsExceedMaxChannels;
     if (!validPositive(c.sendRate))                                   return ConfigError::InvalidSendRate;
@@ -156,8 +175,9 @@ inline std::optional<ConfigError> validateConfig(const NetworkConfig& c) {
     // connection the moment a single datagram reorders.
     if (c.maxSequenceDistance == 0)                                   return ConfigError::InvalidMaxSequenceDistance;
     if (c.sendRate > c.maxPacketRate)                                 return ConfigError::SendRateExceedsMaxPacketRate;
-    if (!std::isfinite(c.congestionGoodRttThreshold)
-        || !std::isfinite(c.congestionBadLossThreshold))              return ConfigError::InvalidCongestionThreshold;
+    if (!std::isfinite(c.congestionGoodRttThreshold) || c.congestionGoodRttThreshold < 0.0
+        || !std::isfinite(c.congestionBadLossThreshold) || c.congestionBadLossThreshold < 0.0
+        || c.congestionBadLossThreshold > 1.0)                       return ConfigError::InvalidCongestionThreshold;
     if (c.maxFragments <= 0)                                          return ConfigError::InvalidMaxFragments;
     // A non-positive reassembly timeout expires every partial message on the tick it arrives (elapsed
     // 0 >= timeout 0), so a fragmented message could never complete.
@@ -166,7 +186,11 @@ inline std::optional<ConfigError> validateConfig(const NetworkConfig& c) {
     if (c.maxPending <= 0)                                            return ConfigError::InvalidMaxPending;
     // retryPendingConnections divides the request timeout by (retries + 1) to pace its retries, so a
     // negative count would invert the interval.
-    if (c.connectionRequestMaxRetries < 0)                            return ConfigError::InvalidConnectionRequestRetries;
+    if (c.connectionRequestMaxRetries < 0
+        || c.connectionRequestMaxRetries == std::numeric_limits<int>::max())
+        return ConfigError::InvalidConnectionRequestRetries;
+    if (c.rateLimitPerSecond <= 0) return ConfigError::InvalidRateLimit;
+    if (c.disconnectRetries < 0) return ConfigError::InvalidDisconnectRetries;
     if (!channelConfigValid(c.defaultChannelConfig))                 return ConfigError::InvalidChannelConfig;
     for (const ChannelConfig& cc : c.channelConfigs)
         if (!channelConfigValid(cc))                                 return ConfigError::InvalidChannelConfig;

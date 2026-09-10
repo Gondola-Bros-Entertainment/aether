@@ -7,7 +7,7 @@ int main() {
     using namespace aether;
     // Valid extreme receive capacity must not overflow credit hysteresis arithmetic.
     {
-        NetworkConfig config;
+        NetworkConfig config = aether::test::anonymousConfig<NetworkConfig>();
         config.defaultChannelConfig.maxReceiveBufferSize = INT_MAX;
         aether::test::require(!validateConfig(config));
         auto connection = newConnection(config, 1, MonoTime{1});
@@ -16,8 +16,8 @@ int main() {
     }
     // Statistics count datagrams within a flush, including every coalesced/control wire.
     {
-        auto statsPeer = newPeerState(addrLocalhost(5000), NetworkConfig{}, MonoTime{1});
-        auto connection = newConnection(NetworkConfig{}, 1, MonoTime{1});
+        auto statsPeer = newPeerState(addrLocalhost(5000), aether::test::anonymousConfig<NetworkConfig>(), MonoTime{1});
+        auto connection = newConnection(aether::test::anonymousConfig<NetworkConfig>(), 1, MonoTime{1});
         markConnected(connection, MonoTime{1});
         connection.sendKey = EncryptionKey{};
         for (int n = 0; n < 5; ++n) enqueueEmptyPacket(connection);
@@ -36,7 +36,7 @@ int main() {
     const auto got = channelReceive(ch);
     aether::test::require((got == std::vector<Bytes>{{'A'}, {'B'}, {'C'}}));
 
-    NetworkConfig cfg; cfg.maxChannels = 1; cfg.defaultChannelConfig.maxReliableRetries = 0;
+    NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>(); cfg.maxChannels = 1; cfg.defaultChannelConfig.maxReliableRetries = 0;
     const PeerId remote{addrLocalhost(2000)};
     auto peer = newPeerState(addrLocalhost(1000), cfg, MonoTime{1});
     auto conn = newConnection(cfg, 1, MonoTime{1});

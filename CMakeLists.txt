@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.23)   # FILE_SET HEADERS (install-interface header sets)
-project(aether VERSION 0.1.0 LANGUAGES CXX)
+project(aether VERSION 0.2.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)   # CMAKE_INSTALL_{INCLUDEDIR,LIBDIR,BINDIR} for the install rules below
 
@@ -129,10 +129,20 @@ endif()
 # consumers do not inherit example binaries.
 option(AETHER_EXAMPLES "Build the example programs" ${PROJECT_IS_TOP_LEVEL})
 if(AETHER_EXAMPLES)
+    add_executable(aether_echo_credentials examples/echo_credentials.cpp)
+    target_link_libraries(aether_echo_credentials PRIVATE aether)
     add_executable(aether_echo_server examples/echo_server.cpp)
     add_executable(aether_echo_client examples/echo_client.cpp)
     target_link_libraries(aether_echo_server PRIVATE aether)
     target_link_libraries(aether_echo_client PRIVATE aether)
+    if(AETHER_BUILD_TESTS)
+        find_package(Python3 COMPONENTS Interpreter QUIET)
+        if(Python3_Interpreter_FOUND)
+            add_test(NAME echo_process COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test/echo_smoke.py
+                $<TARGET_FILE:aether_echo_credentials> $<TARGET_FILE:aether_echo_server> $<TARGET_FILE:aether_echo_client>)
+            set_tests_properties(echo_process PROPERTIES TIMEOUT 60)
+        endif()
+    endif()
 endif()
 
 # --- install / export ---

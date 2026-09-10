@@ -12,4 +12,7 @@ void require(const Condition& condition, std::source_location where = std::sourc
     std::fprintf(stderr, "Check failed at %s:%u (%s)\n", where.file_name(), where.line(), where.function_name());
     std::abort();
 }
+// Existing anonymous transport scenarios opt in without changing production defaults.
+template<class Config>
+Config anonymousConfig() { Config config; config.allowUnauthenticated = true; return config; }
 } // namespace aether::test

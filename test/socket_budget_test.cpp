@@ -21,7 +21,7 @@ int budgetTestRecvFrom(Socket&, std::span<std::uint8_t> buffer, Address& from) {
 
 int main() {
     using namespace aether;
-    NetworkConfig cfg;
+    NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
     aether::test::require(!validateConfig(cfg));
     cfg.receiveBudget.maxDatagrams = 0;
     aether::test::require(validateConfig(cfg) == ConfigError::InvalidReceiveBudget);

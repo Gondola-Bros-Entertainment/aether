@@ -5,11 +5,14 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <netdb.h>
+#include <memory>
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <cerrno>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -23,9 +26,22 @@ namespace aether {
 static_assert(sizeof(sockaddr_storage) <= addrStorageSize, "Address.storage too small");
 
 namespace {
+int addressRuntimeError() { return 0; }
 sockaddr*       sa(Address& a)       { return reinterpret_cast<sockaddr*>(a.storage.data()); }
 const sockaddr* sa(const Address& a) { return reinterpret_cast<const sockaddr*>(a.storage.data()); }
+
+SocketError socketError(int error) {
+    if (error == EAGAIN || error == EWOULDBLOCK) return {SocketErrorCode::WouldBlock, error};
+    if (error == EMSGSIZE) return {SocketErrorCode::MessageTooLarge, error};
+    if (error == EBADF || error == ENOTSOCK) return {SocketErrorCode::Closed, error};
+    return {SocketErrorCode::System, error};
+}
 } // namespace
+
+bool addressValid(const Address& a) noexcept {
+    return (a.len == sizeof(sockaddr_in) && sa(a)->sa_family == AF_INET)
+        || (a.len == sizeof(sockaddr_in6) && sa(a)->sa_family == AF_INET6);
+}
 
 Address addrV4(std::uint32_t ip, std::uint16_t port) {
     Address a{};
@@ -56,17 +72,19 @@ Address addrAny6(std::uint16_t port) {
 }
 
 std::uint16_t addrPort(const Address& a) {
+    if (!addressValid(a)) return 0;
     if (sa(a)->sa_family == AF_INET6)
         return ntohs(reinterpret_cast<const sockaddr_in6*>(a.storage.data())->sin6_port);
     return ntohs(reinterpret_cast<const sockaddr_in*>(a.storage.data())->sin_port);
 }
 
 bool addrEqual(const Address& a, const Address& b) {
-    return a.len == b.len && std::memcmp(a.storage.data(), b.storage.data(), a.len) == 0;
+    return a.len == b.len && std::memcmp(a.storage.data(), b.storage.data(), std::min<std::size_t>(a.len, addrStorageSize)) == 0;
 }
 
 Bytes serializeAddr(const Address& a) {
     Bytes b;
+    if (!addressValid(a)) return b;
     if (sa(a)->sa_family == AF_INET6) {
         const auto* in   = reinterpret_cast<const sockaddr_in6*>(a.storage.data());
         const auto  port = ntohs(in->sin6_port);
@@ -115,6 +133,7 @@ std::optional<Address> deserializeAddr(const std::uint8_t* p, std::size_t n) {
 }
 
 std::optional<Socket> openUdp(const Address& bindAddr) {
+    if (!addressValid(bindAddr)) return std::nullopt;
     const int          family = sa(bindAddr)->sa_family;
     const SocketHandle fd     = ::socket(family, SOCK_DGRAM, 0);
     if (fd == invalidSocket) return std::nullopt;
@@ -141,9 +160,19 @@ Address localAddr(const Socket& s) {
 }
 
 int sendTo(Socket& s, std::span<const std::uint8_t> data, const Address& to) {
+    s.lastSendError = {};
+    if (s.fd == invalidSocket) s.lastSendError = {SocketErrorCode::Closed, 0};
+    else if (!addressValid(to)) s.lastSendError = {SocketErrorCode::InvalidAddress, 0};
+    else if (data.size() > maxUdpPayloadSize) s.lastSendError = {SocketErrorCode::MessageTooLarge, 0};
+    if (s.lastSendError.code != SocketErrorCode::None) { ++s.sendErrors; return -1; }
     ssize_t n;
     do { n = ::sendto(s.fd, data.data(), data.size(), 0, sa(to), to.len); } while (n < 0 && errno == EINTR);
-    if (n < 0) return -1;
+    if (n < 0) {
+        s.lastSendError = socketError(errno);
+        if (s.lastSendError.code == SocketErrorCode::WouldBlock) ++s.sendWouldBlock;
+        else ++s.sendErrors;
+        return -1;
+    }
     s.bytesSent   += static_cast<std::uint64_t>(n);
     s.packetsSent += 1;
     return static_cast<int>(n);
@@ -154,12 +183,22 @@ int sendTo(Socket& s, std::span<const std::uint8_t> data, const Address& to) {
 // loops while n >= 0, so folding the two together ends the tick's drain at the first 0-byte datagram
 // and leaves the rest of the queue sitting in the kernel until the next tick.
 int recvFrom(Socket& s, std::span<std::uint8_t> buf, Address& from) {
+    s.lastReceiveError = {};
     from = Address{};
+    if (s.fd == invalidSocket) {
+        s.lastReceiveError = {SocketErrorCode::Closed, 0};
+        ++s.receiveErrors;
+        return -1;
+    }
     socklen_t len = sizeof(from.storage);
     ssize_t   n;
     do { len = sizeof(from.storage); n = ::recvfrom(s.fd, buf.data(), buf.size(), 0, sa(from), &len); }
     while (n < 0 && errno == EINTR);                          // a signal is not "no data" -- retry
-    if (n < 0) return -1;
+    if (n < 0) {
+        s.lastReceiveError = socketError(errno);
+        if (s.lastReceiveError.code != SocketErrorCode::WouldBlock) ++s.receiveErrors;
+        return -1;
+    }
     from.len      = len;
     s.bytesRecv   += static_cast<std::uint64_t>(n);
     s.packetsRecv += 1;
@@ -182,3 +221,5 @@ void secureRandomBytes(std::uint8_t* out, std::size_t len) {
 }
 
 } // namespace aether
+
+#include "address_resolution.inc"

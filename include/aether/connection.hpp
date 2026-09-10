@@ -7,6 +7,7 @@
 #include "aether/channel.hpp"
 #include "aether/clocksync.hpp"
 #include "aether/config.hpp"
+#include "aether/session_auth.hpp"
 #include "aether/congestion.hpp"
 #include "aether/crypto.hpp"
 #include "aether/fragment.hpp"
@@ -114,7 +115,11 @@ struct Connection {
     int                          disconnectRetries = 0;
     std::optional<EncryptionKey> sendKey;        // our send direction (c2s for the client, s2c for the server)
     std::optional<EncryptionKey> recvKey;        // the peer's send direction
-    std::optional<X25519Key>     resumeMaster;   // ECDH shared secret, cached to re-key a fast reconnect
+    std::optional<X25519Key>     resumeMaster;   // secret for a fresh authenticated resumption handshake
+    bool                         authenticated = false;
+    TokenScope                   authScope{};
+    Bytes                        authenticatedUserData;
+    std::optional<HandshakeReceipt> handshakeReceipt;
     NonceCounter                 sendNonce{};
     ReplayWindow                 recvReplay{};                // 64-bit sliding window (replayWindowBits, crypto.hpp)
     bool                         pendingAck        = false;
@@ -134,6 +139,18 @@ struct Connection {
     bool          pathValidated        = true;   // false until this address proves it RECEIVES
     std::uint64_t unvalidatedRecvBytes = 0;      // bytes accepted from it while unvalidated
     std::uint64_t unvalidatedSentBytes = 0;      // bytes we have sent to it while unvalidated
+
+    Connection() = default;
+    Connection(const Connection&) = default;
+    Connection& operator=(const Connection&) = default;
+    Connection(Connection&&) noexcept = default;
+    Connection& operator=(Connection&&) noexcept = default;
+    ~Connection() {
+        if (sendKey) detail::secureZero(sendKey->data(), sendKey->size());
+        if (recvKey) detail::secureZero(recvKey->data(), recvKey->size());
+        if (resumeMaster) detail::secureZero(resumeMaster->data(), resumeMaster->size());
+        if (config.tokenKey) detail::secureZero(config.tokenKey->data(), config.tokenKey->size());
+    }
 };
 
 // --- construction ---

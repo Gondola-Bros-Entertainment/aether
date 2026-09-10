@@ -4,7 +4,7 @@
 #include <cstdio>
 using namespace aether;
 int main() {
-    NetworkConfig cfg;
+    NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
     cfg.maxChannels = 1;
     cfg.enableMtuDiscovery = false;
     cfg.defaultChannelConfig.maxMessageSize = 4096;
