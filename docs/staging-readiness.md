@@ -1,8 +1,11 @@
-# Staging readiness audit and qualification
+# Aether 0.2 readiness and qualification
 
-Audit baseline: `ad3bd05` (2026-09-09). The 0.2 implementation addresses the findings
-below. This records tested behavior and remaining application work; it is not a
-security certification or a guarantee of production capacity.
+Version 0.2 was merged in [PR #14](https://github.com/Gondola-Bros-Entertainment/aether/pull/14)
+at `33bfe09`. All ten [final PR CI checks](https://github.com/Gondola-Bros-Entertainment/aether/actions/runs/34421035424)
+passed on `0e149cc`; the merged source tree is identical to that tested revision.
+This records tested behavior and remaining application work; it is not a security
+certification or a guarantee of production capacity. The audit baseline was
+`ad3bd05` (2026-09-09).
 
 ## Assessment
 
@@ -12,59 +15,59 @@ intake, congestion/pacing, encrypted packets, migration, field deltas, replicati
 baselines, interpolation, clock sync, interest/priority helpers and deterministic
 network impairment tests. Rendezvous and relay support already exist for P2P.
 
-Keep the split between a testable transport core and platform socket adapters.
-Keep game commands, authority, accounts, persistence and server deployment in
-the application. Extract the new authenticated-handshake machinery into a focused
-module rather than extending the 1,400-line peer header with another cryptographic
-state machine. Preserve the existing data-oriented C++20 API where it remains useful.
+The implementation keeps the testable transport core separate from platform socket
+adapters. Authenticated handshakes, initiation and peer state now have focused
+modules, while the peer loop retains transport processing. The API remains
+data-oriented C++20. Game commands, authority, accounts, persistence and deployment
+belong to the application.
 
 ## Baseline findings addressed by 0.2
 
-1. **Authenticated sessions and scoped credentials.** The baseline X25519
-   exchange has no peer authentication. Bind credentials, application protocol,
-   audience, ephemeral keys and roles to an authenticated transcript, with key
-   confirmation before reporting a connection. Require an explicit opt-in for
-   anonymous development connections. Use an established handshake construction;
-   verify it against independent vectors/implementations, not only self-roundtrips.
-2. **Admission and resumption lifecycle.** A request consumed its token
-   before key proof, and completion did not recheck credential expiry. A captured
-   resume request can spend a session without answering a fresh server challenge.
-   Commit single-use state only after proof, preserve it on rejected attempts,
-   make retransmission idempotent, and test restart/expiry/fallback behavior.
-   Ignore unauthenticated terminal control messages: a forged plaintext denial
-   cancelled a pending connect, and a plaintext acceptance can report a
-   connection after an untrusted challenge.
-3. **Configuration invariants.** Baseline validation accepted NaN connection
-   timeouts, negative handshake timeouts, infinite send rates, a zero request
-   budget, and `INT_MAX` handshake retries (whose `+ 1` later overflows). Review
-   all public rate/timer/retry/MTU inputs and reject values that cannot be honored.
-4. **Observable socket and queue failures.** Baseline `hostTick` discarded send failures and
-   treats hard receive errors like an empty socket. Broadcast discarded each peer's
-   queue-rejection result. Expose bounded, actionable results and counters without
-   changing a queued-send acknowledgement into a promise of remote delivery.
-5. **Host integration.** Add address resolution/formatting for hostname and IP
-   endpoints, with resolution outside the tick loop. Provide host-level reconnect
-   and shutdown paths using the same routing/error handling as normal sends.
-   Make connection queries reflect their stated lifecycle state.
-6. **Qualification and examples.** Exercise the secure public API using real UDP
-   sockets and repeatable loss, delay, duplication and reordering. Cover mixed
-   client/server protocol versions, credential scopes and retransmitted handshake
-   messages. Update examples, installed-consumer checks, wire/API migration notes
-   and CI, including native Linux ARM64. Record tested load profiles rather than
-   inventing a player-capacity guarantee.
+1. **Authenticated sessions and scoped credentials.** The baseline X25519 exchange
+   lacked peer authentication. Noise now binds credentials, protocol, audience,
+   ephemeral keys and roles to the transcript, with confirmation before admission.
+   Anonymous development connections require explicit opt-in. Independent vectors
+   verify the concrete Noise construction.
+2. **Admission and resumption lifecycle.** The baseline spent single-use state
+   before fresh proof and did not recheck credential expiry at completion. Both
+   checks now precede admission. Resumption derives new traffic keys and a new
+   master; retransmissions are idempotent. Forged plaintext terminal messages
+   cannot advance or cancel authenticated handshakes. Restart, expiry, replay
+   races and fallback have regression coverage.
+3. **Configuration invariants.** Validation rejects non-finite or invalid
+   rates/timers, invalid retry counts, missing credential scope and unsupported
+   MTUs. The timeout resume cache is bounded and can be disabled.
+4. **Observable socket and queue failures.** Hosts expose bounded socket and
+   per-peer broadcast failure records alongside cumulative counters. Successful
+   enqueueing still does not imply remote delivery.
+5. **Host integration.** Hostname/IP resolution and numeric formatting are
+   available outside the tick loop. Reconnect and shutdown use normal transport
+   routing and error reporting. Connection queries exclude disconnecting peers.
+6. **Qualification and examples.** Authenticated examples and installed consumers
+   exercise the public API. Tests cover real UDP, incompatible wire versions,
+   credential scopes, loss, delay, duplication, reordering and retransmission.
+   Native Linux ARM64 CI and a bounded load profile qualify the transport for
+   application integration without claiming a player-capacity guarantee.
 
-## Audit evidence
+## Historical baseline evidence
 
-- Current `main` matches `origin/main`; no open GitHub issues were returned.
-- Fresh Debug build with warnings as errors, standalone headers and ODR checks
+- At the audit baseline, `main` matched `origin/main`; no open GitHub issues were returned.
+- A fresh Debug build with warnings as errors, standalone headers and ODR checks
   passed on macOS ARM64. All 27 CTest targets passed: 26 in the sandbox, with the
   real-socket roundtrip rerun successfully outside the socket-restricting sandbox.
 - Local probes reproduced each configuration acceptance listed above, forged
   denial/acceptance behavior, token consumption before connection, and admission
-  after expiry during an in-flight handshake. Probe source is under ignored
-  `build/readiness_probe.cpp`; permanent regression tests belong with the fixes.
-- The existing nine-job hosted CI pass qualifies the previous repair, not the
-  forthcoming authentication implementation.
+  after expiry during an in-flight handshake. Permanent regressions now cover
+  these findings in the configuration and authenticated-session tests.
+- The nine-job hosted CI pass at that baseline qualified the previous repair.
+  The ten-job 0.2 run linked above qualifies the authentication implementation.
+
+## Hosted qualification
+
+All 36 tests passed in Linux ASan/UBSan and each of the five platform builds:
+Linux GCC, Linux Clang, native Linux ARM64 GCC, macOS Clang and Windows MSVC.
+cppcheck passed, as did Release installation and an external `find_package`
+consumer on Linux, macOS and Windows. CI retains the exact source revision and logs.
 
 ## Local qualification (macOS ARM64, AppleClang 21)
 
@@ -88,15 +91,14 @@ state machine. Preserve the existing data-oriented C++20 API where it remains us
   128 reliable 32-byte request/reply messages and checked a bounded eight-entry timeout
   cache. That Debug run took about 1.5 seconds of wall time during local qualification.
   This is a reproducible profile, not a concurrency/latency service-level guarantee.
-- Hosted CI adds native `ubuntu-24.04-arm` alongside GCC, Clang, MSVC, sanitizers and
-  installed consumers. Hosted results belong to the pull request's exact commit.
 
 No Orivella game server or OCI listener is deployed by these library tests.
 
 ## Completion boundary
 
-The intended result is a reviewed transport release ready for Orivella's
-authoritative-server integration and first authenticated OCI staging playtest.
+The 0.2 transport milestone is complete and ready for Orivella's authoritative-server
+integration. The game's server, session issuance and Linux build still require
+their own verification before the first authenticated OCI staging playtest.
 Application schemas, input prediction/reconciliation, game persistence, identity
 providers, matchmaking and fleet orchestration remain application/service work.
 Future defects and measured performance needs can still justify library changes.

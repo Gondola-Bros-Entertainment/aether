@@ -73,7 +73,7 @@ struct PendingConnection {
     X25519Key                    ephemeralPub{};          // our ephemeral X25519 public key
     X25519Key                    peerEphemeralPub{};      // client: the challenge key sessionShared was derived from
     std::optional<X25519Key>     sessionShared;           // ECDH shared secret (client side; keyed at Accepted)
-    bool                         isReconnect   = false;   // this pending is a token reconnect, not a fresh handshake
+    bool                         isReconnect   = false;   // resumes a cached session through a fresh handshake
     bool                         ephemeralReady = false;  // our keypair exists (server: with the pending; client: at the committed challenge)
     bool                         localInitiated = false;  // this side called peerConnect, whatever role it ended up in
     int                          challengeKeyAttempts = 0;    // client: challenges keyed from; bounded separately from retryCount
@@ -344,14 +344,14 @@ struct PendingPathValidation {
 inline constexpr double migrationCooldownMs       = 5000.0;
 inline constexpr double resumeGraceMs             = 30000.0;   // window a dropped session token can reconnect in
 
-// A recently-dropped session kept briefly for a fast reconnect: when it dropped, plus the key it
-// negotiated -- restored on reconnect so a resumed session stays encrypted, not downgraded to plaintext.
+// A recently-dropped session kept briefly for resumption: its expiry basis, identity and master.
+// The master authenticates a fresh Noise exchange that derives new traffic keys and a new master.
 // The table is keyed by clientSalt, which comes off the wire, so two live sessions can carry the same
 // one; `owner` is what tells them apart, so the second to drop cannot overwrite the first's master and
-// leave the real holder's correctly-MAC'd resume being rejected.
+// prevent the real holder from proving possession during resumption.
 struct ResumableSession {
     MonoTime                 at{};
-    std::optional<X25519Key> master;     // ECDH shared secret, to re-key a resumed session with a fresh salt
+    std::optional<X25519Key> master;     // PSK for a fresh Noise resumption exchange
     std::uint64_t            playerId{}; // the connect-token identity the original handshake verified
     PeerId                   owner{};    // the connection this entry was armed from
     bool                     authenticated = false;

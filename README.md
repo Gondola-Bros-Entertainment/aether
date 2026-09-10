@@ -21,7 +21,8 @@ Packet format version 2 retains the 17-byte header and changes the handshake and
 credential formats. Upgrade both endpoints and reissue credentials together; there
 is no downgrade negotiation. This is an implementation milestone, not an independent
 security certification. See [authentication](docs/authentication.md), the
-[behavior reference](docs/behavior.md), and [migration notes](docs/migration-0.2.md).
+[behavior reference](docs/behavior.md), [migration notes](docs/migration-0.2.md),
+and the [0.2 qualification record](docs/staging-readiness.md).
 
 ## Build and test
 
@@ -33,8 +34,9 @@ cmake --build build --config Debug
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-CI uses cppcheck 2.21.0, ASan/UBSan, compiler tests with GCC, Clang, and MSVC, and an installed-package
-consumer on Linux, macOS, and Windows, including native Linux ARM64 transport tests. Keep test builds in Debug: some existing tests use
+CI uses cppcheck 2.21.0, ASan/UBSan, and compiler tests with GCC, Clang, and MSVC,
+including native Linux ARM64 transport tests. Installed-package consumers run on
+Linux, macOS, and Windows. Keep test builds in Debug: some existing tests use
 `assert`, which Release builds disable.
 
 The [credential issuer](examples/echo_credentials.cpp), [echo server](examples/echo_server.cpp)
@@ -81,7 +83,7 @@ benchmarks, examples, and install rules are off by default in an `add_subdirecto
 | --- | --- | --- |
 | `AETHER_BUILD_TESTS` | On, unless `BUILD_TESTING=OFF` | Tests and header/ODR checks |
 | `AETHER_BUILD_BENCHMARKS` | Value of `AETHER_BUILD_TESTS` | Local benchmark |
-| `AETHER_EXAMPLES` | On | Echo client and server |
+| `AETHER_EXAMPLES` | On | Credential issuer, echo client and server |
 | `AETHER_INSTALL` | On | Package installation and export rules |
 | `AETHER_WERROR` | Off | Treat compiler warnings as errors |
 | `AETHER_BENCH_COMPARE` | Off | Comparison benchmark; downloads zpp::bits and bitsery |

@@ -643,11 +643,11 @@ inline std::vector<PeerEvent> updateConnections(NetPeer& peer, MonoTime now) {
             }
         }
         if (updateTick(conn, now)) {
-            // Arm the resumable (token + shared secret + identity, to restore on reconnect) unless this
-            // token is already held by a DIFFERENT live session: the clientSalt keying it is
+            // Cache the session handle, master and identity unless this
+            // handle is already held by a DIFFERENT cached session: the clientSalt keying it is
             // wire-supplied, so a collision is the peer's to cause, and overwriting would replace the
             // other session's master with this one's -- leaving the peer that actually holds that master
-            // unable to resume even with a correct MAC. First writer keeps the entry until it expires.
+            // unable to prove possession. First writer keeps the entry until it expires.
             const auto rit = peer.resumableTokens.find(conn.clientSalt);
             if (conn.resumeMaster && peer.config.maxResumableSessions > 0
                 && (rit != peer.resumableTokens.end()
@@ -795,13 +795,13 @@ inline bool peerIsConnected(const NetPeer& peer, const PeerId& pid) {
     return found != peer.connections.end() && found->second.state == ConnectionState::Connected;
 }
 // The session token (clientSalt) for a live connection. Capture it while connected; pass it to
-// peerReconnect after a drop to re-establish fast.
+// peerReconnect after a timeout to attempt fresh authenticated resumption.
 inline std::optional<std::uint64_t> peerSessionToken(const NetPeer& peer, const PeerId& pid) {
     const auto it = peer.connections.find(pid);
     return it == peer.connections.end() ? std::nullopt : std::optional<std::uint64_t>(it->second.clientSalt);
 }
-// The connect-token identity this connection authenticated (0 when auth is off). Survives a fast
-// reconnect, so a server can attribute a resumed session without having cached the Connected event.
+// The connect-token identity this connection authenticated (0 when auth is off). Survives resumption,
+// so a server can attribute a resumed session without having cached the Connected event.
 inline std::optional<std::uint64_t> peerPlayerId(const NetPeer& peer, const PeerId& pid) {
     const auto it = peer.connections.find(pid);
     return it == peer.connections.end() ? std::nullopt : std::optional<std::uint64_t>(it->second.playerId);
