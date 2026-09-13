@@ -43,8 +43,14 @@ std::optional<std::string> addressToString(const Address& address) {
     const int error = getnameinfo(sa(address), static_cast<int>(address.len), host,
         static_cast<std::uint32_t>(sizeof host), nullptr, 0, NI_NUMERICHOST);
     if (error != 0) return std::nullopt;
-    const auto port = std::to_string(addrPort(address));
-    return sa(address)->sa_family == AF_INET6 ? "[" + std::string(host) + "]:" + port : std::string(host) + ":" + port;
+    const bool ipv6 = sa(address)->sa_family == AF_INET6;
+    std::string result;
+    if (ipv6) result.push_back('[');
+    result.append(host);
+    if (ipv6) result.push_back(']');
+    result.push_back(':');
+    result.append(std::to_string(addrPort(address)));
+    return result;
 }
 
 } // namespace aether
