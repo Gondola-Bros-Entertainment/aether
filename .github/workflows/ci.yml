@@ -128,7 +128,7 @@ jobs:
       # Existing tests still use assert(), so run them in Debug to keep those checks active.
       # AETHER_WERROR enables /WX, matching the GCC and Clang jobs.
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DAETHER_WERROR=ON
+        run: cmake -B build -DAETHER_WERROR=ON
       - name: Build
         run: cmake --build build --config Debug --parallel 2
       - name: Test
@@ -138,7 +138,7 @@ jobs:
   # Match Release configurations for both single- and multi-config generators.
   package:
     name: package / ${{ matrix.os }}
-    needs: [build-test, windows]
+    needs: [build-test, windows, optimized-gcc12]
     strategy:
       fail-fast: false
       matrix:
@@ -150,13 +150,13 @@ jobs:
         with:
           persist-credentials: false
       - name: Configure aether
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DAETHER_WERROR=ON -DAETHER_BUILD_TESTS=OFF -DAETHER_BUILD_BENCHMARKS=OFF -DAETHER_EXAMPLES=OFF
+        run: cmake -B build ${{ runner.os != 'Windows' && '-DCMAKE_BUILD_TYPE=Release' || '' }} -DAETHER_WERROR=ON -DAETHER_BUILD_TESTS=OFF -DAETHER_BUILD_BENCHMARKS=OFF -DAETHER_EXAMPLES=OFF
       - name: Build aether
         run: cmake --build build --target aether --config Release --parallel 2
       - name: Install aether
         run: cmake --install build --prefix "${{ runner.temp }}/aether-prefix" --config Release
       - name: Configure consumer against the installed package
-        run: cmake -S test/package -B test/package/build -DCMAKE_PREFIX_PATH="${{ runner.temp }}/aether-prefix" -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S test/package -B test/package/build -DCMAKE_PREFIX_PATH="${{ runner.temp }}/aether-prefix" ${{ runner.os != 'Windows' && '-DCMAKE_BUILD_TYPE=Release' || '' }}
       - name: Build consumer
         run: cmake --build test/package/build --config Release --parallel 2
       - name: Run installed consumer
