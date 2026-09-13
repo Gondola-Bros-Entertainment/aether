@@ -154,7 +154,10 @@ inline void poly1305Init(Poly1305State& st, const std::uint8_t key[32]) noexcept
     st.r[3] = (std::uint64_t(t2) >> 14 | std::uint64_t(t3) << 18) & 0x3ffffff;
     st.r[4] = (std::uint64_t(t3) >> 8)                            & 0x3ffffff;
     for (int i = 0; i < 5; ++i)  st.h[i] = 0;
-    for (int i = 0; i < 16; ++i) st.s[i] = key[16 + i];
+    for (int i = 0; i < 16; ++i) {
+        st.s[i] = key[16 + i];
+        st.block[i] = 0;
+    }
     st.blockLen = 0;
 }
 
