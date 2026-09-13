@@ -303,17 +303,25 @@ void testAssemblyCountLimit() {
 }
 
 void testAssemblyByteLimit() {
-    aether::FragmentAssembler a = aether::newFragmentAssembler(5000.0, 100, 256);   // 100-byte cap
-    std::vector<std::uint8_t> big(static_cast<std::size_t>(aether::fragmentHeaderSize) + 200);   // one fragment > cap
+    constexpr std::size_t payloadSize = 40;
+    constexpr std::size_t fragmentCharge = payloadSize + aether::fragmentOverheadBytes;
+    constexpr std::size_t byteLimit = 2 * fragmentCharge;
+    aether::FragmentAssembler a = aether::newFragmentAssembler(5000.0, static_cast<int>(byteLimit), 256);
+    std::vector<std::uint8_t> big(aether::fragmentHeaderSize + byteLimit + 1);
     aether::writeFragmentHeader(big.data(), aether::FragmentHeader{ aether::MessageId{ 1 }, 0, 2 });
     const auto rej = aether::processFragment(a, big.data(), big.size(), aether::MonoTime{ 0 });
     assert(!rej && a.currentSize == 0 && a.buffers.empty());   // oversized fragment rejected, nothing buffered
     for (std::uint32_t id = 1; id <= 50; ++id) {               // flood smaller never-completing fragments
-        std::uint8_t f[aether::fragmentHeaderSize + 40];
+        std::uint8_t f[aether::fragmentHeaderSize + payloadSize]{};
         aether::writeFragmentHeader(f, aether::FragmentHeader{ static_cast<aether::MessageId>(id), 0, 2 });
-        aether::processFragment(a, f, sizeof f, aether::MonoTime{ 0 });
+        const auto receipt = aether::acceptFragment(a, f, sizeof f, aether::MonoTime{ id });
+        assert(receipt.accepted && !receipt.message);
+        assert(a.buffers.count(aether::MessageId{ id }) == 1);
+        assert(a.currentSize == (id == 1 ? fragmentCharge : byteLimit));
+        assert(a.buffers.size() == (id == 1 ? 1u : 2u));
+        if (id > 2) assert(a.buffers.count(aether::MessageId{ id - 2 }) == 0);
     }
-    assert(a.currentSize <= 100);   // buffered total stays within the cap (was overshootable by a whole fragment)
+    assert(a.currentSize == byteLimit);
     std::printf("aether fragment-bytecap OK: oversized rejected, buffered total <= cap (%zu bytes)\n", a.currentSize);
 }
 
