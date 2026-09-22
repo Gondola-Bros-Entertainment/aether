@@ -1,4 +1,4 @@
-# Aether 0.2 readiness and qualification
+# Aether 0.2 historical qualification
 
 Version 0.2 was merged in [PR #14](https://github.com/Gondola-Bros-Entertainment/aether/pull/14)
 at `33bfe09`. All ten [final PR CI checks](https://github.com/Gondola-Bros-Entertainment/aether/actions/runs/34421035424)
@@ -96,9 +96,9 @@ No Orivella game server or OCI listener is deployed by these library tests.
 
 ## Completion boundary
 
-The 0.2 transport milestone is complete and ready for Orivella's authoritative-server
-integration. The game's server, session issuance and Linux build still require
-their own verification before the first authenticated OCI staging playtest.
+This record qualifies the 0.2 transport milestone at the revisions above. It does
+not track the current status of consuming applications; Orivella maintains its
+server integration and deployment guidance in its own repository.
 Application schemas, input prediction/reconciliation, game persistence, identity
 providers, matchmaking and fleet orchestration remain application/service work.
 Future defects and measured performance needs can still justify library changes.

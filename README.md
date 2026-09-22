@@ -22,7 +22,7 @@ credential formats. Upgrade both endpoints and reissue credentials together; the
 is no downgrade negotiation. This is an implementation milestone, not an independent
 security certification. See [authentication](docs/authentication.md), the
 [behavior reference](docs/behavior.md), [migration notes](docs/migration-0.2.md),
-and the [0.2 qualification record](docs/staging-readiness.md).
+and the [historical 0.2 qualification record](docs/staging-readiness.md).
 
 ## Build and test
 
