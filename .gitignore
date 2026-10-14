@@ -7,10 +7,3 @@ compile_commands.json
 
 # OS
 .DS_Store
-
-# local working docs (not published)
-CLAUDE.md
-# .claude is private by default; only shared project tooling is allowed through
-.claude/*
-!.claude/settings.json
-!.claude/skills/
