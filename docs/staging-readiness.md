@@ -9,8 +9,8 @@ certification or a guarantee of production capacity. The audit baseline was
 
 ## Assessment
 
-The library has the transport features needed for Orivella's first dedicated
-server: reliable/unreliable channels, fragmentation, flow control, bounded socket
+The library has the transport features a first dedicated game server needs:
+reliable/unreliable channels, fragmentation, flow control, bounded socket
 intake, congestion/pacing, encrypted packets, migration, field deltas, replication
 baselines, interpolation, clock sync, interest/priority helpers and deterministic
 network impairment tests. Rendezvous and relay support already exist for P2P.
@@ -92,13 +92,13 @@ consumer on Linux, macOS and Windows. CI retains the exact source revision and l
   cache. That Debug run took about 1.5 seconds of wall time during local qualification.
   This is a reproducible profile, not a concurrency/latency service-level guarantee.
 
-No Orivella game server or OCI listener is deployed by these library tests.
+These library tests deploy no game server or listener.
 
 ## Completion boundary
 
 This record qualifies the 0.2 transport milestone at the revisions above. It does
-not track the current status of consuming applications; Orivella maintains its
-server integration and deployment guidance in its own repository.
+not track the current status of consuming applications, which keep their own
+server integration and deployment guidance.
 Application schemas, input prediction/reconciliation, game persistence, identity
 providers, matchmaking and fleet orchestration remain application/service work.
 Future defects and measured performance needs can still justify library changes.
