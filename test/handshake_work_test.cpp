@@ -3,7 +3,6 @@
 #define secureRandomBytes handshakeTestRandomBytes
 #include "aether/peer.hpp"
 #undef secureRandomBytes
-#include <cassert>
 #include <cstdio>
 namespace aether {
 void secureRandomBytes(std::uint8_t*, std::size_t);

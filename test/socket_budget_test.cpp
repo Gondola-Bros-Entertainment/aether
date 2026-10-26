@@ -3,7 +3,6 @@
 #define recvFrom budgetTestRecvFrom
 #include "aether/net.hpp"
 #undef recvFrom
-#include <cassert>
 #include <cstring>
 #include <cstdio>
 

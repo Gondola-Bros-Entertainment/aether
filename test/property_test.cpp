@@ -1,12 +1,14 @@
+#include "check.hpp"
 // aether - property tests: the reflective serializer must roundtrip arbitrary values, not just the
 // one happy-path struct. Random structs through serialize/deserialize (floats compared bit-exactly,
 // so NaN / inf / denormals all count) and through deltaPack/deltaUnpack. Deterministic (seeded PRNG).
 #include <aether/aether.hpp>
 
-#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+
+using aether::test::require;
 
 namespace {
 
@@ -56,7 +58,7 @@ int main() {
         aether::serialize(w, a);
         aether::Reader r{ buf, w.pos, 0 };
         const auto back = aether::deserialize<Probe>(r);
-        assert(back && probeEqual(*back, a));
+        require(back && probeEqual(*back, a));
     }
 
     // delta: deltaPack(prev, cur) then deltaUnpack(prev) reconstructs cur, for arbitrary prev/cur
@@ -69,7 +71,7 @@ int main() {
         aether::deltaPack(dw, p, q);
         aether::Reader dr{ buf, dw.pos, 0 };
         const auto back = aether::deltaUnpack(dr, p);
-        assert(back && intProbeEqual(*back, q));
+        require(back && intProbeEqual(*back, q));
     }
 
     // Adaptive changemask: random change COUNTS sweep both encodings (sparse for few changes, the
@@ -87,7 +89,7 @@ int main() {
         aether::deltaPack(dw, p, q);
         aether::Reader dr{ buf, dw.pos, 0 };
         const auto back = aether::deltaUnpack(dr, p);
-        assert(back && std::memcmp(&*back, &q, sizeof(WideProbe)) == 0);
+        require(back && std::memcmp(&*back, &q, sizeof(WideProbe)) == 0);
     }
 
     std::printf("aether property OK: 100k serialize roundtrips (floats bit-exact) + 100k delta roundtrips "

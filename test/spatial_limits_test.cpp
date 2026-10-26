@@ -2,7 +2,6 @@
 #include "aether/interest.hpp"
 #include "aether/interpolation.hpp"
 
-#include <cassert>
 #include <cmath>
 #include <limits>
 

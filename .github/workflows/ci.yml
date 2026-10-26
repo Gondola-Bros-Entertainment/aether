@@ -109,8 +109,8 @@ jobs:
           persist-credentials: false
       - name: Install GCC 12
         run: sudo apt-get update && sudo apt-get install -y g++-12
-      - name: Configure optimized checks with assertions active
-        run: cmake -B build -DCMAKE_CXX_COMPILER=g++-12 -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE=-O3 -DAETHER_WERROR=ON
+      - name: Configure
+        run: cmake -B build -DCMAKE_CXX_COMPILER=g++-12 -DCMAKE_BUILD_TYPE=Release -DAETHER_WERROR=ON
       - name: Build
         run: cmake --build build --parallel 2
       - name: Test
@@ -130,8 +130,8 @@ jobs:
           persist-credentials: false
       - name: Install CMake and Python
         run: apt-get update && apt-get install -y --no-install-recommends cmake python3
-      - name: Configure optimized checks with assertions active
-        run: cmake -B build -DCMAKE_CXX_COMPILER=g++ -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE=-O3 -DAETHER_WERROR=ON
+      - name: Configure
+        run: cmake -B build -DCMAKE_CXX_COMPILER=g++ -DCMAKE_BUILD_TYPE=Release -DAETHER_WERROR=ON
       - name: Build
         run: cmake --build build --parallel 2
       - name: Test
@@ -146,7 +146,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Some tests use assert(), so run them in Debug to keep those checks active.
       # AETHER_WERROR enables /WX, matching the GCC and Clang jobs.
       - name: Configure
         run: cmake -B build -DAETHER_WERROR=ON

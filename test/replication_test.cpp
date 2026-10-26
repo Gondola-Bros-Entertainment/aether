@@ -1,12 +1,11 @@
+#include "check.hpp"
 // aether - snapshot replication test. Pins deltaOnAck under lost / out-of-order / stale / repeated
 // acks (the in-order path is covered in roundtrip.cpp), the ring and staleness bounds that keep the
 // two sides able to recover from an evicted baseline, what fieldEqual counts as a change inside a
 // container, and the client-side snapshot buffer that the same snapshots feed.
-// Standalone: assert() is the check, so build WITHOUT NDEBUG (no -O2 -DNDEBUG).
 #include "aether/interpolation.hpp"
 #include "aether/replication.hpp"
 
-#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -14,6 +13,8 @@
 #include <optional>
 #include <string>
 #include <vector>
+
+using aether::test::require;
 
 namespace {
 
@@ -36,13 +37,13 @@ int main() {
         (void)deltaEncode(tr, BaselineSeq{ 0 }, s0);
         (void)deltaEncode(tr, BaselineSeq{ 1 }, s1);
         (void)deltaEncode(tr, BaselineSeq{ 2 }, s2);
-        assert(tr.pending.size() == 3 && !tr.confirmed);   // nothing acked yet
+        require(tr.pending.size() == 3 && !tr.confirmed);   // nothing acked yet
 
         deltaOnAck(tr, BaselineSeq{ 2 });   // ack the newest, skipping 0 and 1
         const auto conf = deltaConfirmedSeq(tr);
-        assert(conf && *conf == BaselineSeq{ 2 });                         // baseline jumped to the newest acked seq
-        assert(tr.pending.empty());                         // 0 and 1 dropped; nothing is newer than 2
-        assert(tr.confirmed->second.x == 2);               // confirmed holds the acked snapshot
+        require(conf && *conf == BaselineSeq{ 2 });                        // baseline jumped to the newest acked seq
+        require(tr.pending.empty());                        // 0 and 1 dropped; nothing is newer than 2
+        require(tr.confirmed->second.x == 2);              // confirmed holds the acked snapshot
     }
 
     // --- out-of-order then NEW encode uses the right baseline + a stale ack is a no-op ---
@@ -59,7 +60,7 @@ int main() {
         // seq 0: full snapshot. Receiver decodes + stores it as a baseline.
         const auto enc0 = deltaEncode(tr, BaselineSeq{ 0 }, s0);
         const auto dec0 = deltaDecode(bm, enc0);
-        assert(dec0 && dec0->x == 0);
+        require(dec0 && dec0->x == 0);
         pushBaseline(bm, BaselineSeq{ 0 }, *dec0, MonoTime{ 0 });
 
         // seqs 1 and 2 encoded before any further ack -> pending = {0,1,2}.
@@ -69,7 +70,7 @@ int main() {
         // Ack the MIDDLE seq 1: confirmed -> 1, pending keeps only {2}.
         deltaOnAck(tr, BaselineSeq{ 1 });
         auto conf = deltaConfirmedSeq(tr);
-        assert(conf && *conf == BaselineSeq{ 1 } && tr.pending.size() == 1 && tr.pending.front().first == BaselineSeq{ 2 });
+        require(conf && *conf == BaselineSeq{ 1 } && tr.pending.size() == 1 && tr.pending.front().first == BaselineSeq{ 2 });
 
         // Receiver must have seq 1 as a baseline for the next delta to resolve against it.
         const Ent s1recv{ 100, 1 };
@@ -78,15 +79,15 @@ int main() {
         // STALE ack for seq 0 -- already dropped from pending -> a no-op, confirmed must NOT regress.
         deltaOnAck(tr, BaselineSeq{ 0 });
         conf = deltaConfirmedSeq(tr);
-        assert(conf && *conf == BaselineSeq{ 1 });                         // still 1, not regressed to 0
-        assert(tr.pending.size() == 1 && tr.pending.front().first == BaselineSeq{ 2 });   // pending untouched
+        require(conf && *conf == BaselineSeq{ 1 });                        // still 1, not regressed to 0
+        require(tr.pending.size() == 1 && tr.pending.front().first == BaselineSeq{ 2 });   // pending untouched
 
         // A new snapshot now deltas against baseline seq 1 and still round-trips on the receiver.
         const Ent s3{ 100, 3 };
         const auto enc3 = deltaEncode(tr, BaselineSeq{ 3 }, s3);
         const auto dec3 = deltaDecode(bm, enc3);
-        assert(dec3 && dec3->hp == 100 && dec3->x == 3);
-        assert(enc3.size() < enc0.size());                 // delta beats the full snapshot
+        require(dec3 && dec3->hp == 100 && dec3->x == 3);
+        require(enc3.size() < enc0.size());                // delta beats the full snapshot
     }
 
     // --- lost ack: the ack for a snapshot never arrives ---
@@ -99,26 +100,26 @@ int main() {
 
         const auto enc0 = deltaEncode(tr, BaselineSeq{ 0 }, s0);
         const auto dec0 = deltaDecode(bm, enc0);
-        assert(dec0 && dec0->x == 0);
+        require(dec0 && dec0->x == 0);
         pushBaseline(bm, BaselineSeq{ 0 }, *dec0, MonoTime{ 0 });
         deltaOnAck(tr, BaselineSeq{ 0 });
-        assert(deltaConfirmedSeq(tr) && *deltaConfirmedSeq(tr) == BaselineSeq{ 0 });   // baseline at seq 0
+        require(deltaConfirmedSeq(tr) && *deltaConfirmedSeq(tr) == BaselineSeq{ 0 });   // baseline at seq 0
 
         // seq 1 sent but its ack is LOST: we never call deltaOnAck(tr, BaselineSeq{ 1 }).
         const Ent s1{ 100, 1 };
         const auto enc1 = deltaEncode(tr, BaselineSeq{ 1 }, s1);
         const auto dec1 = deltaDecode(bm, enc1);
-        assert(dec1 && dec1->x == 1);
+        require(dec1 && dec1->x == 1);
         const auto confAfterLoss = deltaConfirmedSeq(tr);
-        assert(confAfterLoss && *confAfterLoss == BaselineSeq{ 0 });      // baseline did NOT advance to 1
+        require(confAfterLoss && *confAfterLoss == BaselineSeq{ 0 });     // baseline did NOT advance to 1
 
         // seq 2: because seq 1's ack was lost, this still deltas against baseline seq 0 -- and decodes,
         // since the receiver still holds seq 0. (No need for the lost seq-1 baseline.)
         const Ent s2{ 100, 2 };
         const auto enc2 = deltaEncode(tr, BaselineSeq{ 2 }, s2);
-        assert(enc2[0] == 0 && enc2[1] == 0);              // header references baseline seq 0
+        require(enc2[0] == 0 && enc2[1] == 0);             // header references baseline seq 0
         const auto dec2 = deltaDecode(bm, enc2);
-        assert(dec2 && dec2->hp == 100 && dec2->x == 2);   // next delta still round-trips
+        require(dec2 && dec2->hp == 100 && dec2->x == 2);   // next delta still round-trips
     }
 
     std::printf("aether replication-ack OK: out-of-order ack advances + prunes pending; stale ack is a no-op (no regress); lost ack leaves baseline put and the next delta still round-trips\n");
@@ -137,10 +138,10 @@ int main() {
         const Ent* bare0     = getBaseline(bare, BaselineSeq{ 0 });
         const Ent* bare1     = getBaseline(bare, BaselineSeq{ 1 });
         const Ent* bare2     = getBaseline(bare, BaselineSeq{ 2 });
-        assert(bareCount == 3);
-        assert(bare0 && bare0->x == 0);    // the earlier seqs are still resolvable
-        assert(bare1 && bare1->x == 1);
-        assert(bare2 && bare2->x == 2);
+        require(bareCount == 3);
+        require(bare0 && bare0->x == 0);   // the earlier seqs are still resolvable
+        require(bare1 && bare1->x == 1);
+        require(bare2 && bare2->x == 2);
 
         // maxSnapshots is what bounds the ring, so pushing past it drops the OLDEST, one at a time.
         BaselineManager<Ent> capped = newBaselineManager<Ent>(4, 0.0);   // 0 -> no time-based expiry
@@ -149,9 +150,9 @@ int main() {
         const int  cappedCount = baselineCount(capped);
         const Ent* evicted     = getBaseline(capped, BaselineSeq{ 5 });
         const Ent* newest      = getBaseline(capped, BaselineSeq{ 9 });
-        assert(cappedCount == 4);
-        assert(!evicted);
-        assert(newest && newest->x == 9);
+        require(cappedCount == 4);
+        require(!evicted);
+        require(newest && newest->x == 9);
 
         // A positive timeout still expires: 200ms of gap past a 100ms timeout drops the older entry.
         BaselineManager<Ent> timed = newBaselineManager<Ent>(8, 100.0);
@@ -159,7 +160,7 @@ int main() {
         pushBaseline(timed, BaselineSeq{ 1 }, Ent{ 100, 1 }, MonoTime{ 200000000ull });   // +200ms
         const int  timedCount = baselineCount(timed);
         const Ent* expiredOne = getBaseline(timed, BaselineSeq{ 0 });
-        assert(timedCount == 1 && !expiredOne);
+        require(timedCount == 1 && !expiredOne);
     }
     std::printf("aether replication-ring OK: default BaselineManager keeps every pushed snapshot, count cap evicts oldest-first, positive timeout still expires\n");
 
@@ -175,9 +176,9 @@ int main() {
         tr.pending.push_back({ BaselineSeq{ 0 }, Ent{ 100, 2 } });   // seq 0 again: what an ack for 0 can only mean
         deltaOnAck(tr, BaselineSeq{ 0 });
         const auto conf = deltaConfirmedSeq(tr);
-        assert(conf && *conf == BaselineSeq{ 0 });
-        assert(tr.confirmed->second.x == 2);   // the newest match, not the stale duplicate
-        assert(tr.pending.empty());            // nothing was newer than it
+        require(conf && *conf == BaselineSeq{ 0 });
+        require(tr.confirmed->second.x == 2);   // the newest match, not the stale duplicate
+        require(tr.pending.empty());            // nothing was newer than it
 
         // And deltaEncode cannot build that duplicate itself: pending is capped below the wrap
         // whatever maxPending is set to, so a seq is unique within it.
@@ -185,7 +186,7 @@ int main() {
         for (int i = 0; i < maxPendingLimit; ++i)
             big.pending.push_back({ static_cast<BaselineSeq>(i), Ent{ 100, i } });
         (void)deltaEncode(big, BaselineSeq{ 4242 }, Ent{ 100, 7 });
-        assert(static_cast<int>(big.pending.size()) <= maxPendingLimit);
+        require(static_cast<int>(big.pending.size()) <= maxPendingLimit);
     }
     std::printf("aether replication-ack OK: a repeated seq confirms the newest pending match, pending capped below the 16-bit wrap\n");
 
@@ -203,7 +204,7 @@ int main() {
         const auto       enc0 = deltaEncode(tr, BaselineSeq{ 0 }, Ent{ 100, 0 });
         DeltaDecodeError err0 = DeltaDecodeError::BaselineMissing;
         const auto       dec0 = deltaDecode(bm, enc0, &err0);
-        assert(dec0 && dec0->x == 0);
+        require(dec0 && dec0->x == 0);
         pushBaseline(bm, BaselineSeq{ 0 }, *dec0, MonoTime{ 0 });
         deltaOnAck(tr, BaselineSeq{ 0 });   // the last ack that ever arrives
 
@@ -214,31 +215,31 @@ int main() {
             DeltaDecodeError err = DeltaDecodeError::Malformed;
             const auto       dec = deltaDecode(bm, enc, &err);
             if (!dec) {
-                assert(err == DeltaDecodeError::BaselineMissing);   // told apart from a short packet
+                require(err == DeltaDecodeError::BaselineMissing);   // told apart from a short packet
                 if (firstMissing < 0) firstMissing = i;
                 if (firstRecovered >= 0) ++failedAfterRecovery;
                 continue;
             }
-            assert(dec->x == i);
+            require(dec->x == i);
             pushBaseline(bm, static_cast<BaselineSeq>(i), *dec, MonoTime{ static_cast<std::uint64_t>(i) * 1000000ull });
             if (firstMissing >= 0 && firstRecovered < 0) {
                 firstRecovered         = i;
                 recoveredWithFullState = (enc[0] == 0xFF && enc[1] == 0xFF);   // noBaseline header
             }
         }
-        assert(firstMissing == 9);          // the 8-deep ring evicts baseline 0 on the 8th push
-        assert(firstRecovered > 0);         // and the sender gets itself out, with no ack to help
-        assert(recoveredWithFullState);     // by sending full state, not another undecodable delta
-        assert(failedAfterRecovery == 0);   // and stays out
-        assert(firstRecovered - firstMissing <= tr.maxBaselineAge + 1);
+        require(firstMissing == 9);          // the 8-deep ring evicts baseline 0 on the 8th push
+        require(firstRecovered > 0);         // and the sender gets itself out, with no ack to help
+        require(recoveredWithFullState);     // by sending full state, not another undecodable delta
+        require(failedAfterRecovery == 0);   // and stays out
+        require(firstRecovered - firstMissing <= tr.maxBaselineAge + 1);
 
         // One ack getting through puts it back on deltas against the fresh baseline.
         deltaOnAck(tr, BaselineSeq{ 200 });
         const auto       encBack = deltaEncode(tr, BaselineSeq{ 201 }, Ent{ 100, 201 });
         DeltaDecodeError errBack = DeltaDecodeError::Malformed;
         const auto       decBack = deltaDecode(bm, encBack, &errBack);
-        assert(encBack[0] == 200 && encBack[1] == 0);   // header names baseline seq 200, not noBaseline
-        assert(decBack && decBack->x == 201);
+        require(encBack[0] == 200 && encBack[1] == 0);   // header names baseline seq 200, not noBaseline
+        require(decBack && decBack->x == 201);
     }
     std::printf("aether replication-recovery OK: an evicted baseline reports BaselineMissing, the sender falls back to full state and replication resumes\n");
 
@@ -254,25 +255,25 @@ int main() {
         const Vf   plusZero{ { 0.0f }, 1 };
         const Vf   minusZero{ { -0.0f }, 1 };
         const bool zerosEqual = fieldEqual(plusZero, minusZero);
-        assert(!zerosEqual);   // a sign flip inside the vector is a change
+        require(!zerosEqual);   // a sign flip inside the vector is a change
 
         const Bytes signDelta = packDelta(plusZero, minusZero);
         Reader      signReader{ signDelta.data(), signDelta.size(), 0 };
         const auto  signApplied = deltaUnpack<Vf>(signReader, plusZero);
-        assert(signApplied && signApplied->v.size() == 1);
-        assert(std::signbit(signApplied->v[0]));   // the receiver ends up on the sender's bits
+        require(signApplied && signApplied->v.size() == 1);
+        require(std::signbit(signApplied->v[0]));   // the receiver ends up on the sender's bits
 
         // The mirror case: NaN is unequal to itself by value, so an untouched field would re-send.
         const Vf    nanState{ { std::numeric_limits<float>::quiet_NaN() }, 1 };
         const Bytes nanDelta = packDelta(nanState, nanState);
-        assert(nanDelta.size() == 1);   // changemask only, no field payload
+        require(nanDelta.size() == 1);   // changemask only, no field payload
 
         // optional<T> is the same comparison one level down.
         struct Of { std::optional<float> o; int tag{}; };
         const bool optZerosEqual = fieldEqual(Of{ 0.0f, 1 }, Of{ -0.0f, 1 });
         const bool optNoneEqual  = fieldEqual(Of{ 0.0f, 1 }, Of{ std::nullopt, 1 });
         const bool optSameEqual  = fieldEqual(Of{ std::nullopt, 1 }, Of{ std::nullopt, 1 });
-        assert(!optZerosEqual && !optNoneEqual && optSameEqual);
+        require(!optZerosEqual && !optNoneEqual && optSameEqual);
 
         // A vector of plain aggregates has no operator== to fall through to at all: the comparison
         // has to recurse into the element's fields, and the delta has to round-trip what it finds.
@@ -282,20 +283,20 @@ int main() {
         const Bag  after{ { Item{ 1, 2.0f }, Item{ 2, 4.0f } }, 7 };
         const bool bagSame    = fieldEqual(before, before);
         const bool bagChanged = fieldEqual(before, after);
-        assert(bagSame && !bagChanged);
+        require(bagSame && !bagChanged);
         const Bytes bagDelta = packDelta(before, after);
         Reader      bagReader{ bagDelta.data(), bagDelta.size(), 0 };
         const auto  bagApplied = deltaUnpack<Bag>(bagReader, before);
-        assert(bagApplied && bagApplied->items.size() == 2 && bagApplied->items[1].id == 2);
-        assert(bagApplied->items[1].w > 3.9f && bagApplied->items[1].w < 4.1f);
+        require(bagApplied && bagApplied->items.size() == 2 && bagApplied->items[1].id == 2);
+        require(bagApplied->items[1].w > 3.9f && bagApplied->items[1].w < 4.1f);
         const Bytes bagUnchanged = packDelta(before, before);
-        assert(bagUnchanged.size() == 1);   // changemask only
+        require(bagUnchanged.size() == 1);   // changemask only
 
         // A string field is bytes, with no element to recurse into.
         struct Sf { std::string s; int tag{}; };
         const bool strSame    = fieldEqual(Sf{ "abc", 1 }, Sf{ "abc", 1 });
         const bool strChanged = fieldEqual(Sf{ "abc", 1 }, Sf{ "abd", 1 });
-        assert(strSame && !strChanged);
+        require(strSame && !strChanged);
     }
     std::printf("aether delta OK: fieldEqual recurses through vector/optional (sign flip is a change, NaN is not, aggregate elements compile and round-trip)\n");
 
@@ -318,9 +319,9 @@ int main() {
         const auto  decBoolTrue  = deltaUnpack<Bf>(rBoolTrue, prevB);
         const auto  decBoolFalse = deltaUnpack<Bf>(rBoolFalse, prevB);
         const auto  decBoolBad   = deltaUnpack<Bf>(rBoolBad, prevB);
-        assert(decBoolTrue && decBoolTrue->flag && decBoolTrue->tag == 7);
-        assert(decBoolFalse && !decBoolFalse->flag);
-        assert(!decBoolBad);   // 0x02 is not a bool
+        require(decBoolTrue && decBoolTrue->flag && decBoolTrue->tag == 7);
+        require(decBoolFalse && !decBoolFalse->flag);
+        require(!decBoolBad);   // 0x02 is not a bool
 
         // The optional's present flag is the same byte with the same rule.
         struct Op { std::optional<int> o; int tag{}; };
@@ -334,21 +335,21 @@ int main() {
         const auto  decOptPresent = deltaUnpack<Op>(rOptPresent, prevO);
         const auto  decOptAbsent  = deltaUnpack<Op>(rOptAbsent, prevO);
         const auto  decOptBad     = deltaUnpack<Op>(rOptBad, prevO);
-        assert(decOptPresent && decOptPresent->o && *decOptPresent->o == 21);
-        assert(decOptAbsent && !decOptAbsent->o);
-        assert(!decOptBad);   // 0x02 is not a present flag
+        require(decOptPresent && decOptPresent->o && *decOptPresent->o == 21);
+        require(decOptAbsent && !decOptAbsent->o);
+        require(!decOptBad);   // 0x02 is not a present flag
 
         // What the encoder produces still round-trips, at both flag values.
         const Bf   flagOn{ true, 7 };
         const Bytes boolRoundTrip = packDelta(prevB, flagOn);
         Reader      rBoolRound{ boolRoundTrip.data(), boolRoundTrip.size(), 0 };
         const auto  decBoolRound = deltaUnpack<Bf>(rBoolRound, prevB);
-        assert(decBoolRound && decBoolRound->flag);
+        require(decBoolRound && decBoolRound->flag);
         const Op    optOn{ 21, 7 };
         const Bytes optRoundTrip = packDelta(prevO, optOn);
         Reader      rOptRound{ optRoundTrip.data(), optRoundTrip.size(), 0 };
         const auto  decOptRound = deltaUnpack<Op>(rOptRound, prevO);
-        assert(decOptRound && decOptRound->o && *decOptRound->o == 21);
+        require(decOptRound && decOptRound->o && *decOptRound->o == 21);
     }
     std::printf("aether delta OK: bool and optional-present bytes accept only 0/1, non-canonical forms rejected, encoder output still round-trips\n");
 
@@ -369,31 +370,31 @@ int main() {
                 if (t < sb.playbackDelayMs + dt) continue;   // still filling the delay
                 const bool spans = snapshotSpansDelay(sb);
                 const auto s     = sampleSnapshot(sb, t);
-                assert(spans);   // history reaches back past the sample target
-                assert(s);
+                require(spans);   // history reaches back past the sample target
+                require(s);
                 // The state IS the frame index, so an interpolated sample reads the target in frames.
                 const double expect = (t - sb.playbackDelayMs) / dt;
-                assert(*s > expect - 0.01 && *s < expect + 0.01);
+                require(*s > expect - 0.01 && *s < expect + 0.01);
                 ++sampled;
             }
             return sampled;
         };
         const int at60  = playAt(60.0);
         const int at120 = playAt(120.0);
-        assert(at60 > 0 && at120 > 0);
+        require(at60 > 0 && at120 > 0);
 
         // bufferDepth <= 0 must not report an empty buffer ready to sample, and must not empty the
         // buffer either: playback needs a PAIR whatever the configured depth says.
         SnapshotBuffer<float> zeroDepth = newSnapshotBufferWithConfig<float>(0, 100.0);
         const bool            readyEmpty = snapshotReady(zeroDepth);
-        assert(!readyEmpty);
+        require(!readyEmpty);
         pushSnapshot(zeroDepth, 0.0, 0.0f);
         const bool readyOne = snapshotReady(zeroDepth);
-        assert(!readyOne);   // one snapshot has nothing to interpolate against
+        require(!readyOne);   // one snapshot has nothing to interpolate against
         pushSnapshot(zeroDepth, 16.0, 1.0f);
         const bool readyTwo = snapshotReady(zeroDepth);
         const int  keptTwo  = snapshotCount(zeroDepth);
-        assert(readyTwo && keptTwo == 2);   // and a depth of 0 does not discard every push
+        require(readyTwo && keptTwo == 2);   // and a depth of 0 does not discard every push
 
         // Where the delay genuinely outruns the history, the degraded case is reportable rather
         // than a clamped sample that looks exactly like ordinary playback.
@@ -402,8 +403,8 @@ int main() {
         pushSnapshot(slow, 100.0, 1.0f);
         const bool slowSpans  = snapshotSpansDelay(slow);
         const auto slowSample = sampleSnapshot(slow, 100.0);
-        assert(!slowSpans);                          // 100ms of history under a 5s delay
-        assert(slowSample && *slowSample == 0.0f);   // clamped to the oldest -- and it says so
+        require(!slowSpans);                          // 100ms of history under a 5s delay
+        require(slowSample && *slowSample == 0.0f);   // clamped to the oldest -- and it says so
     }
     std::printf("aether interpolation OK: history spans the playback delay at 60Hz and 120Hz (samples interpolate, not clamp), depth 0 is not ready and does not empty the buffer\n");
     return 0;

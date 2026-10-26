@@ -2,7 +2,6 @@
 #include "aether/delta.hpp"
 
 #include <array>
-#include <cassert>
 #include <cstdint>
 #include <limits>
 #include <vector>

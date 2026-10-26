@@ -1,10 +1,12 @@
+#include "check.hpp"
 // Loss-window unit test: pins lossCount() + the sliding 256-bit LossWindow
-// (recordLossSample / packetLossFraction). assert() is the check, so build WITHOUT
-// NDEBUG. Data-first: plain structs + free functions, no framework.
+// (recordLossSample / packetLossFraction). Data-first: plain structs + free
+// functions, no framework.
 #include "aether/reliability.hpp"
 
-#include <cassert>
 #include <cstdio>
+
+using aether::test::require;
 
 int main() {
     using namespace aether;
@@ -15,33 +17,33 @@ int main() {
         LossWindow w{};
 
         // empty window: nothing lost regardless of how many positions we count
-        assert(lossCount(w, 0)   == 0);
-        assert(lossCount(w, 1)   == 0);
-        assert(lossCount(w, 256) == 0);
+        require(lossCount(w, 0)   == 0);
+        require(lossCount(w, 1)   == 0);
+        require(lossCount(w, 256) == 0);
 
         // n clamps to [0, 256]; negative/zero -> 0, oversized -> 256 positions
-        assert(lossCount(w, -5)   == 0);
-        assert(lossCount(w, 9999) == 0);
+        require(lossCount(w, -5)   == 0);
+        require(lossCount(w, 9999) == 0);
 
         // mark every bit lost across all four 64-bit words
         for (int i = 0; i < lossWindowSize; ++i) lossSet(w, i, true);
         // n < 64 (the take=n, mask=(1<<n)-1 branch): only the low n bits of word 0
-        assert(lossCount(w, 1)  == 1);
-        assert(lossCount(w, 13) == 13);
-        assert(lossCount(w, 63) == 63);
+        require(lossCount(w, 1)  == 1);
+        require(lossCount(w, 13) == 13);
+        require(lossCount(w, 63) == 63);
         // n == 64 exactly: take==64 special-case mask (~0), whole first word, no 1<<64
-        assert(lossCount(w, 64) == 64);
+        require(lossCount(w, 64) == 64);
         // spilling into the second word: 64 (take==64) + remainder (n<64) branch
-        assert(lossCount(w, 65)  == 65);
-        assert(lossCount(w, 128) == 128);   // two full words, both via take==64
-        assert(lossCount(w, 200) == 200);   // three full words + 8 remainder
-        assert(lossCount(w, 256) == 256);   // all four words via take==64
+        require(lossCount(w, 65)  == 65);
+        require(lossCount(w, 128) == 128);   // two full words, both via take==64
+        require(lossCount(w, 200) == 200);   // three full words + 8 remainder
+        require(lossCount(w, 256) == 256);   // all four words via take==64
 
         // a known partial pattern: clear the even indices, every odd index stays lost
         for (int i = 0; i < lossWindowSize; i += 2) lossSet(w, i, false);
-        assert(lossCount(w, 256) == 128);   // half of 256 lost
-        assert(lossCount(w, 64)  == 32);    // half of the take==64 word lost
-        assert(lossCount(w, 10)  == 5);     // 1,3,5,7,9 lost in [0,10)
+        require(lossCount(w, 256) == 128);   // half of 256 lost
+        require(lossCount(w, 64)  == 32);    // half of the take==64 word lost
+        require(lossCount(w, 10)  == 5);     // 1,3,5,7,9 lost in [0,10)
     }
 
     // The FIRST packet an endpoint ever sees acknowledges nothing behind it. A default remoteSeq of 0
@@ -54,9 +56,9 @@ int main() {
         const SequenceNum arrived[] = { SequenceNum{ 1 }, SequenceNum{ 2 } };   // packet 0 was lost
         onPacketsReceived(rx, arrived, 2);
         const auto [ackSeq, ackBits] = getAckInfo(rx);
-        assert(ackSeq == SequenceNum{ 2 });
-        assert((ackBits & 0x1u) != 0);      // bit 0 == seq 1: genuinely received
-        assert((ackBits & 0x2u) == 0);      // bit 1 == seq 0: never received, must NOT be acked
+        require(ackSeq == SequenceNum{ 2 });
+        require((ackBits & 0x1u) != 0);     // bit 0 == seq 1: genuinely received
+        require((ackBits & 0x2u) == 0);     // bit 1 == seq 0: never received, must NOT be acked
 
         // ...and the sender agrees: seq 0 stays in flight and is retransmittable.
         ReliableEndpoint tx{};
@@ -64,8 +66,8 @@ int main() {
         for (std::uint16_t s = 0; s < 3; ++s)
             onPacketSent(tx, SequenceNum{ s }, MonoTime{ 0 }, ch, SequenceNum{ s }, 100);
         const AckResult res = processAcks(tx, ackSeq, ackBits, MonoTime{ 10ull * 1000000 });
-        assert(res.acked.size() == 2);                       // seqs 1 and 2 only
-        assert(isInFlight(tx, SequenceNum{ 0 }));            // seq 0 is still owed
+        require(res.acked.size() == 2);                      // seqs 1 and 2 only
+        require(isInFlight(tx, SequenceNum{ 0 }));           // seq 0 is still owed
     }
 
     // A first packet that IS seq 0 still acks correctly (the common case: markConnected zeroes localSeq).
@@ -74,7 +76,7 @@ int main() {
         const SequenceNum arrived[] = { SequenceNum{ 0 }, SequenceNum{ 1 } };
         onPacketsReceived(rx, arrived, 2);
         const auto [ackSeq, ackBits] = getAckInfo(rx);
-        assert(ackSeq == SequenceNum{ 1 } && (ackBits & 0x1u) != 0);   // bit 0 == seq 0, received
+        require(ackSeq == SequenceNum{ 1 } && (ackBits & 0x1u) != 0);   // bit 0 == seq 0, received
     }
 
     // sliding window via recordLossSample: count caps at the window size, index wraps
@@ -84,9 +86,9 @@ int main() {
     {
         ReliableEndpoint ep{};
         for (int i = 0; i < 100; ++i) recordLossSample(ep, false);
-        assert(ep.lossWindowCount == 100 && ep.lossWindowIndex == 100);
-        assert(lossCount(ep.lossWindow, ep.lossWindowCount) == 0);
-        assert(packetLossFraction(ep) == 0.0);
+        require(ep.lossWindowCount == 100 && ep.lossWindowIndex == 100);
+        require(lossCount(ep.lossWindow, ep.lossWindowCount) == 0);
+        require(packetLossFraction(ep) == 0.0);
     }
 
     // a known partial-loss ratio: every 4th packet lost over a sub-full window -> 25%
@@ -99,11 +101,11 @@ int main() {
             if (lost) ++expectLost;
             recordLossSample(ep, lost);
         }
-        assert(ep.lossWindowCount == n);   // still under the 256 cap, no aging yet
-        assert(lossCount(ep.lossWindow, ep.lossWindowCount) == expectLost);
-        assert(expectLost == 50);
+        require(ep.lossWindowCount == n);   // still under the 256 cap, no aging yet
+        require(lossCount(ep.lossWindow, ep.lossWindowCount) == expectLost);
+        require(expectLost == 50);
         const double pct = packetLossFraction(ep);
-        assert(pct > 0.249 && pct < 0.251);   // 50/200 == 0.25
+        require(pct > 0.249 && pct < 0.251);   // 50/200 == 0.25
     }
 
     // overflowing window: feed > 256 samples so the oldest age out (index wraps mod 256).
@@ -112,22 +114,22 @@ int main() {
     {
         ReliableEndpoint ep{};
         for (int i = 0; i < lossWindowSize; ++i) recordLossSample(ep, true);    // window full, all lost
-        assert(ep.lossWindowCount == lossWindowSize);
-        assert(lossCount(ep.lossWindow, ep.lossWindowCount) == lossWindowSize); // 256 lost
-        assert(packetLossFraction(ep) == 1.0);                                   // 100%
+        require(ep.lossWindowCount == lossWindowSize);
+        require(lossCount(ep.lossWindow, ep.lossWindowCount) == lossWindowSize); // 256 lost
+        require(packetLossFraction(ep) == 1.0);                                  // 100%
 
         for (int i = 0; i < lossWindowSize; ++i) recordLossSample(ep, false);   // overwrite all 256 slots
-        assert(ep.lossWindowCount == lossWindowSize);                           // count stays capped at 256
-        assert(ep.lossWindowIndex == 2 * lossWindowSize);                       // index keeps climbing
-        assert(lossCount(ep.lossWindow, ep.lossWindowCount) == 0);              // old losses aged out
-        assert(packetLossFraction(ep) == 0.0);
+        require(ep.lossWindowCount == lossWindowSize);                          // count stays capped at 256
+        require(ep.lossWindowIndex == 2 * lossWindowSize);                      // index keeps climbing
+        require(lossCount(ep.lossWindow, ep.lossWindowCount) == 0);             // old losses aged out
+        require(packetLossFraction(ep) == 0.0);
 
         // one more wrapped write lands at slot (512 % 256 == 0): mark it lost -> exactly 1 in 256
         recordLossSample(ep, true);
-        assert(ep.lossWindowCount == lossWindowSize);
-        assert(lossCount(ep.lossWindow, ep.lossWindowCount) == 1);
+        require(ep.lossWindowCount == lossWindowSize);
+        require(lossCount(ep.lossWindow, ep.lossWindowCount) == 1);
         const double pct = packetLossFraction(ep);
-        assert(pct > 0.0039 && pct < 0.0040);   // 1/256 ~= 0.00390625
+        require(pct > 0.0039 && pct < 0.0040);   // 1/256 ~= 0.00390625
     }
 
     // The sent ring returns every unresolved packet's bytes EXACTLY ONCE. Two paths remove a record
@@ -148,19 +150,19 @@ int main() {
         const AckResult nack1 = processAcks(ep, SequenceNum{ 1 }, 0b0,  MonoTime{ 10 });
         const AckResult nack2 = processAcks(ep, SequenceNum{ 2 }, 0b1,  MonoTime{ 11 });
         const AckResult nack3 = processAcks(ep, SequenceNum{ 3 }, 0b11, MonoTime{ 12 });
-        assert(nack1.lostBytes == 0 && nack2.lostBytes == 0);
-        assert(nack3.lostBytes == 100);   // the third NACK declares it: released HERE, exactly once
+        require(nack1.lostBytes == 0 && nack2.lostBytes == 0);
+        require(nack3.lostBytes == 100);   // the third NACK declares it: released HERE, exactly once
         for (std::uint16_t s = 4; s < 7; ++s)
             onPacketSent(ep, SequenceNum{ s }, MonoTime{ 100u + s }, ch, SequenceNum{ s }, 100);
-        assert(onPacketSent(ep, SequenceNum{ 7 }, MonoTime{ 200 }, ch, SequenceNum{ 7 }, 100) == 0);   // not again
-        assert(ep.packetsEvicted == 1);
+        require(onPacketSent(ep, SequenceNum{ 7 }, MonoTime{ 200 }, ch, SequenceNum{ 7 }, 100) == 0);   // not again
+        require(ep.packetsEvicted == 1);
 
         // ...but evicting a LIVE (never-declared) victim does report its bytes.
         ReliableEndpoint ep2{};
         ep2.maxInFlight = 2;
         onPacketSent(ep2, SequenceNum{ 0 }, MonoTime{ 0 }, ch, SequenceNum{ 0 }, 300);
         onPacketSent(ep2, SequenceNum{ 1 }, MonoTime{ 1 }, ch, SequenceNum{ 1 }, 100);
-        assert(onPacketSent(ep2, SequenceNum{ 2 }, MonoTime{ 2 }, ch, SequenceNum{ 2 }, 100) == 300);
+        require(onPacketSent(ep2, SequenceNum{ 2 }, MonoTime{ 2 }, ch, SequenceNum{ 2 }, 100) == 300);
     }
     {
         // Displacement: seq 0 stays live and unresolved while 1..255 are sent and acked (in windows
@@ -173,12 +175,12 @@ int main() {
         const std::uint16_t ackPoints[] = { 33, 65, 97, 129, 161, 193, 225, 255 };
         for (const std::uint16_t a : ackPoints)
             processAcks(ep, SequenceNum{ a }, 0xFFFFFFFFull, MonoTime{ 500 });
-        assert(packetsInFlight(ep) == 1);   // only seq 0 left, live
+        require(packetsInFlight(ep) == 1);   // only seq 0 left, live
 
-        assert(onPacketSent(ep, SequenceNum{ 256 }, MonoTime{ 1000 }, ch, SequenceNum{ 256 }, 100) == 777);
-        assert(ep.packetsEvicted == 1);     // the displacement is an eviction and is counted as one
-        assert(packetsInFlight(ep) == 1);   // the overwrite swapped records; the count did not drift
-        assert(!isInFlight(ep, SequenceNum{ 0 }) && isInFlight(ep, SequenceNum{ 256 }));
+        require(onPacketSent(ep, SequenceNum{ 256 }, MonoTime{ 1000 }, ch, SequenceNum{ 256 }, 100) == 777);
+        require(ep.packetsEvicted == 1);     // the displacement is an eviction and is counted as one
+        require(packetsInFlight(ep) == 1);   // the overwrite swapped records; the count did not drift
+        require(!isInFlight(ep, SequenceNum{ 0 }) && isInFlight(ep, SequenceNum{ 256 }));
     }
 
     // The window index is a free-running cursor MASKED into the window, so its wrap costs nothing. A
@@ -189,11 +191,11 @@ int main() {
         ep.lossWindowIndex = 0xFFFFFFFFu;    // one short of the wrap; 0xFFFFFFFF & 255 == slot 255
         ep.lossWindowCount = lossWindowSize;
         recordLossSample(ep, true);
-        assert(ep.lossWindowIndex == 0u);                              // wrapped, defined, back to slot 0
-        assert(lossCount(ep.lossWindow, lossWindowSize) == 1);
+        require(ep.lossWindowIndex == 0u);                             // wrapped, defined, back to slot 0
+        require(lossCount(ep.lossWindow, lossWindowSize) == 1);
         recordLossSample(ep, true);                                    // slot 0: a seamless continuation
-        assert(ep.lossWindowIndex == 1u);
-        assert(lossCount(ep.lossWindow, lossWindowSize) == 2);
+        require(ep.lossWindowIndex == 1u);
+        require(lossCount(ep.lossWindow, lossWindowSize) == 2);
     }
 
     // A sequence far in the FUTURE resynchronizes the endpoint; it must never deafen it. Skipping the
@@ -205,39 +207,39 @@ int main() {
         ep.maxSeqDistance = 1024;
         const SequenceNum first{ 1 };
         onPacketsReceived(ep, &first, 1);
-        assert(ep.remoteSeq == SequenceNum{ 1 });
+        require(ep.remoteSeq == SequenceNum{ 1 });
 
         const SequenceNum farAhead{ 5000 };   // the peer kept sending through a long silence
         onPacketsReceived(ep, &farAhead, 1);
-        assert(ep.remoteSeq == SequenceNum{ 5000 });     // resynchronized...
-        assert(getAckInfo(ep).second == 0);              // ...with an empty bitfield: nothing before it is known
+        require(ep.remoteSeq == SequenceNum{ 5000 });    // resynchronized...
+        require(getAckInfo(ep).second == 0);             // ...with an empty bitfield: nothing before it is known
 
         const SequenceNum resumed[] = { SequenceNum{ 5001 }, SequenceNum{ 5002 } };
         onPacketsReceived(ep, resumed, 2);
         const auto [ackSeq, ackBits] = getAckInfo(ep);
-        assert(ackSeq == SequenceNum{ 5002 });           // ...and it keeps acking from there
-        assert((ackBits & 0x1u) != 0);
+        require(ackSeq == SequenceNum{ 5002 });          // ...and it keeps acking from there
+        require((ackBits & 0x1u) != 0);
 
         const SequenceNum ancient{ 100 };                // far in the PAST: a duplicate, not an advance
         onPacketsReceived(ep, &ancient, 1);
-        assert(ep.remoteSeq == SequenceNum{ 5002 });
-        assert(!rbExists(ep.received, ancient));
+        require(ep.remoteSeq == SequenceNum{ 5002 });
+        require(!rbExists(ep.received, ancient));
     }
 
     // ...and the DEFAULT distance is a real bound. abs(sequenceDiff) tops out at 32768, so a guard
     // testing "> 32768" rejects nothing at any of the 65536 offsets.
     {
         ReliableEndpoint ep{};
-        assert(ep.maxSeqDistance == defaultMaxSequenceDistance);
-        assert(defaultMaxSequenceDistance < 32768);
+        require(ep.maxSeqDistance == defaultMaxSequenceDistance);
+        require(defaultMaxSequenceDistance < 32768);
         const SequenceNum here{ 1000 };
         onPacketsReceived(ep, &here, 1);
         const SequenceNum tooOld{ static_cast<std::uint16_t>(1000 - defaultMaxSequenceDistance - 1) };
         onPacketsReceived(ep, &tooOld, 1);
-        assert(!rbExists(ep.received, tooOld));          // out of range -> not even recorded
+        require(!rbExists(ep.received, tooOld));         // out of range -> not even recorded
         const SequenceNum justInRange{ static_cast<std::uint16_t>(1000 - defaultMaxSequenceDistance) };
         onPacketsReceived(ep, &justInRange, 1);
-        assert(rbExists(ep.received, justInRange));      // ...and the edge itself still is
+        require(rbExists(ep.received, justInRange));     // ...and the edge itself still is
     }
 
     // Karn's algorithm: a packet already DECLARED LOST contributes no RTT sample. The elapsed time to
@@ -257,33 +259,33 @@ int main() {
 
         const MonoTime at20{ 20ull * 1000000 };
         for (int i = 0; i < fastRetransmitThreshold; ++i) processAcks(ep, ackSeq, ackBits, at20);
-        assert(ep.hasRttSample && ep.totalLost == 1);          // honest 20ms samples, and seq 0 written off
+        require(ep.hasRttSample && ep.totalLost == 1);         // honest 20ms samples, and seq 0 written off
         const double srttBefore = ep.srtt, rtoBefore = ep.rto;
-        assert(srttBefore > 19.9 && srttBefore < 20.1);
-        assert(rtoBefore == minRtoMs);
+        require(srttBefore > 19.9 && srttBefore < 20.1);
+        require(rtoBefore == minRtoMs);
 
         const AckResult late = processAcks(ep, SequenceNum{ 0 }, 0, MonoTime{ 500ull * 1000000 });
-        assert(!late.acked.empty());        // it WAS delivered, so the channel message is resolved...
-        assert(late.ackedBytes == 0);       // ...but its bytes already left flight when it was declared
-        assert(ep.srtt == srttBefore);      // ...and the estimator does not take its timing
-        assert(ep.rto  == rtoBefore);
+        require(!late.acked.empty());       // it WAS delivered, so the channel message is resolved...
+        require(late.ackedBytes == 0);      // ...but its bytes already left flight when it was declared
+        require(ep.srtt == srttBefore);     // ...and the estimator does not take its timing
+        require(ep.rto  == rtoBefore);
     }
 
     // The retransmit wait backs off per ATTEMPT, held at maxRtoMs. A flat RTO spends a ten-retry budget
     // inside about half a second at the 50ms floor, so a path that blinks erases every reliable message
     // in flight while the connection itself is nowhere near its own timeout.
     {
-        assert(retransmitTimeoutMs(50.0, 1) == 50.0);      // the first retransmit waits one plain RTO
-        assert(retransmitTimeoutMs(50.0, 2) == 100.0);
-        assert(retransmitTimeoutMs(50.0, 3) == 200.0);
-        assert(retransmitTimeoutMs(50.0, 6) == 1600.0);
-        assert(retransmitTimeoutMs(50.0, 7) == maxRtoMs);   // held at the cap from here on
-        assert(retransmitTimeoutMs(50.0, 99) == maxRtoMs);
-        assert(retransmitTimeoutMs(500.0, 4) == maxRtoMs);  // the cap binds before the shift does
+        require(retransmitTimeoutMs(50.0, 1) == 50.0);     // the first retransmit waits one plain RTO
+        require(retransmitTimeoutMs(50.0, 2) == 100.0);
+        require(retransmitTimeoutMs(50.0, 3) == 200.0);
+        require(retransmitTimeoutMs(50.0, 6) == 1600.0);
+        require(retransmitTimeoutMs(50.0, 7) == maxRtoMs);   // held at the cap from here on
+        require(retransmitTimeoutMs(50.0, 99) == maxRtoMs);
+        require(retransmitTimeoutMs(500.0, 4) == maxRtoMs);  // the cap binds before the shift does
 
         double budget = 0.0;                                // what a default retry budget actually spans
         for (int retry = 1; retry <= 10; ++retry) budget += retransmitTimeoutMs(minRtoMs, retry);
-        assert(budget > 10000.0);                           // longer than the default connection timeout
+        require(budget > 10000.0);                          // longer than the default connection timeout
     }
 
     // Packets no ack ever resolved are written off by TIMEOUT. Every other loss signal is ack-driven,
@@ -294,23 +296,23 @@ int main() {
         const ChannelId  ch{ 0 };
         for (std::uint16_t s = 1; s <= 8; ++s)
             onPacketSent(ep, SequenceNum{ s }, MonoTime{ 0 }, ch, SequenceNum{ s }, 300);
-        assert(packetLossFraction(ep) == 0.0);   // no acks have arrived: nothing sampled either way
+        require(packetLossFraction(ep) == 0.0);   // no acks have arrived: nothing sampled either way
 
         const TimeoutResult early = declareTimedOutPackets(ep, MonoTime{ 50ull * 1000000 }, 200.0);
-        assert(early.lostPackets == 0);          // 50ms: inside the grace, nothing written off yet
+        require(early.lostPackets == 0);         // 50ms: inside the grace, nothing written off yet
 
         const TimeoutResult swept = declareTimedOutPackets(ep, MonoTime{ 500ull * 1000000 }, 200.0);
-        assert(swept.lostPackets == 8);
-        assert(swept.lostBytes == 8 * 300);
-        assert(swept.newLossEpisode);            // ...and it counts as ONE congestion episode, not eight
-        assert(packetLossFraction(ep) == 1.0);   // the signal finally moved
+        require(swept.lostPackets == 8);
+        require(swept.lostBytes == 8 * 300);
+        require(swept.newLossEpisode);            // ...and it counts as ONE congestion episode, not eight
+        require(packetLossFraction(ep) == 1.0);   // the signal finally moved
 
         const TimeoutResult again = declareTimedOutPackets(ep, MonoTime{ 900ull * 1000000 }, 200.0);
-        assert(again.lostPackets == 0);          // already declared: never counted twice
+        require(again.lostPackets == 0);         // already declared: never counted twice
 
         // A late ack still resolves the channel message, and still releases nothing twice.
         const AckResult late = processAcks(ep, SequenceNum{ 8 }, 0, MonoTime{ 900ull * 1000000 });
-        assert(!late.acked.empty() && late.ackedBytes == 0);
+        require(!late.acked.empty() && late.ackedBytes == 0);
     }
 
     std::printf("aether loss-window OK: lossCount take==64 mask, overflow aging, 0%%/25%%/100%% ratios exact; "

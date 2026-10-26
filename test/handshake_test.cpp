@@ -11,13 +11,13 @@
 // Authenticated credential, expiry, capacity and resumption regressions are in session_auth_test.cpp.
 #include <aether/aether.hpp>
 
-#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <optional>
 #include <vector>
 
 using namespace aether;
+using aether::test::require;
 
 namespace {
 
@@ -46,17 +46,17 @@ std::optional<Packet> replyPacket(const RawPacket& raw) {
 Bytes retryCookieFor(NetPeer& S, const PeerId& from, const Bytes& body, MonoTime now) {
     std::vector<IncomingPacket> in{ control(from, PacketType::ConnectionRequest, encodeConnectionRequest({}, body)) };
     const auto r = processAt(S, now, in);
-    assert(S.pending.count(from) == 0);   // nothing committed for an unproven address
+    require(S.pending.count(from) == 0);   // nothing committed for an unproven address
     Bytes cookie;
     int   replies = 0;                    // ...and one cookie is the whole of what this address earns
     for (const RawPacket& p : r.outgoing) {
         if (p.to != from) continue;       // other live connections keep sending; only this peer's reply matters
         replies += 1;
         const auto pkt = replyPacket(p);
-        assert(pkt && pkt->header.type == PacketType::ConnectionRetry);
+        require(pkt && pkt->header.type == PacketType::ConnectionRetry);
         cookie = pkt->payload;
     }
-    assert(replies == 1);
+    require(replies == 1);
     return cookie;
 }
 // A ConnectionRequest carrying a freshly-earned cookie: the packet that actually reaches the keygen.
@@ -68,7 +68,7 @@ IncomingPacket cookiedRequest(NetPeer& S, const PeerId& from, const Bytes& body,
 // The serverSalt the server put in the challenge it queued for `pid`.
 std::uint64_t challengeSaltFor(const NetPeer& peer, const PeerId& pid) {
     const auto it = peer.pending.find(pid);
-    assert(it != peer.pending.end());
+    require(it != peer.pending.end());
     return it->second.serverSalt;
 }
 
@@ -103,7 +103,7 @@ int main() {
         auto peer = newPeerState(addrLocalhost(9600), aether::test::anonymousConfig<NetworkConfig>(), MonoTime{0});
         const PeerId remote{addrLocalhost(9601)};
         handshakeRaw(peer, remote, 0x01020304050607a2ull, {}, MonoTime{tickNs});
-        aether::test::require(peerIsConnected(peer, remote));
+        require(peerIsConnected(peer, remote));
     }
 
     // --- 0. the stateless retry cookie: nothing is allocated for an unproven address ---
@@ -119,8 +119,8 @@ int main() {
 
         // an uncookied request allocates nothing and yields only a cookie (asserted inside the helper)
         const Bytes cookie = retryCookieFor(S, idA, {}, MonoTime{ 1000000 });
-        assert(cookie.size() == retryCookieSize);
-        assert(S.pending.empty());
+        require(cookie.size() == retryCookieSize);
+        require(S.pending.empty());
 
         // the SAME cookie presented from a different source address is worthless: it is bound to the
         // address it was minted for, which is the whole point of proving routability
@@ -129,7 +129,7 @@ int main() {
             const Bytes forA = retryCookieFor(S2, idA, {}, MonoTime{ 1000000 });
             std::vector<IncomingPacket> in{ control(idB, PacketType::ConnectionRequest, encodeConnectionRequest(forA, {})) };
             processAt(S2, MonoTime{ 2000000 }, in);
-            assert(S2.pending.count(idB) == 0);   // no pending, no keygen: it just earned idB its own cookie
+            require(S2.pending.count(idB) == 0);   // no pending, no keygen: it just earned idB its own cookie
         }
 
         // a garbage cookie of the right length is rejected too (it is a MAC, not a length check)
@@ -138,15 +138,15 @@ int main() {
             const Bytes junk(retryCookieSize, 0xAB);
             std::vector<IncomingPacket> in{ control(idA, PacketType::ConnectionRequest, encodeConnectionRequest(junk, {})) };
             processAt(S3, MonoTime{ 2000000 }, in);
-            assert(S3.pending.count(idA) == 0);
+            require(S3.pending.count(idA) == 0);
         }
 
         // the real cookie, from the address it was minted for, is what opens the pending
         {
             std::vector<IncomingPacket> in{ control(idA, PacketType::ConnectionRequest, encodeConnectionRequest(cookie, {})) };
             const auto r = processAt(S, MonoTime{ 2000000 }, in);
-            assert(S.pending.count(idA) == 1);
-            assert(r.outgoing.size() == 1);   // ...and now the challenge goes out
+            require(S.pending.count(idA) == 1);
+            require(r.outgoing.size() == 1);   // ...and now the challenge goes out
         }
 
         // and it expires: past two epochs the same cookie no longer validates
@@ -154,9 +154,9 @@ int main() {
             NetPeer S4 = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
             const Bytes old = retryCookieFor(S4, idA, {}, MonoTime{ 1000000 });
             const MonoTime later{ 1000000 + cookieEpochNs * 3 };
-            assert(!retryCookieValid(S4.cookieSecret, idA.addr, old, later));
-            assert(retryCookieValid(S4.cookieSecret, idA.addr, old, MonoTime{ 1000000 }));       // still good in its own epoch
-            assert(retryCookieValid(S4.cookieSecret, idA.addr, old, MonoTime{ 1000000 + cookieEpochNs }));   // and the next one
+            require(!retryCookieValid(S4.cookieSecret, idA.addr, old, later));
+            require(retryCookieValid(S4.cookieSecret, idA.addr, old, MonoTime{ 1000000 }));      // still good in its own epoch
+            require(retryCookieValid(S4.cookieSecret, idA.addr, old, MonoTime{ 1000000 + cookieEpochNs }));   // and the next one
         }
 
         // a malformed request framing earns nothing at all -- not even a cookie to reflect
@@ -164,8 +164,8 @@ int main() {
             NetPeer S5 = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
             std::vector<IncomingPacket> in{ control(idA, PacketType::ConnectionRequest, Bytes{}) };
             const auto r = processAt(S5, MonoTime{ 1000000 }, in);
-            assert(r.outgoing.empty());
-            assert(S5.pending.empty());
+            require(r.outgoing.empty());
+            require(S5.pending.empty());
         }
         std::printf("aether retry-cookie OK: no pending or keygen until a valid, address-bound cookie comes back\n");
     }
@@ -178,8 +178,8 @@ int main() {
 
         std::vector<IncomingPacket> in{ cookiedRequest(S, idA, {}, MonoTime{ 500000 }) };
         const auto challenge = processAt(S, MonoTime{ 1000000 }, in);
-        assert(challenge.outgoing.size() == 1);          // the server answered with a challenge
-        assert(S.pending.count(idA) == 1);               // ...and opened a pending for it
+        require(challenge.outgoing.size() == 1);         // the server answered with a challenge
+        require(S.pending.count(idA) == 1);              // ...and opened a pending for it
 
         // Respond blind: a well-formed response carrying a serverSalt echo we could not have known.
         X25519Key priv{}, pub{};
@@ -190,10 +190,10 @@ int main() {
             control(idA, PacketType::ConnectionResponse, encodeConnectionResponse(0xDEADBEEFCAFEull, pub, wrongSalt)) };
         const auto after = processAt(S, MonoTime{ 2000000 }, blind);
 
-        assert(!peerIsConnected(S, idA));                // no connection slot committed
-        for (const auto& e : after.events) assert(e.kind != PeerEvent::Connected);
-        assert(after.outgoing.empty());                  // silent drop -- not a reflector
-        assert(S.pending.count(idA) == 1);               // the real client's handshake is untouched
+        require(!peerIsConnected(S, idA));               // no connection slot committed
+        for (const auto& e : after.events) require(e.kind != PeerEvent::Connected);
+        require(after.outgoing.empty());                 // silent drop -- not a reflector
+        require(S.pending.count(idA) == 1);              // the real client's handshake is untouched
         std::printf("handshake_test: blind response rejected, no reply, pending survives\n");
 
         // The SAME peer, now echoing correctly, completes -- proving the gate is the echo and not
@@ -203,7 +203,7 @@ int main() {
         const auto ok = processAt(S, MonoTime{ 3000000 }, good);
         bool connected = false;
         for (const auto& e : ok.events) if (e.kind == PeerEvent::Connected) connected = true;
-        assert(connected && peerIsConnected(S, idA));
+        require(connected && peerIsConnected(S, idA));
         std::printf("handshake_test: correct echo completes the handshake\n");
     }
 
@@ -217,7 +217,7 @@ int main() {
 
         TestLink link = newTestLink(C, idC, S, idS);
         testLinkConnect(link, MonoTime{ 0 }, tickNs, 24);
-        assert(peerIsConnected(S, idC) && peerIsConnected(C, idS));
+        require(peerIsConnected(S, idC) && peerIsConnected(C, idS));
         std::printf("handshake_test: full challenge/response handshake still completes both ways\n");
     }
 
@@ -235,7 +235,7 @@ int main() {
         testLinkImpair(link, TestLinkConfig{ .lossRate = 0.3, .latencyNs = 20 * tickNs, .jitterNs = 5 * tickNs,
                                              .duplicateChance = 0.1, .outOfOrderChance = 0.1 });
         testLinkConnect(link, MonoTime{ 0 }, tickNs, 4000);
-        assert(peerIsConnected(S, idC) && peerIsConnected(C, idS));
+        require(peerIsConnected(S, idC) && peerIsConnected(C, idS));
         std::printf("handshake_test: handshake completes through 30%% loss + 20ms latency + jitter + dups + reorder\n");
     }
 
@@ -251,12 +251,12 @@ int main() {
 
         std::vector<IncomingPacket> in{ cookiedRequest(S, ghost, {}, MonoTime{ tickNs / 2 }) };
         processAt(S, MonoTime{ tickNs }, in);
-        assert(S.pending.count(ghost) == 1);
+        require(S.pending.count(ghost) == 1);
 
         const std::uint64_t past = static_cast<std::uint64_t>(S.config.connectionRequestTimeoutMs) * tickNs * 2;
         const auto expired = processAt(S, MonoTime{ past }, {});
-        assert(S.pending.empty());                              // swept
-        for (const auto& e : expired.events) assert(e.kind != PeerEvent::Disconnected);
+        require(S.pending.empty());                             // swept
+        for (const auto& e : expired.events) require(e.kind != PeerEvent::Disconnected);
 
         // A client's OWN failed connect still reports the timeout -- that one the caller is waiting for.
         NetPeer C = newPeerState(addrLocalhost(9443), aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
@@ -266,7 +266,7 @@ int main() {
         const auto attempt = processAt(C, MonoTime{ past }, {});   // named: a range-for over a temporary's
         for (const auto& e : attempt.events)                         // member does not extend its lifetime
             if (e.kind == PeerEvent::Disconnected && e.reason == DisconnectReason::Timeout) timedOut = true;
-        assert(timedOut);
+        require(timedOut);
         std::printf("handshake_test: abandoned inbound handshake expires silently, outbound reports its timeout\n");
     }
 
@@ -294,7 +294,7 @@ int main() {
             requests.push_back(cookiedRequest(S, ids.back(), {}, MonoTime{ tickNs / 2 }));
         }
         processAt(S, MonoTime{ tickNs }, requests);            // all challenged in one tick: 6 pendings, 0 connections
-        assert(S.pending.size() == clients);
+        require(S.pending.size() == clients);
 
         std::vector<IncomingPacket> responses;                  // ...then every one of them responds at once
         responses.reserve(clients);
@@ -304,7 +304,7 @@ int main() {
                                                                  pubs[static_cast<std::size_t>(i)],
                                                                  challengeSaltFor(S, ids[static_cast<std::size_t>(i)]))));
         processAt(S, MonoTime{ 2 * tickNs }, responses);
-        assert(peerCount(S) == cfg.maxClients);                 // held at 2, not 6
+        require(peerCount(S) == cfg.maxClients);                // held at 2, not 6
         std::printf("handshake_test: maxClients holds at admission (%d of %d responses accepted)\n",
                     peerCount(S), clients);
     }
@@ -316,25 +316,25 @@ int main() {
 
         // A normally-handshaked connection is validated already: the cookie and the challenge echo both
         // proved routability before it existed, so the cap must never throttle it.
-        assert(c.pathValidated);
-        assert(amplificationAllowsSend(c, 1 << 20));
+        require(c.pathValidated);
+        require(amplificationAllowsSend(c, 1 << 20));
 
         // Unvalidated, the budget is a small multiple of what actually arrived -- and zero received
         // means zero sent, which is the spoofed-victim case.
         c.pathValidated        = false;
         c.unvalidatedRecvBytes = 0;
         c.unvalidatedSentBytes = 0;
-        assert(!amplificationAllowsSend(c, 1));
+        require(!amplificationAllowsSend(c, 1));
 
         c.unvalidatedRecvBytes = 100;
-        assert(amplificationAllowsSend(c, 300));          // exactly 3x is allowed
-        assert(!amplificationAllowsSend(c, 301));         // past it is not
+        require(amplificationAllowsSend(c, 300));         // exactly 3x is allowed
+        require(!amplificationAllowsSend(c, 301));        // past it is not
         c.unvalidatedSentBytes = 300;
-        assert(!amplificationAllowsSend(c, 1));           // budget spent
+        require(!amplificationAllowsSend(c, 1));          // budget spent
 
         markPathValidated(c);                             // proof arrived -> uncapped again
-        assert(c.pathValidated);
-        assert(amplificationAllowsSend(c, 1 << 20));
+        require(c.pathValidated);
+        require(amplificationAllowsSend(c, 1 << 20));
         std::printf("handshake_test: unvalidated paths are amplification-capped\n");
     }
 
@@ -348,17 +348,17 @@ int main() {
         // else from connecting without spoofing anything.
         const std::uint64_t k1 = sockAddrToKey(addrV4(0x0A000001u, 1000), P.addrHashSeed);
         for (std::uint16_t port = 1001; port < 1064; ++port)
-            assert(sockAddrToKey(addrV4(0x0A000001u, port), P.addrHashSeed) == k1);
+            require(sockAddrToKey(addrV4(0x0A000001u, port), P.addrHashSeed) == k1);
 
         // Distinct hosts still get distinct buckets, or the limit would be global.
-        assert(sockAddrToKey(addrV4(0x0A000002u, 1000), P.addrHashSeed) != k1);
-        assert(sockAddrToKey(addrV4(0x0B000001u, 1000), P.addrHashSeed) != k1);
+        require(sockAddrToKey(addrV4(0x0A000002u, 1000), P.addrHashSeed) != k1);
+        require(sockAddrToKey(addrV4(0x0B000001u, 1000), P.addrHashSeed) != k1);
 
         // The seed is per-peer and drawn from the CSPRNG, so an attacker cannot compute an address
         // that lands in a victim's bucket and starve it -- FNV-1a alone is trivially invertible.
         NetPeer Q = newPeerState(addrLocalhost(9501), aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
-        assert(Q.addrHashSeed != P.addrHashSeed);
-        assert(sockAddrToKey(addrV4(0x0A000001u, 1000), Q.addrHashSeed) != k1);
+        require(Q.addrHashSeed != P.addrHashSeed);
+        require(sockAddrToKey(addrV4(0x0A000001u, 1000), Q.addrHashSeed) != k1);
         std::printf("handshake_test: rate-limit key is per-host and seeded\n");
     }
 
@@ -381,11 +381,11 @@ int main() {
                                         encodeSaltAndKey(0xF00DF00DF00DF00Dull, evilPub), MonoTime{ 0 }));
 
         MonoTime t = testLinkConnect(link, MonoTime{ 0 }, tickNs, 64);
-        assert(peerIsConnected(S, idC) && peerIsConnected(C, idS));
+        require(peerIsConnected(S, idC) && peerIsConnected(C, idS));
         const Connection& cc = C.connections.at(idS);
         const Connection& sc = S.connections.at(idC);
-        assert(cc.sendKey && cc.recvKey && sc.sendKey && sc.recvKey);
-        assert(*cc.sendKey == *sc.recvKey && *cc.recvKey == *sc.sendKey);   // keys that can actually decrypt
+        require(cc.sendKey && cc.recvKey && sc.sendKey && sc.recvKey);
+        require(*cc.sendKey == *sc.recvKey && *cc.recvKey == *sc.sendKey);   // keys that can actually decrypt
 
         peerSend(C, idS, ChannelId{ 0 }, Bytes{ 7, 7, 7 }, t);   // ...and prove it end to end
         bool delivered = false;
@@ -393,7 +393,7 @@ int main() {
             for (const PeerEvent& e : s.bEvents) if (e.kind == PeerEvent::Message) delivered = true;
             return delivered;
         });
-        assert(delivered);
+        require(delivered);
         std::printf("handshake_test: an injected challenge cannot split the echoed salt from the session key\n");
     }
 
@@ -413,17 +413,17 @@ int main() {
         link.inFlight.push_back(spoofed(idC, PacketType::ConnectionChallenge, encodeSaltAndKey(7, degenerate), MonoTime{ 0 }));
 
         testLinkStep(link, MonoTime{ tickNs });
-        assert(C.pending.count(idS) == 1);
-        assert(!C.pending.at(idS).sessionShared);      // nothing committed
-        assert(!C.pending.at(idS).ephemeralReady);     // ...and nothing latched
+        require(C.pending.count(idS) == 1);
+        require(!C.pending.at(idS).sessionShared);     // nothing committed
+        require(!C.pending.at(idS).ephemeralReady);    // ...and nothing latched
         for (const TestDatagram& d : link.inFlight) {
             const auto stripped = validateAndStripCrc32(d.data);
             const auto pk       = stripped ? deserializePacket(*stripped) : std::nullopt;
-            assert(!pk || pk->header.type != PacketType::ConnectionResponse);   // no response to a challenge we refused
+            require(!pk || pk->header.type != PacketType::ConnectionResponse);   // no response to a challenge we refused
         }
 
         testLinkConnect(link, MonoTime{ tickNs }, tickNs, 64);
-        assert(peerIsConnected(S, idC) && peerIsConnected(C, idS));   // the real handshake still completes
+        require(peerIsConnected(S, idC) && peerIsConnected(C, idS));   // the real handshake still completes
         std::printf("handshake_test: a degenerate challenge keys nothing and blocks nothing\n");
     }
 
@@ -437,24 +437,24 @@ int main() {
 
         std::vector<IncomingPacket> kill{ control(dead, PacketType::Disconnect, {}) };
         const auto killed = processAt(C, MonoTime{ tickNs }, kill);
-        assert(C.pending.count(dead) == 1);   // the handshake is untouched
-        assert(killed.events.empty());
+        require(C.pending.count(dead) == 1);   // the handshake is untouched
+        require(killed.events.empty());
 
         const std::uint64_t past = static_cast<std::uint64_t>(C.config.connectionRequestTimeoutMs) * tickNs * 2;
         const auto expired = processAt(C, MonoTime{ past }, {});
         bool timedOut = false;
         for (const auto& e : expired.events)
             if (e.kind == PeerEvent::Disconnected && e.reason == DisconnectReason::Timeout) timedOut = true;
-        assert(timedOut);                     // ...and the caller still hears the outcome
+        require(timedOut);                    // ...and the caller still hears the outcome
 
         NetPeer      S = newPeerState(addrLocalhost(9493), aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
         const PeerId idA{ addrV4(0x0A000013u, 9494) };
         std::vector<IncomingPacket> req{ cookiedRequest(S, idA, {}, MonoTime{ tickNs / 2 }) };
         processAt(S, MonoTime{ tickNs }, req);
-        assert(S.pending.count(idA) == 1);
+        require(S.pending.count(idA) == 1);
         std::vector<IncomingPacket> spoof{ control(idA, PacketType::Disconnect, {}) };
         processAt(S, MonoTime{ 2 * tickNs }, spoof);
-        assert(S.pending.count(idA) == 1);    // the server's half-open handshake survives it too
+        require(S.pending.count(idA) == 1);   // the server's half-open handshake survives it too
         std::printf("handshake_test: a cleartext Disconnect leaves half-open handshakes alone\n");
     }
 
@@ -471,8 +471,8 @@ int main() {
         TestLink link = newTestLink(C, idC, S, idS);
         link.inFlight.push_back(spoofed(idC, PacketType::ConnectionAccepted, {}, MonoTime{ 0 }));
         testLinkConnect(link, MonoTime{ 0 }, tickNs, 64);
-        assert(peerIsConnected(S, idC) && peerIsConnected(C, idS));
-        assert(C.connections.at(idS).sendKey);   // and it came up keyed, never as a plaintext zombie
+        require(peerIsConnected(S, idC) && peerIsConnected(C, idS));
+        require(C.connections.at(idS).sendKey);   // and it came up keyed, never as a plaintext zombie
         std::printf("handshake_test: an injected Accepted keys nothing and cancels nothing\n");
     }
 
@@ -495,11 +495,11 @@ int main() {
             for (const PeerEvent& e : s.bEvents) if (e.kind == PeerEvent::Connected) bUp = true;
             return aUp && bUp;
         });
-        assert(aUp && bUp);                                  // both callers heard about the connection they asked for
-        assert(peerIsConnected(A, idB) && peerIsConnected(B, idA));
+        require(aUp && bUp);                                 // both callers heard about the connection they asked for
+        require(peerIsConnected(A, idB) && peerIsConnected(B, idA));
         const Connection& ca = A.connections.at(idB);
         const Connection& cb = B.connections.at(idA);
-        assert(*ca.sendKey == *cb.recvKey && *ca.recvKey == *cb.sendKey);
+        require(*ca.sendKey == *cb.recvKey && *ca.recvKey == *cb.sendKey);
 
         peerSend(A, idB, ChannelId{ 0 }, Bytes{ 4, 2 }, t);
         bool delivered = false;
@@ -507,7 +507,7 @@ int main() {
             for (const PeerEvent& e : s.bEvents) if (e.kind == PeerEvent::Message) delivered = true;
             return delivered;
         });
-        assert(delivered);
+        require(delivered);
         std::printf("handshake_test: a simultaneous connect resolves roles and completes\n");
     }
 
@@ -522,20 +522,20 @@ int main() {
 
         handshakeRaw(S, idA, shared, {}, MonoTime{ tickNs });                     // both claim the same token
         handshakeRaw(S, idB, shared, {}, MonoTime{ 8000ull * tickNs });           // ...8s apart, so they expire apart
-        assert(peerCount(S) == 2);
+        require(peerCount(S) == 2);
         const X25519Key masterA = *S.connections.at(idA).resumeMaster;
         const X25519Key masterB = *S.connections.at(idB).resumeMaster;
-        assert(masterA != masterB);
+        require(masterA != masterB);
 
         processAt(S, MonoTime{ 12000ull * tickNs }, {});   // A idles out; B is still live
-        assert(peerCount(S) == 1 && S.connections.count(idB) == 1);
-        assert(S.resumableTokens.count(shared) == 1);
-        assert(*S.resumableTokens.at(shared).master == masterA);
+        require(peerCount(S) == 1 && S.connections.count(idB) == 1);
+        require(S.resumableTokens.count(shared) == 1);
+        require(*S.resumableTokens.at(shared).master == masterA);
 
         processAt(S, MonoTime{ 20000ull * tickNs }, {});   // now B idles out too
-        assert(peerCount(S) == 0);
-        assert(*S.resumableTokens.at(shared).master == masterA);   // A's entry survives, still A's master
-        assert(S.resumableTokens.at(shared).owner == idA);
+        require(peerCount(S) == 0);
+        require(*S.resumableTokens.at(shared).master == masterA);   // A's entry survives, still A's master
+        require(S.resumableTokens.at(shared).owner == idA);
         std::printf("handshake_test: a colliding session token cannot clobber the live resumable\n");
     }
 
@@ -549,17 +549,17 @@ int main() {
         const Bytes tiny{ 0 };   // framing-valid: no cookie, no body -- and far below the minimum
         std::vector<IncomingPacket> small{ control(idA, PacketType::ConnectionRequest, tiny) };
         const auto shed = processAt(S, MonoTime{ tickNs }, small);
-        assert(shed.outgoing.empty());
-        assert(S.pending.empty());
+        require(shed.outgoing.empty());
+        require(S.pending.empty());
 
         const Bytes padded = encodeConnectionRequest({}, {});   // what a real client sends
-        assert(requestDatagramBytes(padded) >= minConnectionRequestBytes);
+        require(requestDatagramBytes(padded) >= minConnectionRequestBytes);
         std::vector<IncomingPacket> ok{ control(idA, PacketType::ConnectionRequest, padded) };
         const auto answered = processAt(S, MonoTime{ 2 * tickNs }, ok);
-        assert(answered.outgoing.size() == 1);
+        require(answered.outgoing.size() == 1);
         const auto retry = replyPacket(answered.outgoing[0]);
-        assert(retry && retry->header.type == PacketType::ConnectionRetry);
-        assert(answered.outgoing[0].data.size() <= requestDatagramBytes(padded));   // no amplification, at all
+        require(retry && retry->header.type == PacketType::ConnectionRetry);
+        require(answered.outgoing[0].data.size() <= requestDatagramBytes(padded));   // no amplification, at all
         std::printf("handshake_test: an undersized request draws no cookie; a padded one is answered 1:1\n");
     }
 
@@ -575,7 +575,7 @@ int main() {
         peerConnect(C, idS, MonoTime{ 0 });
         TestLink link = newTestLink(C, idC, S, idS);
         MonoTime t    = testLinkConnect(link, MonoTime{ 0 }, tickNs, 24);
-        assert(peerIsConnected(S, idC) && peerIsConnected(C, idS));
+        require(peerIsConnected(S, idC) && peerIsConnected(C, idS));
 
         peerSend(C, idS, ChannelId{ 0 }, Bytes{ 1, 2, 3, 4 }, t);
         Bytes datagram;   // captured before the link carries it, so the server has never seen it
@@ -589,20 +589,20 @@ int main() {
                 if (stripped) datagram = *stripped;
             }
         }
-        assert(!datagram.empty());
+        require(!datagram.empty());
 
         Bytes tampered = datagram;
         tampered[8] = static_cast<std::uint8_t>(tampered[8] ^ 0x0F);   // the four bits readHeader throws away
         t = MonoTime{ t.ns + tickNs };
         const auto rejected = processAt(S, t, { IncomingPacket{ idMoved, tampered } });
-        for (const RawPacket& p : rejected.outgoing) assert(p.to != idMoved);
-        assert(S.pathValidations.empty());   // it never authenticated, so no path challenge went out
+        for (const RawPacket& p : rejected.outgoing) require(p.to != idMoved);
+        require(S.pathValidations.empty());   // it never authenticated, so no path challenge went out
 
         t = MonoTime{ t.ns + tickNs };
         const auto probed = processAt(S, t, { IncomingPacket{ idMoved, datagram } });
         bool challenged = false;
         for (const RawPacket& p : probed.outgoing) if (p.to == idMoved) challenged = true;
-        assert(challenged && S.pathValidations.count(idMoved) == 1);   // the untouched copy does
+        require(challenged && S.pathValidations.count(idMoved) == 1);   // the untouched copy does
         std::printf("handshake_test: flipping the discarded header bits breaks the tag on the migration path\n");
     }
 

@@ -1,16 +1,18 @@
+#include "check.hpp"
 // aether - fuzz the decoders. Every byte-parsing path is network-facing, so it must survive
 // arbitrary and truncated input without crashing -- graceful rejection only, never an out-of-bounds
 // read. Deterministic (seeded PRNG) so any failure reproduces. Run under ASan/UBSan it proves there
 // is no OOB read on hostile input; the run completing IS the test.
 #include <aether/aether.hpp>
 
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <optional>
 #include <string>
 #include <vector>
+
+using aether::test::require;
 
 namespace {
 
@@ -99,9 +101,9 @@ int main() {
         // will index or switch on, so the range is a promise the decoder has to keep on hostile input.
         aether::BitReader br{ data.data(), data.size() };
         if (const auto bits = aether::unpackBits<BitProbe>(br)) {
-            assert(bits->small.value <= 5);
-            assert(bits->signed_.value >= -100 && bits->signed_.value <= 100);
-            assert(bits->q.value >= -1.0f && bits->q.value <= 1.0f);
+            require(bits->small.value <= 5);
+            require(bits->signed_.value >= -100 && bits->signed_.value <= 100);
+            require(bits->q.value >= -1.0f && bits->q.value <= 1.0f);
         }
     }
     std::printf("aether fuzz OK: 100k iterations of random/truncated bytes (fixed + dynamic + bit-packed "

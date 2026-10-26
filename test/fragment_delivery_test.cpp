@@ -1,6 +1,5 @@
 #include "check.hpp"
 #include "aether/testnet.hpp"
-#include <cassert>
 #include <cstdio>
 using namespace aether;
 int main() {

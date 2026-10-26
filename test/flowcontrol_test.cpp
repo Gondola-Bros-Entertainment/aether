@@ -9,17 +9,16 @@
 //
 // Note the cap binds on a WITHIN-TICK burst: peerProcess drains every channel into events on every
 // tick, so the receive buffer only accumulates from the packets of a single tick.
-// assert() IS the check -> build WITHOUT NDEBUG.
 #include "aether/channel.hpp"
 #include "aether/connection.hpp"
 #include "aether/peer.hpp"
 #include "aether/testnet.hpp"
 
-#include <cassert>
 #include <cstdint>
 #include <cstdio>
 
 using namespace aether;
+using aether::test::require;
 
 namespace {
 
@@ -57,8 +56,8 @@ MonoTime connectPair(Pair& p, const NetworkConfig& cfg, MonoTime now) {
     p.link   = newTestLink(p.server, p.sp, p.client, p.cp);
     peerConnect(p.client, p.sp, now);
     now = testLinkConnect(p.link, now, tickNs, 400);
-    assert(peerIsConnected(p.client, p.sp));
-    assert(peerIsConnected(p.server, p.cp));
+    require(peerIsConnected(p.client, p.sp));
+    require(peerIsConnected(p.server, p.cp));
     return now;
 }
 
@@ -104,15 +103,15 @@ int main() {
         // doing nothing, so the sender is paced correctly from the start rather than after its first
         // overrun.
         for (int t = 0; t < 5; ++t) { now = MonoTime{ now.ns + tickNs }; testLinkStep(p.link, now); }
-        assert(srv.windowAdvertised);
-        assert(srv.advertisedCredit[0] == cap);
-        assert(p.client.connections.at(p.sp).peerCredit[0] == cap);   // ...and the sender has it
+        require(srv.windowAdvertised);
+        require(srv.advertisedCredit[0] == cap);
+        require(p.client.connections.at(p.sp).peerCredit[0] == cap);   // ...and the sender has it
 
         for (int t = 0; t < 30; ++t) {                   // ...and it is never repeated while the receiver keeps up
             now = MonoTime{ now.ns + tickNs };
             const std::size_t before = srv.sendQueue.size();
             maybeAdvertiseWindow(srv, now);
-            assert(!queuedWindowUpdateSince(srv, before));
+            require(!queuedWindowUpdateSince(srv, before));
         }
     }
 
@@ -134,23 +133,23 @@ int main() {
         Connection& srv = p.server.connections.at(p.cp);
 
         for (int t = 0; t < 5; ++t) { now = MonoTime{ now.ns + tickNs }; testLinkStep(p.link, now); }
-        assert(srv.advertisedCredit[0] == cap);
+        require(srv.advertisedCredit[0] == cap);
 
         // Fill the buffer so the receiver is restricted, and report it.
         for (int i = 0; i < cap; ++i)
             onMessageReceived(srv.channels[0], SequenceNum{ static_cast<std::uint16_t>(i) }, Bytes{ 0x01 }, now);
         now = MonoTime{ now.ns + tickNs };
         maybeAdvertiseWindow(srv, now);
-        assert(srv.advertisedCredit[0] == 0);
+        require(srv.advertisedCredit[0] == 0);
 
         // The application drains: the receiver crosses back out of restricted and emits the reopen.
         srv.channels[0].receiveBuffer.clear();
         now = MonoTime{ now.ns + tickNs };
         std::size_t before = srv.sendQueue.size();
         maybeAdvertiseWindow(srv, now);
-        assert(queuedWindowUpdateSince(srv, before));    // the reopen goes out...
-        assert(srv.advertisedCredit[0] == cap);
-        assert(!srv.windowUpdateAcked);                  // ...and is outstanding until a header covers it
+        require(queuedWindowUpdateSince(srv, before));   // the reopen goes out...
+        require(srv.advertisedCredit[0] == cap);
+        require(!srv.windowUpdateAcked);                 // ...and is outstanding until a header covers it
 
         // Now LOSE it: never deliver the ack. The receiver is unrestricted and its free count is
         // steady, so nothing about its own state will ever prompt it again -- only the fact that the
@@ -162,7 +161,7 @@ int main() {
             maybeAdvertiseWindow(srv, now);
             resent = queuedWindowUpdateSince(srv, before);
         }
-        assert(resent);   // otherwise the sender stays at credit 0
+        require(resent);   // otherwise the sender stays at credit 0
 
         // And once the peer finally acknowledges it, the repeats stop: this must not become a
         // permanent 250ms heartbeat on an idle healthy link.
@@ -171,12 +170,12 @@ int main() {
         ack.ack     = srv.windowUpdateSeq;
         ack.ackBits = 0;
         processIncomingAcks(srv, ack, now);
-        assert(srv.windowUpdateAcked);
+        require(srv.windowUpdateAcked);
         for (int t = 0; t < 60; ++t) {
             now    = MonoTime{ now.ns + tickNs };
             before = srv.sendQueue.size();
             maybeAdvertiseWindow(srv, now);
-            assert(!queuedWindowUpdateSince(srv, before));   // confirmed: silent again
+            require(!queuedWindowUpdateSince(srv, before));   // confirmed: silent again
         }
     }
 
@@ -189,42 +188,41 @@ int main() {
         Connection& cli = p.client.connections.at(p.sp);
 
         for (int t = 0; t < 5; ++t) { now = MonoTime{ now.ns + tickNs }; testLinkStep(p.link, now); }
-        assert(srv.advertisedCredit[0] == cap);          // capacity established during the handshake
+        require(srv.advertisedCredit[0] == cap);         // capacity established during the handshake
 
         // Now hold messages in the buffer: this models a collection that did not keep up, which is
         // the only way occupancy survives past a tick. Sequences from 0 so an ordered channel
         // delivers each one straight through rather than holding it in the reorder buffer.
         for (int i = 0; i < cap; ++i)
             onMessageReceived(srv.channels[0], SequenceNum{ static_cast<std::uint16_t>(i) }, Bytes{ 0x01 }, now);
-        assert(channelFreeReceiveSlots(srv.channels[0]) == 0);
+        require(channelFreeReceiveSlots(srv.channels[0]) == 0);
 
         now = MonoTime{ now.ns + tickNs };
         const std::size_t before = srv.sendQueue.size();
         maybeAdvertiseWindow(srv, now);
-        assert(queuedWindowUpdateSince(srv, before));   // the restriction is reported
-        assert(srv.windowAdvertised);
-        assert(srv.advertisedCredit[0] == 0);
+        require(queuedWindowUpdateSince(srv, before));   // the restriction is reported
+        require(srv.windowAdvertised);
+        require(srv.advertisedCredit[0] == 0);
 
-        // Deliver that advertisement to the sender. Hoisted out of assert(): the call mutates credit,
-        // so under NDEBUG an assert would drop the delivery along with the check.
+        // Deliver that advertisement to the sender.
         const Bytes upd       = encodeWindowUpdate(srv);
         const bool  delivered = applyWindowUpdate(cli, freshWindowHeader(cli), ByteSpan(upd.data(), upd.size()));
-        assert(delivered);
-        assert(cli.peerCredit[0] == 0);
+        require(delivered);
+        require(cli.peerCredit[0] == 0);
 
         // With no credit the sender must admit nothing -- and must not lose it either. The messages
         // stay queued, which is what makes channelSend report BufferFull to the application instead
         // of the wire quietly eating one.
         for (int i = 0; i < 8; ++i) {
             const auto err = sendMessage(cli, ChannelId{ 0 }, Bytes(32, 0xAB), now);
-            assert(!err);
+            require(!err);
         }
         now = MonoTime{ now.ns + tickNs };
         const std::size_t q = cli.sendQueue.size();
         updateConnectedPure(cli, now);
-        assert(payloadsQueuedSince(cli, q) == 0);            // nothing went out
-        assert(cli.channels[0].sendBuffer.size() == 8);      // ...and nothing was dropped to make it so
-        assert(cli.channels[0].totalDropped == 0);
+        require(payloadsQueuedSince(cli, q) == 0);           // nothing went out
+        require(cli.channels[0].sendBuffer.size() == 8);     // ...and nothing was dropped to make it so
+        require(cli.channels[0].totalDropped == 0);
 
         // A blocked message must not burn its retry budget either: that burn is exactly the data
         // loss the advertised window exists to prevent.
@@ -232,16 +230,16 @@ int main() {
             now = MonoTime{ now.ns + tickNs };
             updateConnectedPure(cli, now);
         }
-        assert(cli.channels[0].sendBuffer.size() == 8);
-        assert(cli.channels[0].totalDropped == 0);
-        assert(cli.channels[0].totalRetransmits == 0);
+        require(cli.channels[0].sendBuffer.size() == 8);
+        require(cli.channels[0].totalDropped == 0);
+        require(cli.channels[0].totalRetransmits == 0);
 
         // Reopen: the sender resumes immediately.
         cli.peerCredit[0] = 256;
         now = MonoTime{ now.ns + tickNs };
         const std::size_t q2 = cli.sendQueue.size();
         updateConnectedPure(cli, now);
-        assert(payloadsQueuedSince(cli, q2) > 0);
+        require(payloadsQueuedSince(cli, q2) > 0);
     }
 
     // ---- the window must never wedge a live connection ----
@@ -269,9 +267,9 @@ int main() {
                 if (e.kind == PeerEvent::Message) ++delivered;
             if (sent == total && delivered == total) break;
         }
-        assert(sent == total);
-        assert(delivered == total);   // the window throttled, it never stranded anything
-        assert(p.client.connections.at(p.sp).channels[0].totalDropped == 0);
+        require(sent == total);
+        require(delivered == total);   // the window throttled, it never stranded anything
+        require(p.client.connections.at(p.sp).channels[0].totalDropped == 0);
     }
 
     // ---- a full REORDER buffer closes the advertised window ----
@@ -295,48 +293,48 @@ int main() {
         Connection& srv = p.server.connections.at(p.cp);
         Connection& cli = p.client.connections.at(p.sp);
         for (int t = 0; t < 5; ++t) { now = MonoTime{ now.ns + tickNs }; testLinkStep(p.link, now); }
-        assert(srv.advertisedCredit[0] == 8192);   // no gap yet: the receive buffer is the only limit
+        require(srv.advertisedCredit[0] == 8192);   // no gap yet: the receive buffer is the only limit
 
         // seq 0 is lost; 1..4 arrive and fill the reorder buffer, so the 5th has nowhere to go.
         for (std::uint16_t s = 1; s <= 4; ++s)
             onMessageReceived(srv.channels[0], SequenceNum{ s }, Bytes{ 0x01 }, now);
         const bool refused = onMessageReceived(srv.channels[0], SequenceNum{ 5 }, Bytes{ 0x01 }, now);
-        assert(!refused);
-        assert(srv.channels[0].totalRefused == 1);
-        assert(channelFreeReceiveSlots(srv.channels[0]) == 1);   // the credit SEES the reorder buffer
+        require(!refused);
+        require(srv.channels[0].totalRefused == 1);
+        require(channelFreeReceiveSlots(srv.channels[0]) == 1);   // the credit SEES the reorder buffer
 
         now = MonoTime{ now.ns + tickNs };
         const std::size_t before = srv.sendQueue.size();
         maybeAdvertiseWindow(srv, now);
-        assert(queuedWindowUpdateSince(srv, before));            // ...and the receiver reports it
-        assert(srv.advertisedCredit[0] == 1);
+        require(queuedWindowUpdateSince(srv, before));           // ...and the receiver reports it
+        require(srv.advertisedCredit[0] == 1);
 
-        // Deliver it. Hoisted out of assert(): applyWindowUpdate mutates credit.
+        // Deliver it.
         const Bytes upd       = encodeWindowUpdate(srv);
         const bool  delivered = applyWindowUpdate(cli, freshWindowHeader(cli), ByteSpan(upd.data(), upd.size()));
-        assert(delivered);
-        assert(cli.peerCredit[0] == 1);
+        require(delivered);
+        require(cli.peerCredit[0] == 1);
 
         // The sender stops at that one slot instead of pushing a run of messages into a buffer
         // that cannot take any of them -- and nothing is dropped to make it so.
         for (int i = 0; i < 8; ++i) {
             const auto err = sendMessage(cli, ChannelId{ 0 }, Bytes(32, 0xAB), now);
-            assert(!err);
+            require(!err);
         }
         now = MonoTime{ now.ns + tickNs };
         const std::size_t q = cli.sendQueue.size();
         updateConnectedPure(cli, now);
-        assert(payloadsQueuedSince(cli, q) == 1);              // exactly the room the receiver stated
-        assert(cli.channels[0].sendBuffer.size() == 8);
-        assert(cli.channels[0].totalDropped == 0);
-        assert(cli.channels[0].totalReliableDropped == 0);
+        require(payloadsQueuedSince(cli, q) == 1);             // exactly the room the receiver stated
+        require(cli.channels[0].sendBuffer.size() == 8);
+        require(cli.channels[0].totalDropped == 0);
+        require(cli.channels[0].totalReliableDropped == 0);
 
         // The one-slot floor is what keeps this backpressure rather than deadlock: the message that
         // FILLS the gap is delivered straight through, so the window reopens on its own.
         const bool filled = onMessageReceived(srv.channels[0], SequenceNum{ 0 }, Bytes{ 0x01 }, now);
-        assert(filled);
-        assert(srv.channels[0].orderedBuffer.empty());
-        assert(channelFreeReceiveSlots(srv.channels[0]) == 8192 - 5);
+        require(filled);
+        require(srv.channels[0].orderedBuffer.empty());
+        require(channelFreeReceiveSlots(srv.channels[0]) == 8192 - 5);
     }
 
     // ---- the decoder rejects hostile bytes ----
@@ -346,8 +344,6 @@ int main() {
         (void)now;
         Connection& cli = p.client.connections.at(p.sp);
 
-        // applyWindowUpdate mutates credit, so every call is hoisted out of assert(): inside one it
-        // would vanish under NDEBUG and take the state change with it.
         const PacketHeader h = freshWindowHeader(cli);   // framing is judged before freshness, so one header serves
         const std::uint8_t tooMany[]    = { maxChannelCount + 1 };
         const std::uint8_t shortBuf[]   = { 1, 0, 0 };
@@ -359,11 +355,11 @@ int main() {
         const bool rejShort   = applyWindowUpdate(cli, h, ByteSpan(shortBuf, sizeof shortBuf));
         const bool rejLong    = applyWindowUpdate(cli, h, ByteSpan(longBuf, sizeof longBuf));
         const bool rejChannel = applyWindowUpdate(cli, h, ByteSpan(badChannel, sizeof badChannel));
-        assert(!rejEmpty);     // empty
-        assert(!rejCount);     // count past the channel max
-        assert(!rejShort);     // count 1 needs 4 bytes
-        assert(!rejLong);      // trailing byte: not what the encoder emits
-        assert(!rejChannel);   // channel 7, only 1 configured
+        require(!rejEmpty);     // empty
+        require(!rejCount);     // count past the channel max
+        require(!rejShort);     // count 1 needs 4 bytes
+        require(!rejLong);      // trailing byte: not what the encoder emits
+        require(!rejChannel);   // channel 7, only 1 configured
 
         // A rejected update must leave credit exactly as it was: a two-entry update whose SECOND entry
         // names a channel we do not have must not write the first before returning false, which would
@@ -371,15 +367,15 @@ int main() {
         const std::uint16_t before    = cli.peerCredit[0];
         const std::uint8_t  halfBad[] = { 2, 0, 0x00, 0x05, 7, 0x00, 0x09 };
         const bool          rejHalf   = applyWindowUpdate(cli, h, ByteSpan(halfBad, sizeof halfBad));
-        assert(!rejHalf);
-        assert(cli.peerCredit[0] == before);   // untouched, not 5
+        require(!rejHalf);
+        require(cli.peerCredit[0] == before);   // untouched, not 5
 
         const std::uint16_t was     = cli.peerCredit[0];
         const std::uint8_t  good[]  = { 1, 0, 0x01, 0x2C };                        // channel 0 <- 300
         const bool          applied = applyWindowUpdate(cli, h, ByteSpan(good, sizeof good));
-        assert(applied);
-        assert(cli.peerCredit[0] == 300);
-        assert(was != 300);
+        require(applied);
+        require(cli.peerCredit[0] == 300);
+        require(was != 300);
 
         // Credit is absolute, so a REORDERED update must not overwrite a newer one. UDP delivering an
         // older "0 free" behind a newer "300 free" would otherwise shut the window with the receiver
@@ -387,13 +383,13 @@ int main() {
         const std::uint8_t stale[]   = { 1, 0, 0x00, 0x00 };
         const bool         rejStale  = applyWindowUpdate(cli, windowHeader(static_cast<std::uint16_t>(h.sequence.value - 1)),
                                                          ByteSpan(stale, sizeof stale));
-        assert(!rejStale);
-        assert(cli.peerCredit[0] == 300);
+        require(!rejStale);
+        require(cli.peerCredit[0] == 300);
         const std::uint8_t fresher[] = { 1, 0, 0x00, 0x07 };
         const bool         appliedNewer = applyWindowUpdate(cli, windowHeader(static_cast<std::uint16_t>(h.sequence.value + 1)),
                                                             ByteSpan(fresher, sizeof fresher));
-        assert(appliedNewer);
-        assert(cli.peerCredit[0] == 7);     // a strictly newer sequence still lands
+        require(appliedNewer);
+        require(cli.peerCredit[0] == 7);    // a strictly newer sequence still lands
     }
 
     std::printf("flowcontrol_test: all assertions passed\n");

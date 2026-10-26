@@ -1,17 +1,19 @@
+#include "check.hpp"
 // wire-contract arithmetic edges: the non-obvious Ranged/Quantized boundary cases the
 // roundtrip smoke test does not cover -- negative Lo, the full int32 span (sign-extension
 // cancellation), a zero-bit range (Lo == Hi), Quantized at the 2^32 endpoint (the double
 // math that dodges the uint32 UB), and a non-finite Quantized input (NaN, which no
 // comparison clamps). Each value round-trips BitWriter -> BitReader.
-// Standalone: assert() is the check, one success line, no framework. Data-first.
+// Standalone: one success line, no framework. Data-first.
 #include "aether/bitpack.hpp"
 #include "aether/wire.hpp"
 
-#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
+
+using aether::test::require;
 
 // Round-trip a single wire-contract field through the bit cursors and hand back the value.
 template <class Field>
@@ -20,12 +22,12 @@ static decltype(Field::value) roundtrip(const Field& in) {
     aether::BitWriter w{ buf, sizeof buf };
     aether::writeWire(w, in);
     const std::size_t n = aether::flushBits(w);
-    assert(w.ok);
+    require(w.ok);
 
     aether::BitReader r{ buf, n };
     Field out{};
     aether::readWire(r, out);
-    assert(r.ok);
+    require(r.ok);
     return out.value;
 }
 
@@ -37,7 +39,7 @@ int main() {
         const int lo  = roundtrip(R{ -100 });
         const int mid = roundtrip(R{ -7 });
         const int hi  = roundtrip(R{ 100 });
-        assert(lo == -100 && mid == -7 && hi == 100);
+        require(lo == -100 && mid == -7 && hi == 100);
     }
 
     // Ranged spanning the full int32 range: span = (uint64)INT32_MAX - (uint64)INT32_MIN is
@@ -53,7 +55,7 @@ int main() {
         const std::int32_t hi   = roundtrip(R{ INT32_MAX });
         const std::int32_t zero = roundtrip(R{ 0 });
         const std::int32_t neg1 = roundtrip(R{ -1 });
-        assert(lo == INT32_MIN && hi == INT32_MAX && zero == 0 && neg1 == -1);
+        require(lo == INT32_MIN && hi == INT32_MAX && zero == 0 && neg1 == -1);
     }
 
     // Zero-bit Ranged (Lo == Hi): the value is a constant, costs 0 bits, and decodes back to Lo.
@@ -64,12 +66,12 @@ int main() {
         aether::BitWriter w{ buf, sizeof buf };
         aether::writeWire(w, R{ 42 });
         const std::size_t n = aether::flushBits(w);
-        assert(w.ok && n == 0);   // nothing written for a 0-bit field
+        require(w.ok && n == 0);   // nothing written for a 0-bit field
 
         aether::BitReader r{ buf, n };
         R out{ 0 };
         aether::readWire(r, out);
-        assert(r.ok && out.value == 42);   // reconstructed from Lo, no bits read
+        require(r.ok && out.value == 42);   // reconstructed from Lo, no bits read
     }
 
     // Quantized with Bits == 32: maxv = 2^32-1 done in double (a float cast would round up to
@@ -81,8 +83,8 @@ int main() {
         const float eps  = step * 4.0f;            // a few steps; float storage adds ~1e-7 abs here
         const float lo = roundtrip(Q{ -1.0f });
         const float hi = roundtrip(Q{ 1.0f });
-        assert(std::fabs(lo - (-1.0f)) < eps);
-        assert(std::fabs(hi - 1.0f) < eps);
+        require(std::fabs(lo - (-1.0f)) < eps);
+        require(std::fabs(hi - 1.0f) < eps);
     }
 
     // A non-finite Quantized input must still land inside the contract. NaN fails every comparison,
@@ -99,10 +101,10 @@ int main() {
         const float fromNegInf = roundtrip(Q{ -inf });
         const float fromLo     = roundtrip(Q{ -1.0f });
         const float fromHi     = roundtrip(Q{ 1.0f });
-        assert(fromNan >= -1.0f && fromNan <= 1.0f);   // in contract, whatever the app sent
-        assert(fromNan == fromLo);
-        assert(fromPosInf == fromHi);
-        assert(fromNegInf == fromLo);
+        require(fromNan >= -1.0f && fromNan <= 1.0f);   // in contract, whatever the app sent
+        require(fromNan == fromLo);
+        require(fromPosInf == fromHi);
+        require(fromNegInf == fromLo);
     }
 
     // A Ranged field whose span is not 2^n-1 has unrepresented bit patterns: Ranged<0,5> costs 3 bits,
@@ -117,14 +119,14 @@ int main() {
             aether::BitWriter w{ buf, sizeof buf };
             aether::writeBits(w, raw, 3);            // stands in for a hostile or buggy encoder
             const std::size_t n = aether::flushBits(w);
-            assert(w.ok);
+            require(w.ok);
 
             aether::BitReader r{ buf, n };
             R out{ 0 };
             aether::readWire(r, out);
-            assert(r.ok);
-            assert(out.value <= 5);                                       // in contract for every input
-            assert(out.value == (raw <= 5 ? static_cast<std::uint8_t>(raw) : 5));   // exact below the cap, clamped above
+            require(r.ok);
+            require(out.value <= 5);                                      // in contract for every input
+            require(out.value == (raw <= 5 ? static_cast<std::uint8_t>(raw) : 5));   // exact below the cap, clamped above
         }
         // A negative-Lo range clamps to Hi the same way (the offset is unsigned, so this checks the
         // clamp happens before the Lo shift, not after).
@@ -136,7 +138,7 @@ int main() {
         aether::BitReader sr{ sbuf, sn };
         S sout{ -10 };
         aether::readWire(sr, sout);
-        assert(sr.ok && sout.value == -8);
+        require(sr.ok && sout.value == -8);
     }
 
     std::printf("aether wire-edges OK: negative-Lo, full-int32 (32 bits), zero-bit Ranged, "
