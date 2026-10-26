@@ -543,7 +543,7 @@ inline std::vector<PeerEvent> handlePacket(NetPeer& peer, const PeerId& pid, con
 }
 
 // --- outgoing: build the datagram in its final layout, in one allocation ---
-// A datagram is [header:9][payload][crc:4] in the clear, or [header:9][counter:8][ciphertext][tag:16][crc:4]
+// A datagram is [header:17][payload][crc:4] in the clear, or [header:17][counter:8][ciphertext][tag:16][crc:4]
 // once keyed. Both are assembled directly into one exactly-sized buffer: the size is known before any
 // bytes are written, so the ciphertext is encrypted straight into place and the CRC is computed over the
 // finished bytes. (Serializing, slicing off the header, encrypting into a second buffer, appending it, then
