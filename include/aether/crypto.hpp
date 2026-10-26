@@ -9,9 +9,11 @@
 
 #include "aether/types.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <optional>
 
 namespace aether {
@@ -188,24 +190,28 @@ inline void poly1305Absorb(Poly1305State& st, const std::uint8_t buf[17]) noexce
 
 inline void poly1305Update(Poly1305State& st, const std::uint8_t* msg, std::size_t len) noexcept {
     if (len == 0) return; // Empty updates accept nullptr and leave a carried partial block intact.
+    // Every copy states its byte count, bounded by the room left in its destination. GCC at -O3 cannot
+    // prove that bound for a byte-at-a-time copy once a short constant length is inlined, and reports
+    // overflows that cannot happen.
     std::size_t  off = 0;
     std::uint8_t buf[17];
     if (st.blockLen > 0) {                                       // top up a carried partial block first
-        while (st.blockLen < 16 && off < len) st.block[st.blockLen++] = msg[off++];
-        if (st.blockLen == 16) {
-            for (int i = 0; i < 16; ++i) buf[i] = st.block[i];
-            buf[16] = 1;
-            poly1305Absorb(st, buf);
-            st.blockLen = 0;
-        }
+        off = std::min(sizeof st.block - st.blockLen, len);
+        std::memcpy(st.block + st.blockLen, msg, off);
+        st.blockLen += off;
+        if (st.blockLen < sizeof st.block) return;               // msg ran out before the block filled
+        std::memcpy(buf, st.block, sizeof st.block);
+        buf[16] = 1;
+        poly1305Absorb(st, buf);
     }
     while (len - off >= 16) {                                    // whole blocks straight from msg
-        for (int i = 0; i < 16; ++i) buf[i] = msg[off + i];
+        std::memcpy(buf, msg + off, 16);
         buf[16] = 1;
         poly1305Absorb(st, buf);
         off += 16;
     }
-    while (off < len) st.block[st.blockLen++] = msg[off++];      // stash the remainder
+    st.blockLen = len - off;                                     // stash the remainder, under 16 bytes
+    std::memcpy(st.block, msg + off, st.blockLen);
 }
 
 // Zero-pad the carried partial block up to 16 (RFC pad1/pad2); a no-op when already aligned.

@@ -116,6 +116,27 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure --timeout 120
 
+  # The current GCC release, whose -O3 analysis reports diagnostics that GCC 12 does not. Ubuntu
+  # 24.04 does not package it, so the job runs in the official GCC image, pinned by digest.
+  optimized-gcc16:
+    name: optimized / gcc16
+    needs: sanitizers
+    timeout-minutes: 20
+    runs-on: ubuntu-24.04
+    container: gcc:16.2.0@sha256:07280eb2e744f1b7a2d8d4a3894c089ea07266c109758afc388a634bd098e4eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install CMake and Python
+        run: apt-get update && apt-get install -y --no-install-recommends cmake python3
+      - name: Configure optimized checks with assertions active
+        run: cmake -B build -DCMAKE_CXX_COMPILER=g++ -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS_RELEASE=-O3 -DAETHER_WERROR=ON
+      - name: Build
+        run: cmake --build build --parallel 2
+      - name: Test
+        run: ctest --test-dir build --output-on-failure --timeout 120
+
   windows:
     name: windows / msvc
     needs: sanitizers
@@ -138,7 +159,7 @@ jobs:
   # Match Release configurations for both single- and multi-config generators.
   package:
     name: package / ${{ matrix.os }}
-    needs: [build-test, windows, optimized-gcc12]
+    needs: [build-test, windows, optimized-gcc12, optimized-gcc16]
     strategy:
       fail-fast: false
       matrix:
