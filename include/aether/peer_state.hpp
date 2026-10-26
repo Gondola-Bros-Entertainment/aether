@@ -62,6 +62,10 @@ inline PeerEvent evReconnected(const PeerId& p, std::uint64_t playerId = 0) { re
 struct IncomingPacket { PeerId from; Bytes data; };
 struct RawPacket      { PeerId to;   Bytes data; };
 
+// Challenges a client pending may spend Diffie-Hellman work on: per pending in the anonymous
+// handshake, per retry interval in the authenticated one.
+inline constexpr int maxChallengeKeyAttempts = 3;
+
 struct PendingConnection {
     ConnectionDirection direction = ConnectionDirection::Inbound;
     std::uint64_t       serverSalt = 0;
