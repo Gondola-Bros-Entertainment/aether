@@ -119,10 +119,9 @@ inline std::vector<PeerEvent> handleConnectionRetry(NetPeer& peer, const PeerId&
 // one (a retransmit, answered with the same response) or replaces it whole.
 //
 // Replacing means a fresh keypair and a fresh ECDH, which is real work per challenge, so it is bounded
-// like the cookie handoff: enough for a server that legitimately re-challenges with new material,
-// nowhere near enough to be a CPU sink for an off-path source spoofing the server's address.
-inline constexpr int maxChallengeKeyAttempts = 3;
-
+// by maxChallengeKeyAttempts like the cookie handoff: enough for a server that legitimately
+// re-challenges with new material, nowhere near enough to be a CPU sink for an off-path source
+// spoofing the server's address.
 inline std::vector<PeerEvent> handleConnectionChallenge(NetPeer& peer, const PeerId& pid, const Packet& pkt, MonoTime now) {
     const auto it = peer.pending.find(pid);
     if (it == peer.pending.end() || it->second.direction != ConnectionDirection::Outbound) return {};

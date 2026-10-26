@@ -134,7 +134,7 @@ inline std::vector<PeerEvent> handleAuthChallenge(NetPeer& peer, const PeerId& p
             pending.challengeBudgetAt = now;
             pending.challengeKeyAttempts = 0;
         }
-        if (pending.challengeKeyAttempts >= 3) return {};
+        if (pending.challengeKeyAttempts >= maxChallengeKeyAttempts) return {};
         ++pending.challengeKeyAttempts;
         if (!detail::noiseReadSecond(auth.noise, *second)) return {};
         auth.keys = detail::noiseFinish(auth.noise);
