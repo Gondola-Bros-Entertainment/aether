@@ -89,7 +89,8 @@ struct PendingWire {
     ChannelMsg msg{};       // (channel, channelSeq) -- used for reliability when reliable
 };
 
-// One peer connection.
+// One peer connection. Fields are grouped by concern rather than ordered to minimize padding.
+// NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 struct Connection {
     NetworkConfig                config;
     ConnectionState              state      = ConnectionState::Disconnected;

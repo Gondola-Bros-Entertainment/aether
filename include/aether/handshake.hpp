@@ -124,7 +124,7 @@ inline std::optional<Bytes> noiseReadFirst(NoiseState& state, ByteSpan message) 
     std::copy_n(message.begin(), next.remotePublic.size(), next.remotePublic.begin());
     noiseMixHash(next, next.remotePublic);
     noiseMixKey(next, next.remotePublic);
-    const auto payload = noiseOpen(next.key, 0, next.hash, message.subspan(32));
+    auto payload = noiseOpen(next.key, 0, next.hash, message.subspan(32));
     if (!payload) return std::nullopt;
     noiseMixHash(next, message.subspan(32));
     next.phase = NoisePhase::ReadyToReply;
@@ -165,7 +165,7 @@ inline std::optional<Bytes> noiseReadSecond(NoiseState& state, ByteSpan message)
     if (!shared) return std::nullopt;
     noiseMixKey(next, *shared);
     secureZero(shared->data(), shared->size());
-    const auto payload = noiseOpen(next.key, 0, next.hash, message.subspan(32));
+    auto payload = noiseOpen(next.key, 0, next.hash, message.subspan(32));
     if (!payload) return std::nullopt;
     noiseMixHash(next, message.subspan(32));
     secureZero(next.ephemeralPrivate.data(), next.ephemeralPrivate.size());

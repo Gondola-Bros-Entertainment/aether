@@ -34,9 +34,9 @@ cmake --build build --config Debug
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-CI uses cppcheck 2.21.0, ASan/UBSan, and compiler tests with GCC, Clang, and MSVC,
-including native Linux ARM64 transport tests. Installed-package consumers run on
-Linux, macOS, and Windows.
+CI uses cppcheck 2.21.0, clang-tidy 22.1.7, ASan/UBSan, and compiler tests with GCC,
+Clang, and MSVC, including native Linux ARM64 transport tests. Installed-package
+consumers run on Linux, macOS, and Windows.
 
 The [credential issuer](examples/echo_credentials.cpp), [echo server](examples/echo_server.cpp)
 and [echo client](examples/echo_client.cpp) exercise the authenticated public API.

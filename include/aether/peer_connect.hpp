@@ -65,21 +65,21 @@ inline std::optional<ConnectError> peerReconnect(NetPeer& peer, const PeerId& pi
     if (const auto error = canConnect(peer, pid)) return error;
     if (fallback && !credentialValid(*fallback, peer.config.protocolId)) return ConnectError::InvalidCredential;
     const auto cached = peer.resumableTokens.find(token);
-    if (cached == peer.resumableTokens.end() || !cached->second.master
-        || elapsedMs(cached->second.at, now) >= resumeGraceMs) {
+    const ResumableSession* const session = cached != peer.resumableTokens.end() ? &cached->second : nullptr;
+    if (!session || !session->master || elapsedMs(session->at, now) >= resumeGraceMs) {
         if (fallback) return peerConnectWithToken(peer, pid, *fallback, now);
         return peerConnect(peer, pid, now);
     }
-    if (cached->second.scope.protocolId != peer.config.protocolId
-        || (!cached->second.authenticated && (!peer.config.allowUnauthenticated || peer.config.tokenKey)))
+    if (session->scope.protocolId != peer.config.protocolId
+        || (!session->authenticated && (!peer.config.allowUnauthenticated || peer.config.tokenKey)))
         return ConnectError::AuthenticationRequired;
     auto pending = newOutboundPending(now);
     pending.clientSalt = token;
     pending.isReconnect = true;
     pending.fallbackCredential = std::move(fallback);
-    pending.auth = startAuthHandshake(AuthRequestMode::Resume, token, cached->second.scope, {}, *cached->second.master);
-    pending.auth->authenticated = cached->second.authenticated;
-    pending.auth->resumeBefore = cached->second.master;
+    pending.auth = startAuthHandshake(AuthRequestMode::Resume, token, session->scope, {}, *session->master);
+    pending.auth->authenticated = session->authenticated;
+    pending.auth->resumeBefore = session->master;
     queueControlPacket(peer, PacketType::ConnectionRequest, encodeConnectionRequest({}, pending.auth->request), pid);
     peer.pending.emplace(pid, std::move(pending));
     return std::nullopt;

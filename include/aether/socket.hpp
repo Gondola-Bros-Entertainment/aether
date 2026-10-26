@@ -23,7 +23,7 @@ inline constexpr std::size_t addrStorageSize  = 128;   // >= sizeof(sockaddr_sto
 // datagrams count too. The byte budget must admit any one socket datagram.
 struct ReceiveBudget {
     std::size_t maxDatagrams = 256;
-    std::size_t maxBytes = 256 * 1024;
+    std::size_t maxBytes = std::size_t{256} * 1024;
 };
 inline bool receiveBudgetValid(const ReceiveBudget& budget) noexcept {
     return budget.maxDatagrams > 0 && budget.maxBytes >= maxUdpPacketSize;

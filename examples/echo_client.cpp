@@ -3,6 +3,7 @@
 #include <aether/net.hpp>
 
 #include <cstdio>
+#include <exception>
 #include <optional>
 #include <string>
 #include <thread>
@@ -46,7 +47,7 @@ int runEcho(aether::Host& host, const aether::Address& server, const std::string
 
 } // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     const auto port = aether_example::parsePort(argc > 3 ? argv[3] : "7777");
     const auto credential = argc >= 2 ? aether_example::readCredential(argv[1]) : std::nullopt;
     if (argc > 5 || !port || !credential) {
@@ -71,4 +72,8 @@ int main(int argc, char** argv) {
     const int result = runEcho(*host, server, message, *credential);
     aether::closeHost(*host);
     return result;
+}
+ catch (const std::exception& error) {
+    std::fprintf(stderr, "aether_echo_client: %s\n", error.what());
+    return 1;
 }
