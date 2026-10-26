@@ -14,8 +14,7 @@ It draws a unique 32-byte PSK from the OS CSPRNG, seals the claims, and returns 
 `ConnectCredential` containing the sealed bytes, separate PSK, scope and expiry.
 Deliver that complete object through the backend's authenticated confidential channel.
 The issuer key belongs only on the backend and admitting servers. Each client receives
-its own PSK; it cannot open another player's token. Cloudflare, SSH and CI credentials
-have no role in this protocol.
+its own PSK; it cannot open another player's token.
 
 The client authenticates a responder that possesses its credential PSK, obtained here
 by opening its token with the issuer key. The server authenticates possession of that
