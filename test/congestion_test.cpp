@@ -1,6 +1,6 @@
-// Congestion control: pins the parts an audit found untested -- the Good/Bad AIMD rate
-// controller (ccUpdate), RFC 2861 idle slow-start restart, window pacing gates, and the
-// sliding-window bandwidth tracker. Data-first: structs driven by free functions, assert checks.
+// Congestion control: pins the Good/Bad AIMD rate controller (ccUpdate), RFC 2861 idle slow-start
+// restart, window pacing gates, and the sliding-window bandwidth tracker. Data-first: structs driven
+// by free functions, assert checks.
 // New Reno cwOnAck/cwOnLoss are covered elsewhere and not re-pinned here.
 #include "aether/congestion.hpp"
 
@@ -152,8 +152,8 @@ int main() {
 
     // --- ...and pacing is not a function of the caller's TICK RATE ---
     // The same second of wall clock must release the same number of packets whether the application
-    // ticks at 20Hz or 144Hz. Comparing `now` against a per-flush timestamp made the answer swing
-    // between "everything" and "nothing" purely on where the tick boundary fell.
+    // ticks at 20Hz or 144Hz. Comparing `now` against a per-flush timestamp would make the answer
+    // swing between "everything" and "nothing" purely on where the tick boundary falls.
     {
         const auto releasedInOneSecond = [](double hz) {
             CongestionWindow cw = newCongestionWindow(1200);
@@ -203,8 +203,7 @@ int main() {
     }
 
     // --- the AIMD ramp is held under the configured packet-rate cap, not just 4x base ---
-    // maxPacketRate was validated at setup and then never enforced, so the ramp ran to 4*sendRate
-    // regardless of it.
+    // A validated maxPacketRate must also bind the ramp, which would otherwise run to 4*sendRate.
     {
         CongestionController cc = newCongestionController(60.0, 120.0, 0.1, 100.0, 2000.0);
         assert(ccMaxSendRate(cc) == 120.0);             // min(4*60, 120), not 240
@@ -213,8 +212,8 @@ int main() {
     }
 
     // --- the byte budget is a TOKEN BUCKET earned from elapsed time, not a per-tick grant ---
-    // It used to hand out a full second's worth on every call, so a 60Hz loop was allowed 60x the
-    // configured send rate and the rate arm of the controller never actually bound.
+    // A full second's worth per call would let a 60Hz loop send 60x the configured rate, and the rate
+    // arm of the controller would never bind.
     {
         constexpr int mtu = 1200;
         CongestionController cc = newCongestionController(60.0, 120.0, 0.1, 100.0, 2000.0);
@@ -254,13 +253,13 @@ int main() {
     }
 
     // --- a run where every packet is lost must not leak the window shut ---
-    // Nothing returned a lost packet's bytes, so bytesInFlight only ever grew until it reached cwnd
-    // and the window stopped admitting anything but sub-64-byte reliable messages.
+    // A lost packet's bytes must leave bytesInFlight; otherwise it only grows until it reaches cwnd
+    // and the window admits nothing but sub-64-byte reliable messages.
     {
         CongestionWindow cw = newCongestionWindow(1200);
         for (int i = 0; i < 500; ++i) {
             cwOnSend(cw, 1200, atMs(i * 16.0));
-            cwReleaseInFlight(cw, 1200);                // what processIncomingHeader does with lostBytes
+            cwReleaseInFlight(cw, 1200);                // what processIncomingAcks does with lostBytes
             cwOnLoss(cw);
         }
         assert(cw.bytesInFlight == 0);
@@ -268,8 +267,8 @@ int main() {
     }
 
     // --- the additive increase is per SECOND, so the ramp does not depend on the caller's tick rate ---
-    // A per-call increment made the send rate a function of frame rate: a 144Hz loop ramped more than
-    // 7x faster than a 20Hz one from identical network conditions.
+    // A per-call increment would make the send rate a function of frame rate: a 144Hz loop would ramp
+    // more than 7x faster than a 20Hz one from identical network conditions.
     {
         CongestionController fast = newCongestionController(60.0, 1000.0, 0.1, 100.0, 2000.0);
         CongestionController slow = newCongestionController(60.0, 1000.0, 0.1, 100.0, 2000.0);
@@ -376,7 +375,7 @@ int main() {
         abandonSentPackets(ep);                          // what updateConnectedPure does on a restart
         assert(packetsInFlight(ep) == 0);
 
-        // A late ack for an abandoned record now resolves to nothing, so it cannot subtract bytes the
+        // A late ack for an abandoned record resolves to nothing, so it cannot subtract bytes the
         // window no longer holds.
         const AckResult late = processAcks(ep, SequenceNum{ 20 }, 0xFFFFFFFFull, atMs(1100.0));
         assert(late.ackedBytes == 0 && late.lostBytes == 0 && late.acked.empty());

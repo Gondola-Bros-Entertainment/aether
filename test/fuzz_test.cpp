@@ -17,8 +17,8 @@ namespace {
 struct Probe { std::int32_t a; float b; std::uint64_t c; bool d; std::int16_t e; std::uint8_t f; };
 
 // Dynamic-length fields (string / vector / optional + nested vector<string>) -- the reflective decoder
-// paths the fixed-width Probe never reaches. These are exactly where the prior has()-overflow CRITICAL
-// hid (an unfuzzed string length), so the hostile-byte sweep must cover them.
+// paths the fixed-width Probe never reaches. Each reads a wire-supplied length or presence byte, so
+// the hostile-byte sweep must cover them.
 struct Dyn { std::string s; std::vector<std::uint32_t> v; std::optional<std::int64_t> o; std::vector<std::string> vs; };
 
 // Wide enough (20 fields) for the ADAPTIVE changemask, so the sparse-index decoder -- mode byte,

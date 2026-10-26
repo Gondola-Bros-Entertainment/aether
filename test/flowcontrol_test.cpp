@@ -1,5 +1,5 @@
 #include "check.hpp"
-// aether - receiver flow control: the advertised receive window (issue #3).
+// aether - receiver flow control: the advertised receive window.
 //
 // Backpressure alone never loses data silently, but the sender only discovers the receiver's limit by
 // retransmitting into it, and every refused attempt spends one of the message's retries. The
@@ -120,12 +120,12 @@ int main() {
     //
     // A WindowUpdate is not registered in the sent ring, so nothing retransmits it. The reopen that
     // follows a drain is a single datagram, and once it is sent the receiver is unrestricted with a
-    // steady free count, so nothing triggers another. Losing that one datagram therefore left the
-    // sender at credit 0 with no way to ever hear otherwise: the channel was dead on a healthy link.
+    // steady free count, so nothing triggers another. Losing that one datagram would leave the sender
+    // at credit 0 with no way to ever hear otherwise: the channel would be dead on a healthy link.
     //
     // The cap MUST exceed windowLowCredit here. At cap <= 8 the channel can never have more than
-    // windowLowCredit free, so it is permanently "restricted", the persist timer always fires, and the
-    // bug is invisible -- which is exactly why the original test missed it.
+    // windowLowCredit free, so it is permanently "restricted", the persist timer always fires, and a
+    // lost reopen cannot be observed.
     {
         constexpr int cap = 64;
         static_assert(cap > windowLowCredit, "a cap at or below the threshold is always restricted");
@@ -162,7 +162,7 @@ int main() {
             maybeAdvertiseWindow(srv, now);
             resent = queuedWindowUpdateSince(srv, before);
         }
-        assert(resent);   // before the fix this never fired again and the sender stayed at credit 0
+        assert(resent);   // otherwise the sender stays at credit 0
 
         // And once the peer finally acknowledges it, the repeats stop: this must not become a
         // permanent 250ms heartbeat on an idle healthy link.
@@ -277,11 +277,11 @@ int main() {
     // ---- a full REORDER buffer closes the advertised window ----
     //
     // A gap holds every later message in the reorder buffer, bufferOrdered refuses at
-    // maxOrderedBufferSize, and a refused packet is left unacked so the sender retransmits. The credit
-    // counted only the receive buffer, so it advertised thousands of free slots while the reorder
-    // buffer sat at its cap: the sender kept pushing into a buffer that stays full until
+    // maxOrderedBufferSize, and a refused packet is left unacked so the sender retransmits. A credit
+    // that counted only the receive buffer would advertise thousands of free slots while the reorder
+    // buffer sat at its cap: the sender would keep pushing into a buffer that stays full until
     // orderedBufferTimeout -- an order of magnitude longer than a retry budget lasts -- and the run of
-    // messages behind the gap was destroyed rather than delayed.
+    // messages behind the gap would be destroyed rather than delayed.
     {
         NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         ChannelConfig cc        = reliableOrderedChannel();
@@ -317,7 +317,7 @@ int main() {
         assert(delivered);
         assert(cli.peerCredit[0] == 1);
 
-        // The sender now stops at that one slot instead of pushing a run of messages into a buffer
+        // The sender stops at that one slot instead of pushing a run of messages into a buffer
         // that cannot take any of them -- and nothing is dropped to make it so.
         for (int i = 0; i < 8; ++i) {
             const auto err = sendMessage(cli, ChannelId{ 0 }, Bytes(32, 0xAB), now);
@@ -366,8 +366,8 @@ int main() {
         assert(!rejChannel);   // channel 7, only 1 configured
 
         // A rejected update must leave credit exactly as it was: a two-entry update whose SECOND entry
-        // names a channel we do not have used to write the first before returning false, desyncing the
-        // channels it reached against the ones it did not.
+        // names a channel we do not have must not write the first before returning false, which would
+        // desync the channels it reached against the ones it did not.
         const std::uint16_t before    = cli.peerCredit[0];
         const std::uint8_t  halfBad[] = { 2, 0, 0x00, 0x05, 7, 0x00, 0x09 };
         const bool          rejHalf   = applyWindowUpdate(cli, h, ByteSpan(halfBad, sizeof halfBad));

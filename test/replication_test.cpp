@@ -354,10 +354,10 @@ int main() {
 
     // --- the snapshot buffer spans the delay it is sampled at ---
     // sampleSnapshot looks playbackDelayMs behind the newest timestamp. History capped by a COUNT
-    // spans however long the send rate makes those entries last, which is unrelated to the delay: at
-    // the shipped defaults it covered 83ms at 60Hz against a 100ms delay, so every sample fell off
-    // the front and returned the oldest state -- stepping, not interpolating, while snapshotReady()
-    // still said ready. Retention is derived from the delay, so the span holds at any rate.
+    // spans however long the send rate makes those entries last, which is unrelated to the delay.
+    // When it spans less, every sample falls off the front and returns the oldest state -- stepping,
+    // not interpolating, while snapshotReady() still says ready. Retention is derived from the delay,
+    // so the span holds at any rate.
     {
         const auto playAt = [](double hz) {
             SnapshotBuffer<float> sb = newSnapshotBuffer<float>();
@@ -393,7 +393,7 @@ int main() {
         pushSnapshot(zeroDepth, 16.0, 1.0f);
         const bool readyTwo = snapshotReady(zeroDepth);
         const int  keptTwo  = snapshotCount(zeroDepth);
-        assert(readyTwo && keptTwo == 2);   // and a depth of 0 no longer discards every push
+        assert(readyTwo && keptTwo == 2);   // and a depth of 0 does not discard every push
 
         // Where the delay genuinely outruns the history, the degraded case is reportable rather
         // than a clamped sample that looks exactly like ordinary playback.

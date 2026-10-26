@@ -1,10 +1,10 @@
 #include "check.hpp"
 // aether - handshake security properties, each pinned by the case that would otherwise break it.
 //
-//  1. The connection challenge is a RETURN-ROUTABILITY proof. The server's challenge salt was sent
-//     and stored but never echoed or verified, so a peer that never received the challenge still
-//     completed the handshake -- a source-spoofing flood could fill every client slot with
-//     connections to addresses that do not exist. The echo closes that, and a WRONG echo must be
+//  1. The connection challenge is a RETURN-ROUTABILITY proof. If the server's challenge salt were
+//     never echoed or verified, a peer that never received the challenge could still complete the
+//     handshake, and a source-spoofing flood could fill every client slot with connections to
+//     addresses that do not exist. So the response must echo the salt, and a WRONG echo must be
 //     dropped silently: replying would make the server a reflector, and cancelling the pending would
 //     let anyone who can guess an in-flight client's address abort its handshake.
 //
@@ -108,10 +108,10 @@ int main() {
 
     // --- 0. the stateless retry cookie: nothing is allocated for an unproven address ---
     //
-    // A ConnectionRequest used to buy a half-open slot and an X25519 keypair from an address that had
-    // proven nothing. The cookie moves both behind a round trip the server keeps no state for: it is
-    // an AEAD tag over (source address, time epoch) under a per-peer secret, so it is unforgeable,
-    // useless from any other address, and expires on its own.
+    // Without it a ConnectionRequest would buy a half-open slot and an X25519 keypair from an address
+    // that has proven nothing. The cookie moves both behind a round trip the server keeps no state
+    // for: it is an AEAD tag over (source address, time epoch) under a per-peer secret, so it is
+    // unforgeable, useless from any other address, and expires on its own.
     {
         const Address addrS = addrLocalhost(9301);
         NetPeer S = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
@@ -241,8 +241,9 @@ int main() {
 
     // --- 1d. an abandoned INBOUND handshake expires quietly ---
     // A half-open handshake that never completes is a peer that walked away (or a spoofed source that was
-    // never there). Reporting Disconnected for it told the server a peer it never had a connection with
-    // had disconnected -- one bogus event per abandoned handshake, and a spoof flood is all of them.
+    // never there). Reporting Disconnected for it would tell the server that a peer it never had a
+    // connection with had disconnected -- one bogus event per abandoned handshake, and a spoof flood is
+    // all of them.
     {
         const Address addrS = addrLocalhost(9441);
         NetPeer S = newPeerState(addrS, aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
@@ -270,8 +271,8 @@ int main() {
     }
 
     // --- 1e. maxClients holds at the moment connections are ADMITTED, not just when requested ---
-    // The cap was checked at the request and then the response inserted unconditionally, so every
-    // handshake already in flight when the last slot filled still became a connection.
+    // Checking the cap only at the request would let every handshake already in flight when the last
+    // slot filled still become a connection.
     {
         NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         cfg.maxClients = 2;
@@ -341,10 +342,10 @@ int main() {
     {
         NetPeer P = newPeerState(addrLocalhost(9500), aether::test::anonymousConfig<NetworkConfig>(), MonoTime{ 0 });
 
-        // One host, many source ports, one bucket. Hashing the port too minted a fresh budget for every
-        // port an ordinary host bound: ~1200x its cap from 5000 ports, which also filled the tracked-
-        // source table so that every NEW address was shed -- a single machine could stop anyone else
-        // from connecting without spoofing anything.
+        // One host, many source ports, one bucket. Hashing the port too would mint a fresh budget for
+        // every port an ordinary host binds: ~1200x its cap from 5000 ports, which would also fill the
+        // tracked-source table so that every NEW address is shed -- a single machine could stop anyone
+        // else from connecting without spoofing anything.
         const std::uint64_t k1 = sockAddrToKey(addrV4(0x0A000001u, 1000), P.addrHashSeed);
         for (std::uint16_t port = 1001; port < 1064; ++port)
             assert(sockAddrToKey(addrV4(0x0A000001u, port), P.addrHashSeed) == k1);
@@ -563,9 +564,9 @@ int main() {
     }
 
     // --- 14. the AEAD authenticates the header as it ARRIVED, on every path ---
-    // The migration and path-validation paths rebuilt their AAD from the parsed header. writeHeader
-    // normalizes the low nibble of byte 8 and readHeader discards it, so those four bits sat outside
-    // the tag on exactly those paths while every other path authenticated the wire bytes.
+    // writeHeader normalizes the low nibble of byte 8 and readHeader discards it, so an AAD rebuilt
+    // from the parsed header would leave those four bits outside the tag. The migration and
+    // path-validation paths must authenticate the wire bytes, like every other path.
     {
         const Address addrS = addrLocalhost(9541), addrC = addrLocalhost(9542);
         const PeerId  idS{ addrS }, idC{ addrC }, idMoved{ addrV4(0x0A000017u, 9543) };

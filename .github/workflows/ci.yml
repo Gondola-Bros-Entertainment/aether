@@ -125,7 +125,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # Existing tests still use assert(), so run them in Debug to keep those checks active.
+      # Some tests use assert(), so run them in Debug to keep those checks active.
       # AETHER_WERROR enables /WX, matching the GCC and Clang jobs.
       - name: Configure
         run: cmake -B build -DAETHER_WERROR=ON

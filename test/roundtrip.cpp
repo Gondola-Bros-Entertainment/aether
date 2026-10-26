@@ -70,8 +70,7 @@ void testFoundation() {
     assert(restored.x == original.x && restored.y == original.y
         && restored.health == original.health && restored.seq == original.seq);
 
-    // large struct past the old 12-field cap: tieFields now reaches 32, so this instantiates
-    // the highest decomposition case (the pre-raise code static_assert-failed at 13 fields).
+    // the largest struct the 32-field cap allows: this instantiates the highest decomposition case.
     {
         struct Big32 {
             std::int32_t v0,v1,v2,v3,v4,v5,v6,v7,v8,v9,v10,v11,v12,v13,v14,v15,
@@ -210,8 +209,8 @@ void testLossAccounting() {
     for (int i = 0; i < aether::fastRetransmitThreshold; ++i)
         last = aether::processAcks(ep, ackSeq, ackBits, aether::MonoTime{ 60ull * 1000000 });
     assert(!last.fastRetransmit.empty());           // seq 0 declared lost
-    assert(ep.totalLost > 0);                        // the (previously dead) counter moves
-    assert(aether::packetLossFraction(ep) > 0.0);     // ...and the metric is no longer pinned at 0
+    assert(ep.totalLost > 0);                        // the counter moves
+    assert(aether::packetLossFraction(ep) > 0.0);     // ...and the metric is not pinned at 0
     std::printf("aether loss-metric OK: a NACKed packet registers as loss (totalLost=%llu, loss=%.0f%%)\n",
                 static_cast<unsigned long long>(ep.totalLost), aether::packetLossFraction(ep) * 100.0);
 }
@@ -230,7 +229,7 @@ void testReliableSendPipelining() {
         ++emitted;
     }
     assert(emitted == 4);   // all four in flight at once (stop-and-wait would have emitted 1)
-    std::printf("aether channel-pipeline OK: %d reliable messages in flight in one drain (was 1)\n", emitted);
+    std::printf("aether channel-pipeline OK: %d reliable messages in flight in one drain\n", emitted);
 }
 
 void testRetransmitCommit() {
@@ -240,7 +239,7 @@ void testRetransmitCommit() {
     const aether::MonoTime later{ 200ull * 1000000 };          // 200ms > 100ms RTO
     const auto cands = aether::getRetransmitMessages(ch, later, 100.0);
     assert(cands.size() == 1);                                                                  // RTO elapsed -> candidate
-    assert(ch.sendBuffer.at(sr.seq).retryCount == 1 && ch.sendBuffer.at(sr.seq).sendTime.ns == 0);   // peek did NOT mutate (was the bug)
+    assert(ch.sendBuffer.at(sr.seq).retryCount == 1 && ch.sendBuffer.at(sr.seq).sendTime.ns == 0);   // peek did NOT mutate
     aether::commitRetransmit(ch, sr.seq, later);
     assert(ch.sendBuffer.at(sr.seq).retryCount == 2 && ch.sendBuffer.at(sr.seq).sendTime.ns == later.ns);   // state advances only on commit
     std::printf("aether retransmit-commit OK: candidate peeked without burning a retry; commit advances state\n");
@@ -255,14 +254,14 @@ void testAckWindowBoundary() {
     const auto [ackSeq, ackBits] = aether::getAckInfo(ep);
     assert(ackSeq.value == 132);
     assert((ackBits & (std::uint64_t(1) << 31)) != 0);         // seq 100 (now 32 back) still acked at bit 31
-    std::printf("aether ack-bitfield OK: +32 advance keeps the prior ack at bit 31 (was dropped)\n");
+    std::printf("aether ack-bitfield OK: +32 advance keeps the prior ack at bit 31\n");
 }
 
 void testNonceReplayWindow() {
     aether::ReplayWindow w;   // hoist each call out of assert() -- the side effect must run even under NDEBUG
     const bool r1 = aether::replayAccept(w, 5);   assert(r1);    // first seen
     const bool r2 = aether::replayAccept(w, 7);   assert(r2);    // forward
-    const bool r3 = aether::replayAccept(w, 6);   assert(r3);    // reordered but unseen -> accepted (strict-increasing dropped this)
+    const bool r3 = aether::replayAccept(w, 6);   assert(r3);    // reordered but unseen -> accepted (strict-increasing would drop it)
     const bool r4 = aether::replayAccept(w, 6);   assert(!r4);   // replay -> rejected
     const bool r5 = aether::replayAccept(w, 7);   assert(!r5);   // replay -> rejected
     const bool r6 = aether::replayAccept(w, 200); assert(r6);    // big forward jump
@@ -298,7 +297,7 @@ void testAssemblyCountLimit() {
         aether::processFragment(a, f, sizeof f, aether::MonoTime{ 0 });
     }
     assert(static_cast<int>(a.buffers.size()) <= 8);   // bounded, not 100
-    std::printf("aether fragment-cap OK: concurrent buffers bounded to %d (was unbounded), count==0 rejected\n",
+    std::printf("aether fragment-cap OK: concurrent buffers bounded to %d, count==0 rejected\n",
                 static_cast<int>(a.buffers.size()));
 }
 
@@ -386,7 +385,7 @@ void testConfigurationPropagation() {
     assert(conn.reliability.maxInFlight == 8);              // reached the reliability endpoint...
     assert(conn.reliability.maxSeqDistance == 1000);
 
-    aether::Connection reset = conn;                         // ...and survives a reset (was reverting to defaults)
+    aether::Connection reset = conn;                         // ...and survives a reset, not reverting to defaults
     aether::resetConnection(reset);
     assert(reset.reliability.maxInFlight == 8 && reset.reliability.maxSeqDistance == 1000);
 
@@ -675,7 +674,7 @@ void testConfigurationAndQuality() {
     bad.mtu = aether::minMtu - 1;   // below the smallest MTU any path is required to carry
     assert(aether::validateConfig(bad) == aether::ConfigError::InvalidMtu);
     const auto rejected = aether::openHost(aether::addrLocalhost(0), bad, aether::MonoTime{ 0 });
-    assert(!rejected);   // openHost now refuses an invalid config
+    assert(!rejected);   // openHost refuses an invalid config
     assert(aether::assessConnectionQuality(20.0, 0.0)  == aether::ConnectionQuality::Excellent);
     assert(aether::assessConnectionQuality(600.0, 0.0) == aether::ConnectionQuality::Bad);
     std::printf("aether config/stats OK: defaults valid, bad config + quality assessment caught\n");
@@ -911,7 +910,7 @@ void testDynamicFields() {
 
 void testReplayAndQuantizationEdges() {
     // reliability: a fresh dedup buffer must NOT report seq 65535 as already-seen
-    // (the old 0xFFFF sentinel collided with the real sequence 65535 once per wrap).
+    // (a 0xFFFF empty-slot sentinel would collide with the real sequence 65535 once per wrap).
     aether::ReceivedBuffer rb;
     assert(!aether::rbExists(rb, aether::SequenceNum{ 65535 }));
     aether::rbInsert(rb, aether::SequenceNum{ 65535 });
@@ -932,8 +931,8 @@ void testReplayAndQuantizationEdges() {
     const auto a3 = aether::validateConnectToken(tk2, tv, s2, aether::UnixTime{ 3 }, {17, 42});
     assert(!a3.error);                                                   // fresh seal (new nonce) OK
 
-    // wire: Quantized at the full 32-bit width must round-trip a value at Hi (the old code
-    // cast an out-of-range float to uint32 there -- UB that silently encoded Hi as Lo).
+    // wire: Quantized at the full 32-bit width must round-trip a value at Hi (float math rounds
+    // 2^32-1 up to 2^32 there, and casting that to uint32 is UB that can encode Hi as Lo).
     aether::Quantized<0.0f, 100.0f, 32> q{ 100.0f };
     std::uint8_t qbuf[8] = {};
     aether::BitWriter qw{ qbuf, sizeof qbuf };
@@ -1418,13 +1417,12 @@ void testChannelCapacityValidation() {
     c3.defaultChannelConfig.maxMessageSize = 400000;   // beyond maxFragmentCount fragments at the default MTU -> rejected at setup, not dropped at send
     assert(validateConfig(c3) == aether::ConfigError::MessageTooLargeToFragment);
     // ...and the fragment ceiling is the ONLY size limit: a message far bigger than one send-rate
-    // bucket validates fine, because fragment pacing spreads its emission across ticks (the old
-    // whole-message admission rejected this as MessageExceedsSendBudget).
+    // bucket validates fine, because fragment pacing spreads its emission across ticks.
     aether::NetworkConfig c4 = aether::test::anonymousConfig<aether::NetworkConfig>();
     c4.defaultChannelConfig.maxMessageSize = static_cast<int>(aether::maxFragmentableMessage(c4));   // ~295KB >> one bucket
     assert(!validateConfig(c4));
     assert(!validateConfig(aether::NetworkConfig{}));   // defaults remain valid
-    std::printf("aether channel-config-validation OK: non-positive caps + unfragmentable maxMessageSize rejected; budget no longer caps size\n");
+    std::printf("aether channel-config-validation OK: non-positive caps + unfragmentable maxMessageSize rejected; budget does not cap size\n");
 }
 
 void testOrderedGapFailureAcrossWrap() {
@@ -1492,8 +1490,8 @@ void testFragmentDeliveryWithLoss() {
     assert(received == big);   // exact reassembly under loss
     // With ~1/3 of fragments lost, 5 fragments cost 7 datagrams: the 5 originals plus the 2 that were
     // dropped. Resending the whole message per retransmit round costs 10 here (measured), and the gap
-    // widens with the fragment count -- so this bound fails on a regression back to full resends rather
-    // than quietly costing bandwidth.
+    // widens with the fragment count -- so whole-message resends fail this bound instead of quietly
+    // costing bandwidth.
     assert(fragmentsSent < 10);
     std::printf("aether fragmentation-e2e OK: %zu-byte reliable message fragmented + reassembled under "
                 "~33%% loss, %d fragment wires sent for 5 fragments\n", big.size(), fragmentsSent);
@@ -1842,7 +1840,7 @@ void testAdaptiveDeltaMask() {
     assert(rejects({ 0x01 }));                                       // truncated: promised index missing
     assert(rejects({ 0xFF, 0x03, 0x00, 0x00, 0x09, 0x09 }));         // bitmap with 2 bits: always sent sparse
     assert(rejects({ 0xFF, 0xFF, 0xFF, 0xFF }));                     // bitmap padding bits set (fields stop at 19)
-    std::printf("aether adaptive-mask OK: sparse 1/20 costs 3 bytes (was 4), canonical-form rejection holds\n");
+    std::printf("aether adaptive-mask OK: sparse 1/20 costs 3 bytes, canonical-form rejection holds\n");
 }
 
 void testAssemblyIdleExpiry() {
@@ -1908,7 +1906,7 @@ void testOrderedBufferBackpressure() {
             if (e.kind == aether::PeerEvent::Message) ++delivered;
     }
     assert(sent == total);
-    assert(delivered == total);   // was 20 of 30: the overrun silently ate a run of messages
+    assert(delivered == total);   // the overrun must not silently eat a run of messages
     const auto& chB = B.connections.at(idA).channels[0];
     assert(chB.totalRefused > 0);    // the overrun really happened...
     assert(chB.totalDropped == 0);   // ...and cost nothing: refusals are backpressure, not loss

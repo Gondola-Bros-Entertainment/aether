@@ -43,13 +43,12 @@ MonoTime connectPair(Pair& p, const NetworkConfig& cfg, MonoTime now) {
 int main() {
     // ---- an UNRELIABLE-only connection still measures RTT and loss ----
     //
-    // recordLossSample/updateRtt are only reachable from processAcks, which walks the sent ring.
-    // While flushPendingWires registered a packet there only when it carried a reliable message, a
-    // connection streaming unreliable snapshots -- the ordinary shape for replicated state -- fed the
-    // loss window nothing. It reported zero loss and zero RTT on a badly degraded path, graded itself
-    // Excellent, and its AIMD controller additively increased INTO the congestion because it never saw
-    // a bad sample. Every payload packet is registered now, with size 0 when it carries no reliable
-    // bytes so window accounting is untouched.
+    // recordLossSample/updateRtt are only reachable from processAcks, which walks the sent ring, so
+    // flushPendingWires registers every payload packet there, with size 0 when it carries no reliable
+    // bytes so window accounting is untouched. Registering only packets that carry a reliable message
+    // would leave a connection streaming unreliable snapshots -- the ordinary shape for replicated
+    // state -- with no loss samples: it would report zero loss and zero RTT on a badly degraded path,
+    // grade itself Excellent, and its AIMD controller would additively increase INTO the congestion.
     {
         NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         cfg.channelConfigs = { unreliableChannel() };
@@ -77,8 +76,8 @@ int main() {
         assert(c.reliability.srtt > 0.0);
         assert(c.stats.rtt > 0.0);                          // ...and reaches the app-facing stats
         assert(c.stats.packetLoss > 0.1);
-        assert(c.stats.connectionQuality != ConnectionQuality::Excellent);   // no longer graded perfect
-        // the rate controller now reacts instead of ramping up into the loss
+        assert(c.stats.connectionQuality != ConnectionQuality::Excellent);   // not graded perfect
+        // the rate controller reacts instead of ramping up into the loss
         assert(c.congestion.currentSendRate <= c.congestion.baseSendRate);
 
         // the unreliable traffic must NOT have been charged to the congestion window (size 0),
@@ -114,10 +113,10 @@ int main() {
 
     // ---- the congestion window bounds a single tick ----
     //
-    // cwCanSend reads bytesInFlight, which only moved when the tick's wires were flushed -- after
-    // every channel had already been drained. So each message in a tick tested the same pre-tick
-    // figure and one tick could admit many times cwnd (13.4x with a one-MTU window). Reserving the
-    // bytes at admission is what makes the check bind.
+    // bytesInFlight moves only when the tick's wires are flushed, after every channel has drained. If
+    // cwCanSend read it alone, each message in a tick would test the same pre-tick figure and one tick
+    // could admit many times cwnd (13.4x with a one-MTU window). Reserving the bytes at admission is
+    // what makes the check bind.
     {
         NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         cfg.useCwndCongestion = true;
@@ -168,12 +167,12 @@ int main() {
 
     // ---- the congestion WINDOW must react to loss of unreliable-only packets ----
     //
-    // processIncomingAcks gated cwOnLoss on res.fastRetransmit being non-empty. An unreliable-only
-    // packet is registered in the sent ring with msgCount 0 and size 0, so a triple-NACK on one
-    // produced a loss SAMPLE (the AIMD arm reacted) but no fastRetransmit entries and no lostBytes:
-    // the window never shrank. On the traffic shape games actually send -- a stream of unreliable
-    // snapshots -- New Reno sat at its initial size through 40% loss. The signal is the lost-packet
-    // COUNT, because congestion is a property of the path, not of a delivery mode.
+    // An unreliable-only packet is registered in the sent ring with msgCount 0 and size 0, so a
+    // triple-NACK on one produces a loss SAMPLE (the AIMD arm reacts) but no fastRetransmit entries
+    // and no lostBytes. Gating cwOnLoss on either would leave the window unshrunk: on the traffic
+    // shape games actually send -- a stream of unreliable snapshots -- New Reno would sit at its
+    // initial size through 40% loss. The signal is the lost-packet COUNT, because congestion is a
+    // property of the path, not of a delivery mode.
     {
         NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         cfg.useCwndCongestion = true;
@@ -344,12 +343,12 @@ int main() {
 
     // ---- an idle connection must not trade an ack-only every tick ----
     //
-    // recordReceivedPacket set pendingAck for ANY packet, and a bare ack-only goes out as a
-    // Keepalive -- so each side's ack was itself treated as needing an ack and the two ping-ponged
-    // at tick rate forever. On an idle link with zero application traffic that measured ~0.91
-    // packets per tick per side, about 28x the keepalive cadence. Only a packet carrying something
-    // the sender waits on (channel data, or an MTU probe whose ack is the discovery signal) earns a
-    // prompt ack now; the sequence is still recorded either way, so the ack bitfield stays exact.
+    // Only a packet carrying something the sender waits on (channel data, or an MTU probe whose ack
+    // is the discovery signal) earns a prompt ack; the sequence is still recorded either way, so the
+    // ack bitfield stays exact. A bare ack-only goes out as a Keepalive, so if recordReceivedPacket
+    // set pendingAck for ANY packet, each side's ack would itself need an ack and the two would
+    // ping-pong at tick rate forever. On an idle link with zero application traffic that is ~0.91
+    // packets per tick per side (measured), about 28x the keepalive cadence.
     {
         NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();   // defaults: 1000ms keepalive, 1000ms time-sync, 10000ms timeout
         Pair     p;
@@ -395,11 +394,11 @@ int main() {
     // ---- a peer that has received nothing must not acknowledge anything ----
     //
     // getAckInfo cannot express "nothing received yet": before its first receive it reports the default
-    // remoteSeq 0 with an empty bitfield, which on the wire is a genuine ack of packet 0. So a peer that
-    // had heard nothing acked our packet 0 -- and if that packet carried a reliable message that was
-    // lost, the sender marked it delivered and never sent it again. Reserving sequence 0 (firstSequence)
-    // is what makes the two cases distinguishable: no record ever exists at the sequence such a header
-    // names.
+    // remoteSeq 0 with an empty bitfield, which on the wire is a genuine ack of packet 0. A peer that
+    // has heard nothing would ack our packet 0 -- and if that packet carried a reliable message that
+    // was lost, the sender would mark it delivered and never send it again. Reserving sequence 0
+    // (firstSequence) is what makes the two cases distinguishable: no record ever exists at the
+    // sequence such a header names.
     {
         NetworkConfig cfg = aether::test::anonymousConfig<NetworkConfig>();
         const MonoTime now{ 0 };
