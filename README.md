@@ -22,7 +22,7 @@ credential formats. Upgrade both endpoints and reissue credentials together; the
 is no downgrade negotiation. This is an implementation milestone, not an independent
 security certification. See [authentication](docs/authentication.md), the
 [behavior reference](docs/behavior.md), [migration notes](docs/migration-0.2.md),
-and the [historical 0.2 qualification record](docs/staging-readiness.md).
+and the [historical 0.2 qualification record](docs/qualification-0.2.md).
 
 ## Build and test
 
@@ -36,8 +36,8 @@ ctest --test-dir build -C Debug --output-on-failure
 
 CI uses cppcheck 2.21.0, ASan/UBSan, and compiler tests with GCC, Clang, and MSVC,
 including native Linux ARM64 transport tests. Installed-package consumers run on
-Linux, macOS, and Windows. Keep test builds in Debug: some existing tests use
-`assert`, which Release builds disable.
+Linux, macOS, and Windows. Keep test builds in Debug: some tests use `assert`,
+which Release builds disable.
 
 The [credential issuer](examples/echo_credentials.cpp), [echo server](examples/echo_server.cpp)
 and [echo client](examples/echo_client.cpp) exercise the authenticated public API.
@@ -202,8 +202,6 @@ the complete `ConnectCredential` through that backend's trusted channel.
 Set the server's `NetworkConfig::tokenKey` and nonzero `tokenAudience`. Clients call
 `hostConnectWithToken`; the token alone cannot authenticate them. Server-side
 `Connected` and `Reconnected` events carry the verified `playerId` and `userData`.
-Game authentication credentials are separate from SSH, deployment keys and
-Cloudflare service tokens.
 
 Credential expiry uses `UnixTime` in Unix epoch nanoseconds; transport timers use
 `MonoTime`. `hostTick` obtains Unix time from the system. Pure-core callers supply

@@ -33,7 +33,7 @@ requiring a fresh credential. Explicit disconnects are not resumable. A successf
 resume creates a new generation; original credential expiry gates initial admission,
 not the lifetime of the established session or its short resume window.
 
-Anonymous development/P2P connections use the previous unauthenticated X25519 exchange
+Anonymous development/P2P connections use the unauthenticated X25519 exchange
 only when explicitly enabled. A token-gated host never admits an anonymous fallback.
 Anonymous initial exchange does not protect against an active intermediary; its later
 resume cannot retroactively establish identity. `hostJoinRoom` requires anonymous
