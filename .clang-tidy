@@ -1,18 +1,21 @@
-# aether lint -- curated to signal, not style.
+# aether lint -- curated to signal, not style. clangd and `run-clang-tidy -p build` read this file;
+# CI does not run clang-tidy.
 #
-# On this hand-crafted, twice-audited codebase the stock readability/modernize/misc checks are
-# almost all noise: they fight the deliberate dense one-liners (braces-around-statements), the
-# lowercase literal suffixes, the C arrays, #pragma once, and explicit types. None of those are
-# bugs. So clang-tidy here is a bug/perf/portability safety net, not a style cop -- the families
-# below, minus a handful that false-positive on this code (branch-clone on `if constexpr` chains,
-# infinite-loop on the varint shift loop, incorrect-roundings on non-negative quantization).
+# The stock readability/modernize/misc checks fight the deliberate dense one-liners
+# (braces-around-statements), the lowercase literal suffixes, the C arrays and explicit types, none
+# of which are bugs. So only the bug, performance, portability and analyzer families below are on,
+# minus the checks that flag intended code here:
+#   branch-clone: `if constexpr` chains, and switch cases that map several values alike
+#   incorrect-roundings: non-negative quantization
+#   easily-swappable-parameters: same-typed parameter runs (crypto primitives, new* constructors)
+#   enum-size: the int-based API enums; the wire enums already declare a one-byte base
+#   avoid-pragma-once: every header uses #pragma once, not include guards
 Checks: >
   bugprone-*,
   performance-*,
   portability-*,
   clang-analyzer-*,
   -bugprone-branch-clone,
-  -bugprone-infinite-loop,
   -bugprone-incorrect-roundings,
   -bugprone-easily-swappable-parameters,
   -performance-enum-size,
