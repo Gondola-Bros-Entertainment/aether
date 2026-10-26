@@ -3,131 +3,174 @@
 [![ci](https://github.com/Gondola-Bros-Entertainment/aether/actions/workflows/ci.yml/badge.svg)](https://github.com/Gondola-Bros-Entertainment/aether/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A C++20 library for reliable UDP transport, serialization, and state replication helpers.
-It has no external runtime dependencies. Most implementation is in headers; a small static
-library provides sockets and system randomness on Linux, macOS, and Windows.
+Reliable UDP netcode for games in C++20: authenticated, encrypted connections, channels with five
+delivery modes, fragmentation, congestion control, and reflection-based delta compression for game
+state. It has no external dependencies. Most of the library is headers; a small static library
+provides sockets, address resolution, and OS randomness on Linux, macOS, and Windows.
 
-Applications own their message schemas, account integration, simulation, and persistence.
-Aether provides the networking mechanisms without depending on an application or engine.
+Applications own their message schemas, accounts, simulation, and persistence.
 
-## Development status
+## Requirements
 
-Version 0.2 uses authenticated, scoped credentials with the concrete
-`Noise_NNpsk0_25519_ChaChaPoly_SHA256` handshake. Fresh key confirmation precedes
-admission and resumption. Anonymous encrypted connections require an explicit
-`allowUnauthenticated = true` opt-in at both endpoints.
+- CMake 3.23 or later
+- A C++20 compiler. CI builds and tests GCC 12 and GCC 16 on x86-64 Linux, the Ubuntu 24.04 GCC
+  on x86-64 and ARM64, Clang on Ubuntu 24.04, Apple Clang on macOS 26, and MSVC on Windows
+  Server 2025.
 
-Packet format version 2 retains the 17-byte header and changes the handshake and
-credential formats. Upgrade both endpoints and reissue credentials together; there
-is no downgrade negotiation. This is an implementation milestone, not an independent
-security certification. See [authentication](docs/authentication.md), the
-[behavior reference](docs/behavior.md), [migration notes](docs/migration-0.2.md),
-and the [historical 0.2 qualification record](docs/qualification-0.2.md).
+## Use from CMake
 
-## Build and test
-
-Requires CMake 3.23 or later and a C++20 compiler.
-
-```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DAETHER_WERROR=ON
-cmake --build build --config Debug
-ctest --test-dir build -C Debug --output-on-failure
-```
-
-CI uses cppcheck 2.21.0, clang-tidy 22.1.7, ASan/UBSan, and compiler tests with GCC,
-Clang, and MSVC, including native Linux ARM64 transport tests. Installed-package
-consumers run on Linux, macOS, and Windows.
-
-The [credential issuer](examples/echo_credentials.cpp), [echo server](examples/echo_server.cpp)
-and [echo client](examples/echo_client.cpp) exercise the authenticated public API.
-Create a new directory under a private parent, then run the server and clients in
-separate terminals:
-
-```sh
-./build/aether_echo_credentials /private/path/echo-demo
-./build/aether_echo_server /private/path/echo-demo/server.key 7777
-./build/aether_echo_client /private/path/echo-demo/client-1.credential localhost 7777 "hello aether"
-./build/aether_echo_client /private/path/echo-demo/client-2.credential localhost 7777 "second client"
-```
-
-The issuer creates two separate credentials valid for ten minutes. Each may establish
-one session on that running server. The server key stays on the issuer/server; distribute
-only each client's credential to that client. These files demonstrate provisioning,
-not an account service. On Windows, use a directory protected by your user ACL.
-Multi-configuration generators put executables in a configuration directory such as
-`build/Debug`. The client verifies its echo and exits nonzero on failure. The default
-channel message limit is 1024 bytes. The example resolves IPv4 names; the library
-resolver also supports IPv6. Ctrl+C gracefully shuts down the server.
-
-### Use from CMake
-
-For a source checkout:
+From a source tree, with `add_subdirectory` or `FetchContent`:
 
 ```cmake
 add_subdirectory(path/to/aether)
 target_link_libraries(my_app PRIVATE aether::aether)
 ```
 
-For an installed package:
+From an installed package:
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAETHER_BUILD_TESTS=OFF -DAETHER_EXAMPLES=OFF
+cmake --build build --config Release
+cmake --install build --config Release --prefix /path/to/prefix
+```
 
 ```cmake
 find_package(aether CONFIG REQUIRED)
 target_link_libraries(my_app PRIVATE aether::aether)
 ```
 
-The target exports its C++20 requirement and platform link dependencies. Tests, header checks,
-benchmarks, examples, and install rules are off by default in an `add_subdirectory` build.
+Add the prefix to `CMAKE_PREFIX_PATH`. A versioned `find_package(aether 0.2 ...)` accepts only
+0.2.x versions.
+
+The `aether::aether` target carries the C++20 requirement, the include directory, and the Windows
+libraries it needs (`ws2_32` and `bcrypt`). Include `<aether/aether.hpp>` for the whole library or
+individual headers such as `<aether/net.hpp>`. Everything is in namespace `aether`.
 
 | Option | Default when built directly | Purpose |
 | --- | --- | --- |
 | `AETHER_BUILD_TESTS` | On, unless `BUILD_TESTING=OFF` | Tests and header/ODR checks |
-| `AETHER_BUILD_BENCHMARKS` | Value of `AETHER_BUILD_TESTS` | Local benchmark |
+| `AETHER_BUILD_BENCHMARKS` | Value of `AETHER_BUILD_TESTS` | Benchmark (`aether_bench`) |
 | `AETHER_EXAMPLES` | On | Credential issuer, echo client and server |
 | `AETHER_INSTALL` | On | Package installation and export rules |
 | `AETHER_WERROR` | Off | Treat compiler warnings as errors |
 | `AETHER_BENCH_COMPARE` | Off | Comparison benchmark; downloads zpp::bits and bitsery |
 
+Everything except the library itself is off by default when aether is not the top-level project.
+
 ## Transport
 
-A `Host` owns a UDP socket and peer state. `openHost` validates configuration and binds the socket;
-check its optional result before use. Call `hostTick` regularly with monotonic time. It receives
-a bounded batch, advances transport timers, sends queued traffic, and returns events.
+A `Host` owns a non-blocking UDP socket and all session state. Aether starts no threads; the
+application drives it from its own loop.
 
-Use `hostConnectWithToken` with a `ConnectCredential` to start an authenticated connection. After a `Connected` event, `hostSend` queues a message
-for one peer. Its optional error reports local rejection; success means queued, not remotely
-delivered. `hostTick` also accepts messages to broadcast. Take bounded socket and broadcast
-failures with `hostTakeDiagnostics`; socket counters remain cumulative. `hostReconnect`
-performs fresh resumption. `hostShutdown` flushes disconnects; continue ticking for retries
-if desired, then call `closeHost` to release the socket and session state. The [examples](examples/) demonstrate this sequence.
+- `openHost(bindAddress, config, now)` validates a `NetworkConfig` and binds the socket. It returns
+  an empty optional on an invalid config or a bind failure; `validateConfig(config)` returns the
+  `ConfigError` in the first case. Servers bind `addrAny(port)` (or `addrAny6` for IPv6); clients
+  can bind `addrAny(0)`. A host bound with `addrAny` reaches only IPv4 addresses, so resolve the
+  server with `aether::AddressFamily::IPv4`, as the echo client does.
+- A client starts a connection with `hostConnectWithToken(host, serverAddress, credential, now)`
+  (see [Authentication](#authentication)). Connect calls return `std::optional<ConnectError>`,
+  empty when the attempt started.
+- `hostTick(host, broadcasts, now)` receives a bounded batch of datagrams, advances timers, sends
+  queued traffic, and returns `PeerEvent`s: `Connected`, `Disconnected` (with a
+  `DisconnectReason`), `Message`, `Migrated`, and `Reconnected`. `broadcasts` is a list of
+  `(ChannelId, Bytes)` messages for every connected peer. Call it every frame.
+- `hostSend(host, peerAddress, channel, bytes, now)` queues a message for one peer. An error means
+  it was rejected locally; success means queued, not delivered.
+- `hostDisconnect` closes one connection. `hostShutdown` sends disconnects to every peer; keep
+  ticking if you want them retried, then call `closeHost` to release the socket and session state.
 
-Each channel chooses its delivery mode:
+`now` is a `MonoTime`: nanoseconds from a monotonic clock such as `std::chrono::steady_clock`.
+`hostTakeDiagnostics` returns the socket and broadcast failures recorded since the last call, and
+`peerStats(host.peer, aether::PeerId{address})` returns a connection's RTT, loss, bandwidth, and
+`reliableDropped` count. `resolveAddresses` turns a host name into addresses; it blocks, so call it
+outside the tick. The [examples](examples/) show the whole sequence. Both endpoints must use the
+same wire format version (currently 2); there is no version negotiation.
+
+A connection has up to 8 channels (`NetworkConfig::maxChannels`). `channelConfigs[i]` configures
+channel `i`; channels without an entry use `defaultChannelConfig`, which is reliable ordered with a
+1024-byte message limit. Both endpoints must use the same channel settings: they are not sent on
+the wire, and a receiver drops messages on a channel beyond its own `maxChannels`. Each
+`ChannelConfig` picks a `DeliveryMode`:
 
 | Mode | Behavior |
 | --- | --- |
-| Reliable ordered | Retransmits missing messages and delivers in order; a gap is recovered or fails the connection. |
-| Reliable unordered | Retransmits missing messages and suppresses duplicate deliveries without waiting for earlier messages. |
-| Reliable sequenced | Retransmits while a message remains current; newer messages supersede older ones. |
-| Unreliable | Sends without retransmission or ordering. |
-| Unreliable sequenced | Sends without retransmission and discards messages older than the latest received sequence. |
+| `ReliableOrdered` | Retransmits missing messages and delivers in order; a gap is recovered or fails the connection. |
+| `ReliableUnordered` | Retransmits missing messages and delivers each once, without waiting for earlier ones. |
+| `ReliableSequenced` | Retransmits until acknowledged; the receiver discards anything older than the newest message it has delivered. |
+| `Unreliable` | Sends without retransmission or ordering. |
+| `UnreliableSequenced` | Sends without retransmission and discards messages older than the newest received. |
 
-The packet layer rejects replayed datagrams. Small messages can share a datagram. Large messages
-use fragmentation, selective retransmission, and pacing across ticks. Reliable receive pressure
-withholds acknowledgements; acknowledged fragments retain assembly storage until the channel
-accepts the completed message. Retry exhaustion or an unrecoverable reliable assembly timeout
-reports `DeliveryFailed` instead of silently losing a message and continuing.
+Small messages share datagrams. Large messages are fragmented, paced across ticks, and
+retransmitted per fragment. If a reliable message exhausts its retries, or a fragmented
+reliable message stalls, the connection closes with `DisconnectReason::DeliveryFailed` instead of
+continuing without it. Replayed datagrams are rejected.
 
-Other transport modules provide RTT/RTO estimation, loss-based rate control, an optional
-congestion window, path-MTU probes, encrypted address-migration challenges, and rendezvous
-pairing with hole punching and relay fallback. These are custom UDP mechanisms; the congestion
-controller does not claim TCP NewReno conformance.
+The transport also estimates RTT and RTO, paces sending with AIMD rate control driven by RTT and
+loss (`useCwndCongestion` adds a New Reno style congestion window that also gates larger reliable
+sends), probes the path MTU, follows a peer to a new address, and pairs peers behind NAT through a
+rendezvous server with relay fallback. The [behavior reference](docs/behavior.md) lists the limits,
+defaults, and application obligations.
 
-`peerProcess` exposes the transport without sockets. `testnet.hpp` drives two peers with seeded
-loss, latency, jitter, duplication, and reordering for deterministic application tests.
+`peerProcess` runs the same transport without sockets, and `testnet.hpp` connects two peers over a
+simulated link with seeded loss, latency, jitter, duplication, and reordering for deterministic
+tests.
 
-## Serialization and field deltas
+## Authentication
 
-The delta codec compares aggregate fields against a baseline and writes a change mask followed
-by changed values. The caller must supply the same baseline to both operations:
+Clients connect with credentials from a trusted backend:
+
+1. The backend authenticates the player, then calls
+   `issueConnectCredential(issuerKey, ConnectToken{playerId, expiresAt, userData, scope})`.
+   `expiresAt` is a `UnixTime` in nanoseconds since the Unix epoch, `userData` is up to 256 opaque
+   bytes, and `scope` is a `TokenScope{protocolId, audience}`. The result is a
+   `ConnectCredential`: a sealed token plus a separate random proof key for that client. It throws
+   `std::invalid_argument` if the key, protocol ID, audience, or expiry is zero, or `userData` is
+   too long. Send the whole credential to the client over the backend's authenticated, encrypted
+   channel.
+2. The server sets `NetworkConfig::tokenKey` to the issuer key and `tokenAudience` to the scope's
+   audience. Both endpoints' `NetworkConfig::protocolId` must equal the scope's protocol ID.
+3. The client calls `hostConnectWithToken`. Only the sealed token travels on the wire; the client
+   proves it holds the proof key during the handshake. The server's `Connected` and `Reconnected`
+   events carry the verified `playerId` and `userData`.
+
+Each token admits one session per server host. The server remembers spent tokens in memory and
+refuses new admissions while 65,536 unexpired tokens are tracked. A restarted server forgets them,
+so rotate the issuer key after losing that state. Servers that share a key and audience do not
+share spent tokens. `hostTick` reads the system clock for expiry checks; with `peerProcess`, pass
+the Unix time as its fourth argument or the server admits no credentials.
+
+After a timeout, `hostReconnect(host, address, token, now, fallback)` resumes the session for up to
+30 seconds with a fresh handshake. Read `token` with
+`peerSessionToken(host.peer, aether::PeerId{address})` while connected. If the server no longer has
+the session, the optional `fallback` credential starts a normal connection instead. A successful
+resume reports `Reconnected` on both endpoints; a fallback connection reports `Connected`. Explicit
+disconnects are not resumable.
+
+`hostConnect` opens an anonymous encrypted connection for development or peer-to-peer use. Both
+endpoints must set `allowUnauthenticated = true`, and a host with a `tokenKey` refuses it. It
+authenticates neither side.
+
+The [authentication reference](docs/authentication.md) specifies the handshake, wire format,
+resumption, and trust boundaries.
+
+## Serialization
+
+The codecs reflect over plain aggregates with no annotations:
+
+- `serialize` / `deserialize`: fixed-width little-endian fields.
+- `pack` / `unpack`: varint integers.
+- `deltaPack` / `deltaUnpack`: only the fields that differ from a baseline.
+- `packBits` / `unpackBits`: bit-packed, with `Ranged` and `Quantized` fields.
+
+A reflected type must be an aggregate of at most 32 public fields, with no base classes, reference
+members, or user-declared constructors. Fields may be integers, floating-point values, `bool`, enums
+with a fixed underlying type, nested aggregates, `std::array` of up to 32 elements, `std::string`,
+`std::vector`, and `std::optional`, except that `packBits` takes only fixed-size fields. Raw C
+arrays are rejected; use `std::array`. Unsupported shapes fail to compile. The wire format carries
+no field names or schema version, so both ends must use the same types in the same member order.
+
+The delta codec writes a change mask followed by the changed values. The caller must supply the
+same baseline to both operations:
 
 ```cpp
 #include <aether/delta.hpp>
@@ -150,23 +193,12 @@ int main() {
 }
 ```
 
-Reflection uses compile-time aggregate decomposition and structured bindings, with a central
-binding ladder for up to 32 fields per aggregate. It binds members directly; it does not guess
-memory offsets. Supported fields include nested aggregates, `std::array`, `std::string`,
-`std::vector`, and `std::optional`. Raw C-array members are unsupported; use `std::array`.
-Changing member order or types changes the wire schema.
+Integers are varints and floating-point values keep their exact bits. Structs with more than 16
+fields send a list of changed field indices when that is smaller than the mask. A changed vector
+is sent in full. The codec does not infer numeric tolerances, object identities, or element-level
+vector edits.
 
-Integers use varints; floating-point values preserve their bits. Above 16 fields, change masks
-use sparse indices when smaller. Changed vectors are encoded in full. The codec does not infer
-numeric tolerances, object identities, or element-level vector edits.
-
-`DeltaTracker` stores sender baselines and `BaselineManager` stores receiver baselines. The
-application assigns snapshot IDs and acknowledges successful reconstruction. Packet receipt
-alone is insufficient. Full-state fallback is enabled by default when snapshot acknowledgements
-stop advancing. Interest management, priority accumulation, snapshot interpolation, and clock
-offset estimation are separate helpers.
-
-### Explicit bit packing
+### Bit packing
 
 Use `Ranged` and `Quantized` when the application knows a field's range and acceptable precision:
 
@@ -188,33 +220,65 @@ int main() {
 }
 ```
 
-This is a separate codec from `deltaPack`. Quantization trades precision for fewer bits.
+Values outside a field's range are clamped, and quantization trades precision for fewer bits.
 
-## Connect tokens
+### Replication
 
-An authenticated application backend calls `issueConnectCredential` with an issuer/server
-sealing key and `ConnectToken` claims: numeric `playerId`, Unix expiry, up to 256 bytes
-of opaque `userData`, and `TokenScope{protocolId, audience}`. It generates a unique PSK
-and returns both the opaque sealed token and the separate client proof key. Deliver
-the complete `ConnectCredential` through that backend's trusted channel.
+`replication.hpp` builds snapshot replication on the delta codec. The application numbers its
+snapshots with `BaselineSeq` IDs and acknowledges them itself:
 
-Set the server's `NetworkConfig::tokenKey` and nonzero `tokenAudience`. Clients call
-`hostConnectWithToken`; the token alone cannot authenticate them. Server-side
-`Connected` and `Reconnected` events carry the verified `playerId` and `userData`.
+1. The sender calls `deltaEncode(tracker, id, state)` with a `DeltaTracker<T>` and sends the result
+   together with `id`. The payload names the baseline it was encoded against, not its own ID.
+2. The receiver calls `deltaDecode(baselines, payload)` with a `BaselineManager<T>`, stores a
+   successful result with `pushBaseline(baselines, id, state, now)`, and only then acknowledges
+   `id`. Receiving the packet is not enough.
+3. On that acknowledgement the sender calls `deltaOnAck(tracker, id)`, and later snapshots are
+   encoded against it.
 
-Credential expiry uses `UnixTime` in Unix epoch nanoseconds; transport timers use
-`MonoTime`. `hostTick` obtains Unix time from the system. Pure-core callers supply
-it as `peerProcess`'s fourth argument when accepting credentials; omission fails
-admission closed. Replay storage rejects new admissions when full. A Unix-time
-high watermark prevents backwards clock corrections from reviving expired tokens.
+If `maxBaselineAge` (default 32) snapshots go out without an acknowledgement, `deltaEncode` sends
+full state; zero or less turns that off. A `BaselineManager` keeps 64 snapshots for up to one second
+by default (`newBaselineManager` sets both). The ID `noBaseline` (0xFFFF) is reserved.
 
-Replay storage is local to an admission authority and held in memory. Preserve it
-across restarts or rotate the sealing key after state loss. Independent validators
-sharing a key and audience do not enforce global single use. Scope binds protocol
-and audience but does not replace this operational requirement.
+`interest.hpp` (relevance filtering), `priority.hpp` (priority accumulation), `interpolation.hpp`
+(snapshot interpolation), and `clocksync.hpp` (clock offset estimation) are separate helpers.
 
-See [authentication and wire details](docs/authentication.md) for proof, expiry,
-resumption and trust boundaries, and [0.2 migration](docs/migration-0.2.md) for API changes.
+## Security
+
+Authenticated sessions use the `Noise_NNpsk0_25519_ChaChaPoly_SHA256` handshake, and traffic
+after the handshake is encrypted with ChaCha20-Poly1305. X25519, ChaCha20-Poly1305, SHA-256, HMAC,
+and HKDF are implemented in this library and tested against published vectors. Neither the
+cryptography nor the protocol has been independently audited.
+
+## Examples
+
+With `AETHER_EXAMPLES` on, the build produces a credential issuer, an echo server, and an echo
+client:
+
+```sh
+./build/aether_echo_credentials /private/path/echo-demo
+./build/aether_echo_server /private/path/echo-demo/server.key 7777
+./build/aether_echo_client /private/path/echo-demo/client-1.credential localhost 7777 "hello aether"
+./build/aether_echo_client /private/path/echo-demo/client-2.credential localhost 7777 "second client"
+```
+
+The issuer creates the directory, which must not already exist, restricts it to your user, and
+writes the server key and two client credentials valid for ten minutes. On Windows, choose a parent
+directory that your user ACL already protects. File-based provisioning is for the demo only. Each
+credential admits one session per server run. The client resolves IPv4 names, sends one message of
+up to 1024 bytes, and exits nonzero unless the echo matches. Ctrl+C shuts the server down.
+Multi-configuration generators put the executables in a configuration directory such as
+`build/Debug`.
+
+## Building and testing
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DAETHER_WERROR=ON
+cmake --build build --config Debug
+ctest --test-dir build -C Debug --output-on-failure
+```
+
+The header self-containment and ODR checks are build targets, so a failure breaks the build. The
+`echo_process` test runs the example programs and is registered only when Python 3 is found.
 
 ## License
 
