@@ -45,9 +45,10 @@ int main() {
     }
 
     // The FIRST packet an endpoint ever sees acknowledges nothing behind it. A default remoteSeq of 0
-    // is not a sequence we received, so seeding the ack bitfield from it shifted in a set bit meaning
-    // "sequence 0 received" -- if packet 0 was the one lost, the sender saw it acked, marked its
-    // reliable messages delivered and never retransmitted them. Silent data loss on the first packet.
+    // is not a sequence we received, so seeding the ack bitfield from it would shift in a set bit
+    // meaning "sequence 0 received". If packet 0 were the one lost, the sender would see it acked,
+    // mark its reliable messages delivered and never retransmit them: silent data loss on the first
+    // packet.
     {
         ReliableEndpoint rx{};
         const SequenceNum arrived[] = { SequenceNum{ 1 }, SequenceNum{ 2 } };   // packet 0 was lost
@@ -130,13 +131,13 @@ int main() {
     }
 
     // The sent ring returns every unresolved packet's bytes EXACTLY ONCE. Two paths remove a record
-    // without an ack, and each had a byte-accounting bug the e2e soak was too small to reach:
+    // without an ack, and the e2e soak is too small to reach either:
     //
-    //  - EVICTION of a packet already declared lost double-released: the declare (lostBytes) and the
-    //    eviction both reported its size, deflating bytesInFlight below truth.
-    //  - DISPLACEMENT leaked: a live record whose slot is reused a full ring cycle later (count still
-    //    under maxInFlight, so the eviction path never ran) was overwritten reporting nothing, so its
-    //    charged bytes stayed "in flight" forever.
+    //  - EVICTION of a packet already declared lost must report nothing: the declare (lostBytes)
+    //    already released its size, and releasing it again deflates bytesInFlight below truth.
+    //  - DISPLACEMENT of a live record whose slot is reused a full ring cycle later (count still
+    //    under maxInFlight, so the eviction path never runs) must report its size; overwriting it
+    //    silently leaves its charged bytes "in flight" forever.
     {
         // Declare seq 0 lost via triple-NACK, then evict it: the eviction must report 0 bytes.
         ReliableEndpoint ep{};

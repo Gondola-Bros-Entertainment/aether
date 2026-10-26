@@ -148,8 +148,8 @@ struct AckResult {
     // COUNT of packets newly acknowledged, whatever they carried. The mirror of lostPackets, and for
     // the same reason: an unreliable-only packet is recorded with size 0, so ackedBytes stays 0 when one
     // is confirmed. Growth is byte-driven and correctly ignores it, but ENTERING cwOnAck at all is what
-    // ends fast recovery -- gating that on bytes left a mostly-unreliable stream stuck in Recovery from
-    // its first loss until whenever the next reliable ack happened to arrive.
+    // ends fast recovery, so gating that on bytes would leave a mostly-unreliable stream stuck in
+    // Recovery from its first loss until whenever the next reliable ack happens to arrive.
     int                     ackedPackets = 0;
     // COUNT of packets newly declared lost, whatever they carried. This is the congestion signal;
     // the two fields above are byte accounting and neither can stand in for it. A packet carrying

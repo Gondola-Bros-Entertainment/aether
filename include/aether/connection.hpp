@@ -681,8 +681,8 @@ inline void processIncomingAcks(Connection& conn, const PacketHeader& header, Mo
 
 // First-send emission for a FRAGMENTED message, paced by the congestion budget: as many fragments as
 // the budget (and, for reliable traffic, the window) admit this tick, resuming next tick at
-// msg.sentFragments. This is what lets maxMessageSize exceed one token bucket -- the message no longer
-// has to be admitted whole. The split is a pure function of (innerLen, chunk), so indices and
+// msg.sentFragments. This is what lets maxMessageSize exceed one token bucket -- a message need not be
+// admitted whole. The split is a pure function of (innerLen, chunk), so indices and
 // boundaries are identical across the ticks the message spans and across retransmits (selective
 // retransmit depends on that). Returns false when the budget ran out mid-message: emission is in
 // order, so the channel sends nothing past it this tick.
@@ -879,7 +879,7 @@ inline void resetConnection(Connection& conn) {
     conn.reliability  = newReliableEndpoint(config);
     // The window is transport state like everything else here: a recycled connection that kept the old
     // one would start life with a stale bytesInFlight (and phase) from the session that just ended,
-    // and nothing would ever ack those bytes back out. resetTransportMetrics already did this.
+    // and nothing would ever ack those bytes back out. resetTransportMetrics does the same.
     conn.cwnd         = config.useCwndCongestion ? std::optional<CongestionWindow>(newCongestionWindow(config.mtu)) : std::nullopt;
     conn.congestion   = newCongestionController(config.sendRate, config.maxPacketRate, config.congestionBadLossThreshold,
                                                 config.congestionGoodRttThreshold, config.congestionRecoveryTimeMs);

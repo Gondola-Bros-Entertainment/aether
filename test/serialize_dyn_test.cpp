@@ -1,4 +1,4 @@
-// aether - pins the serializer and reassembly behaviors an audit flagged:
+// aether - pins these serializer and reassembly behaviors:
 //   1. nested-dynamic round-trip (the bounded-amplification path): vector<string> /
 //      vector<vector<uint8_t>> with empty inner elements pack+unpack exactly.
 //   2. non-canonical delta changemask rejection: a high padding bit set beyond the
@@ -157,7 +157,7 @@ int main() {
     // ChannelId is `enum class ChannelId : std::uint8_t {}`: a fixed underlying type makes it total
     // over that type, so all 256 byte values are valid and none may be rejected. An enum with NO
     // fixed underlying type stops at its largest enumerator and casting past it is undefined -- both
-    // decoders now refuse that shape at compile time, so it cannot appear in this suite.
+    // decoders refuse that shape at compile time, so it cannot appear in this suite.
     {
         struct Msg { aether::ChannelId ch; bool flag; };           // bool keeps it off the memcpy path
         for (int raw = 0; raw < 256; ++raw) {

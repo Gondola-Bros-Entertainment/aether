@@ -212,7 +212,7 @@ void testPoly1305Vectors() {
                     "13000000000000000000000000000000");
 
     // The empty message: no block is ever absorbed, so the accumulator stays 0 and the tag is s
-    // verbatim. resumeMac and makeRetryCookie both seal an empty plaintext, so this shape is live.
+    // verbatim.
     const auto emptyKey = hexBytes("85d6be7857556d337f4452fe42d506a8" "0103808afb0db2fd4abff6af4149f51b");
     std::uint8_t emptyTag[16];
     aether::detail::poly1305(emptyKey.data(), nullptr, 0, emptyTag);
@@ -305,10 +305,11 @@ void testAeadDecryptVector() {
     std::printf("  aead decrypt            RFC 8439 A.5 OK (tampered tag/ct/aad all rejected)\n");
 }
 
-// The empty-plaintext, empty-aad shape, passed as NULL pointers: exactly what resumeMac and
-// makeRetryCookie do. The MAC input is then only le64(0) || le64(0), so the tag must equal Poly1305
-// over sixteen zero bytes under the block-0 one-time key -- computed here from the primitives the
-// vectors above already pinned, so this checks the AEAD framing rather than restating it.
+// The empty-plaintext, empty-aad shape, passed as NULL pointers, is an API edge case; makeRetryCookie
+// binds an aad, and that shape is checked below. The MAC input here is only le64(0) || le64(0), so
+// the tag must equal Poly1305 over sixteen zero bytes under the block-0 one-time key -- computed from
+// the primitives the vectors above already pinned, so this checks the AEAD framing rather than
+// restating it.
 void testAeadEmptyShapes() {
     const auto key = hexBytes(aeadTestKey);
     std::uint8_t nonce[12];

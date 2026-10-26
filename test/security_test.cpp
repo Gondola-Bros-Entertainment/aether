@@ -1,6 +1,6 @@
 #include "check.hpp"
 // aether - security + handshake unit tests that need the static lib (the connect-token seal draws an
-// OS-CSPRNG nonce; the handshake draws CSPRNG salts). Pins audit-flagged edges: replay-table capacity
+// OS-CSPRNG nonce; the handshake draws CSPRNG salts). Pins these edges: replay-table capacity
 // rejection, the inclusive token-expiry boundary, the fail-closed unkeyed-accept branch (no plaintext
 // zombie), the hoisted per-source rate gate that bounds the connect-request reflection surface, and
 // who the rate limiter sheds when its table is full.
@@ -126,15 +126,15 @@ int main() {
     }
 
     // the hoisted per-source rate gate bounds the connect-request reflection surface: a flood of
-    // ConnectionRequests from one (spoofable) source elicits at most ~rate challenge replies, not one
-    // per request. Before the fix the challenge resend bypassed the limiter (one reply per request).
+    // ConnectionRequests from one (spoofable) source elicits at most ~rate replies, not one per
+    // request. The gate runs before every reply path, the challenge resend included.
     {
         aether::NetworkConfig cfg = aether::test::anonymousConfig<aether::NetworkConfig>();        // no tokenKey -> no-auth handshake
         cfg.rateLimitPerSecond = 5;
         const aether::Address addrS = aether::addrLocalhost(50010);
         aether::NetPeer S = aether::newPeerState(addrS, cfg, aether::MonoTime{ 0 });
         const aether::PeerId attacker{ aether::addrLocalhost(40000) };
-        // Well-formed but uncookied: the reply is now a stateless retry cookie rather than a
+        // Well-formed but uncookied: the reply is a stateless retry cookie rather than a
         // challenge, which is the reflection surface the rate gate has to bound.
         const aether::Packet req{ aether::PacketHeader{ aether::PacketType::ConnectionRequest,
                                                         aether::SequenceNum{ 0 }, aether::SequenceNum{ 0 }, 0 },

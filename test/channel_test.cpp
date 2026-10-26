@@ -70,9 +70,9 @@ int main() {
     }
 
     // A duplicate of an already-DELIVERED sequence on an ordered channel must be dropped, not buffered.
-    // Buffering it meant the ordered-buffer timeout later redelivered it AND dragged orderedExpected
-    // backward past every sequence already delivered, so the messages after it stalled behind a window
-    // that had rewound -- one lost ack could wedge a channel for as long as traffic kept flowing.
+    // Buffering it would let the ordered-buffer timeout redeliver it AND drag orderedExpected backward
+    // past every sequence already delivered, so the messages after it would stall behind a rewound
+    // window -- one lost ack could wedge a channel for as long as traffic kept flowing.
     {
         aether::Channel ch = aether::newChannel(aether::ChannelId{ 0 }, aether::reliableOrderedChannel());
         for (std::uint16_t s = 0; s < 3; ++s)
@@ -190,9 +190,9 @@ int main() {
     }
 
     // A duplicate of a sequence already WAITING in the reorder buffer is acked, not re-buffered or
-    // refused. At the cap the old behavior refused it -- blocking the ack of a message the channel
-    // already held, so the sender kept resending into a permanent refusal -- and below the cap it
-    // re-inserted, resetting the entry's flush-timeout clock.
+    // refused. Refusing it at the cap would block the ack of a message the channel already holds, so
+    // the sender would keep resending into a permanent refusal; re-inserting it below the cap would
+    // reset the entry's flush-timeout clock.
     {
         aether::ChannelConfig cfg = aether::reliableOrderedChannel();
         cfg.maxOrderedBufferSize  = 2;

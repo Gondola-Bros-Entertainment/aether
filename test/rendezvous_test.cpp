@@ -39,9 +39,9 @@ int main() {
 
     // A peer that re-registers before a partner arrives must NOT be paired with itself. hostTick
     // re-sends Register every registerRetryMs until a Paired reply lands, so the first peer into a
-    // room always reaches this. Self-pairing handed that peer its own address AND made it stop
-    // retrying (a Paired reply clears pendingRoom), so the partner arriving later found the room
-    // already consumed and waited out the full TTL: NAT traversal failed for the ordinary case of
+    // room always reaches this. Self-pairing would hand that peer its own address AND make it stop
+    // retrying (a Paired reply clears pendingRoom), so the partner arriving later would find the room
+    // already consumed and wait out the full TTL: NAT traversal would fail for the ordinary case of
     // one peer arriving more than a second before the other.
     {
         RendezvousServer rv;
@@ -97,9 +97,9 @@ int main() {
     }
 
     // A third party presenting a known room id must not be able to terminate a LIVE relay session.
-    // Registering for a paired room used to fall through to the waiting branch, and the next
-    // registration then overwrote the pair -- the two real peers' Relay frames failed the membership
-    // test from then on, so anyone who learned a room id could silently kill the relay.
+    // If registering for a paired room fell through to the waiting branch, the next registration
+    // would overwrite the pair -- the two real peers' Relay frames would fail the membership test
+    // from then on, so anyone who learned a room id could silently kill the relay.
     {
         RendezvousServer rv;
         const Address    evil = addrV4(0xC0A800FF, 9999);
