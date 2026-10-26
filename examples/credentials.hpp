@@ -44,7 +44,7 @@ inline std::optional<aether::ConnectCredential> readCredential(const std::filesy
     auto bytes = readPrivateFile(path, 53 + aether::maxSealedConnectTokenBytes);
     if (!bytes || bytes->size() < 53 || (*bytes)[0] != 2) return std::nullopt;
     aether::ConnectCredential credential;
-    credential.scope = {aether::detail::cryptoLe32(bytes->data() + 1), aether::getU64(bytes->data() + 5)};
+    credential.scope = {aether::getU32(bytes->data() + 1), aether::getU64(bytes->data() + 5)};
     credential.expiresAt = {aether::getU64(bytes->data() + 13)};
     std::copy_n(bytes->begin() + 21, credential.proofKey.size(), credential.proofKey.begin());
     credential.token.assign(bytes->begin() + 53, bytes->end());
