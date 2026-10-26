@@ -1004,7 +1004,6 @@ inline std::vector<OutgoingPacket> drainSendQueue(Connection& conn) {
     return out;
 }
 inline void touchRecvTime(Connection& conn, MonoTime now) { conn.lastRecvTime = now; }
-inline void touchSendTime(Connection& conn, MonoTime now) { conn.lastSendTime = now; }
 
 inline void markConnected(Connection& conn, MonoTime now) {
     conn.state     = ConnectionState::Connected;
