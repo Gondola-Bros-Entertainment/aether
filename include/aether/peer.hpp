@@ -331,20 +331,21 @@ inline std::vector<PeerEvent> handleMigration(NetPeer& peer, const PeerId& newPi
     if (const auto it = peer.migrationCooldowns.find(cand->token);
         it != peer.migrationCooldowns.end() && elapsedMs(it->second, now) < migrationCooldownMs) return {};
     const auto connIt = peer.connections.find(cand->oldPeer);
-    if (connIt == peer.connections.end() || !connIt->second.recvKey) return {};
+    if (connIt == peer.connections.end()) return {};
+    Connection& conn = connIt->second;
+    if (!conn.recvKey) return {};
 
     // KEY authentication: decrypting proves the sender holds the session key, so an off-path attacker
     // cannot forge this. It is necessary but NOT sufficient to move the connection -- a replayed genuine
     // packet decrypts just as well, and the source address is still unverified. The routing ID selects
     // the key; it is never the proof.
-    const auto dec = decrypt(*connIt->second.recvKey, peer.config.protocolId, wireHeader, packetHeaderBytes,
+    const auto dec = decrypt(*conn.recvKey, peer.config.protocolId, wireHeader, packetHeaderBytes,
                              pkt.payload.data(), pkt.payload.size());
-    if (!dec || !replayAccept(connIt->second.recvReplay, dec->counter.value)) return {};
+    if (!dec || !replayAccept(conn.recvReplay, dec->counter.value)) return {};
 
     // The payload is authentic, so deliver it on the connection where it already lives. Nothing about
     // this packet justifies moving that connection, so nothing moves: the reply path is unchanged until
     // the candidate address answers a challenge.
-    Connection& conn = connIt->second;
     processIncomingAcks(conn, pkt.header, now);
     touchRecvTime(conn, now);
     const ByteSpan mpayload(dec->plaintext.data(), dec->plaintext.size());
@@ -387,11 +388,13 @@ inline std::vector<PeerEvent> handlePathResponse(NetPeer& peer, const PeerId& ne
     if (pv == peer.pathValidations.end()) return {};
     if (elapsedMs(pv->second.sentAt, now) >= pathValidationTimeoutMs) { peer.pathValidations.erase(pv); return {}; }
     const auto connIt = peer.connections.find(pv->second.current);
-    if (connIt == peer.connections.end() || !connIt->second.recvKey) { peer.pathValidations.erase(pv); return {}; }
+    if (connIt == peer.connections.end()) { peer.pathValidations.erase(pv); return {}; }
+    Connection& conn = connIt->second;
+    if (!conn.recvKey) { peer.pathValidations.erase(pv); return {}; }
 
-    const auto dec = decrypt(*connIt->second.recvKey, peer.config.protocolId, wireHeader, packetHeaderBytes,
+    const auto dec = decrypt(*conn.recvKey, peer.config.protocolId, wireHeader, packetHeaderBytes,
                              pkt.payload.data(), pkt.payload.size());   // the wire bytes, as everywhere else
-    if (!dec || !replayAccept(connIt->second.recvReplay, dec->counter.value)) return {};
+    if (!dec || !replayAccept(conn.recvReplay, dec->counter.value)) return {};
     if (dec->plaintext.size() != pathChallengeBytes) return {};
     if (!detail::constTimeEq(dec->plaintext.data(), pv->second.challenge.data(), pathChallengeBytes)) return {};
 
@@ -399,7 +402,7 @@ inline std::vector<PeerEvent> handlePathResponse(NetPeer& peer, const PeerId& ne
     const std::uint64_t token = pv->second.token;
     peer.pathValidations.erase(pv);
 
-    Connection migrated = std::move(connIt->second);
+    Connection migrated = std::move(conn);
     peer.connections.erase(connIt);
     resetTransportMetrics(migrated, now);
     peer.connections[newPid] = std::move(migrated);
@@ -464,11 +467,11 @@ inline std::vector<PeerEvent> handlePacket(NetPeer& peer, const PeerId& pid, con
     const PacketType ptype = header->type;
     const int        bytes = static_cast<int>(dat.size());
 
-    const auto connIt = peer.connections.find(pid);
-    const bool keyed  = connIt != peer.connections.end() && connIt->second.recvKey.has_value();
+    const auto        connIt   = peer.connections.find(pid);
+    Connection* const existing = connIt != peer.connections.end() ? &connIt->second : nullptr;
 
-    if (isPostHandshake(ptype) && keyed) {
-        Connection&         conn   = connIt->second;
+    if (isPostHandshake(ptype) && existing && existing->recvKey) {
+        Connection&         conn   = *existing;
         if (header->connectionId != conn.connectionId) return {};
         const std::uint8_t* enc    = dat.data() + packetHeaderBytes;   // [counter:8][ciphertext][tag:16]
         const std::size_t   encLen = dat.size() - packetHeaderBytes;   // dat.size() >= packetHeaderBytes (readHeader checked)
@@ -535,7 +538,7 @@ inline std::vector<PeerEvent> handlePacket(NetPeer& peer, const PeerId& pid, con
 
     // cold path: control/handshake (cleartext) + a payload from an unknown source (a migration probe)
     Packet pkt{ *header, Bytes(dat.begin() + static_cast<std::ptrdiff_t>(packetHeaderBytes), dat.end()) };
-    if (connIt != peer.connections.end()) recordBytesReceived(connIt->second, bytes, now);
+    if (existing) recordBytesReceived(*existing, bytes, now);
     return handlePacketByType(peer, pid, pkt, dat.data(), now, ptype);   // dat.data(): the header bytes as they arrived
 }
 
@@ -707,7 +710,7 @@ inline std::vector<PeerEvent> cleanupPending(NetPeer& peer, MonoTime now) {
         if (elapsedMs(it->second.createdAt, now) > timeout) {
             if (it->second.isReconnect && it->second.fallbackCredential) {
                 const auto pid = it->first;
-                auto credential = std::move(*it->second.fallbackCredential);
+                const auto credential = *it->second.fallbackCredential;
                 it = peer.pending.erase(it);
                 if (peerConnectWithToken(peer, pid, credential, now))
                     events.push_back(evDisconnected(pid, DisconnectReason::ProtocolMismatch));

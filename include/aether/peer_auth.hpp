@@ -6,8 +6,7 @@
 
 namespace aether {
 
-inline void applyAuthKeys(Connection& conn, const AuthHandshake& auth, bool server) {
-    const auto& keys = *auth.keys;
+inline void applyAuthKeys(Connection& conn, const AuthHandshake& auth, const detail::HandshakeSecrets& keys, bool server) {
     conn.sendKey = server ? keys.serverToClient : keys.clientToServer;
     conn.recvKey = server ? keys.clientToServer : keys.serverToClient;
     conn.resumeMaster = keys.resumeMaster;
@@ -71,20 +70,23 @@ inline std::vector<PeerEvent> handleAuthRequest(NetPeer& peer, const PeerId& pid
         playerId = claims.playerId;
     } else {
         const auto cached = peer.resumableTokens.find(request->token);
-        if (cached == peer.resumableTokens.end() || !cached->second.master
-            || elapsedMs(cached->second.at, now) >= resumeGraceMs || cached->second.scope != request->scope
-            || (!cached->second.authenticated && (!peer.config.allowUnauthenticated || peer.config.tokenKey))
-            || (cached->second.authenticated && peer.config.tokenKey && request->scope.audience != peer.config.tokenAudience)) return {};
-        claims.proofKey = *cached->second.master;
+        if (cached == peer.resumableTokens.end()) return {};
+        const ResumableSession& session = cached->second;
+        if (!session.master
+            || elapsedMs(session.at, now) >= resumeGraceMs || session.scope != request->scope
+            || (!session.authenticated && (!peer.config.allowUnauthenticated || peer.config.tokenKey))
+            || (session.authenticated && peer.config.tokenKey && request->scope.audience != peer.config.tokenAudience)) return {};
+        claims.proofKey = *session.master;
         auth.resumeBefore = claims.proofKey;
-        auth.authenticated = cached->second.authenticated;
-        auth.userData = cached->second.userData;
-        playerId = cached->second.playerId;
+        auth.authenticated = session.authenticated;
+        auth.userData = session.userData;
+        playerId = session.playerId;
     }
     auth.denialKey = authDenialKey(claims.proofKey, requestId);
     auth.noise = detail::noiseStart(claims.proofKey, authPrologue(request->context));
     if (!detail::noiseReadFirst(auth.noise, request->noise)) return {}; // PSK proof before cookie or X25519 work
-    if (auth.tokenNonce && (auth.expiresAt.ns <= peer.tokenTime->ns || tokenNonceSpent(peer.tokenValidator, *auth.tokenNonce))) {
+    if (auth.tokenNonce && (!peer.tokenTime || auth.expiresAt.ns <= peer.tokenTime->ns
+                            || tokenNonceSpent(peer.tokenValidator, *auth.tokenNonce))) {
         queueAuthDenial(peer, pid, auth, DenyReason::InvalidToken);
         return {};
     }
@@ -120,6 +122,7 @@ inline std::vector<PeerEvent> handleAuthRequest(NetPeer& peer, const PeerId& pid
 
 inline std::vector<PeerEvent> handleAuthChallenge(NetPeer& peer, const PeerId& pid, const Packet& packet, MonoTime now) {
     auto& pending = peer.pending.at(pid);
+    if (!pending.auth) return {};
     auto& auth = *pending.auth;
     const auto second = decodeAuthReply(packet.payload, auth.requestId, authNoiseMessageBytes);
     if (!second) return {};
@@ -157,8 +160,9 @@ inline std::vector<PeerEvent> handleAuthResponse(NetPeer& peer, const PeerId& pi
         return {};
     }
     const auto it = peer.pending.find(pid);
-    if (it == peer.pending.end() || it->second.direction != ConnectionDirection::Inbound || !it->second.auth) return {};
+    if (it == peer.pending.end()) return {};
     auto& pending = it->second;
+    if (pending.direction != ConnectionDirection::Inbound || !pending.auth) return {};
     const auto& auth = *pending.auth;
     if (!auth.keys || elapsedMs(pending.createdAt, now) > peer.config.connectionRequestTimeoutMs) return {};
     const auto proof = decodeAuthReply(packet.payload, auth.requestId, auth.keys->clientProof.size());
@@ -185,7 +189,7 @@ inline std::vector<PeerEvent> handleAuthResponse(NetPeer& peer, const PeerId& pi
     }
     Connection conn = newConnection(peer.config, pending.clientSalt, now);
     conn.playerId = pending.playerId;
-    applyAuthKeys(conn, auth, true);
+    applyAuthKeys(conn, auth, *auth.keys, true);
     touchRecvTime(conn, now);
     markConnected(conn, now);
     auto event = pending.isReconnect ? evReconnected(pid, conn.playerId)
@@ -199,12 +203,13 @@ inline std::vector<PeerEvent> handleAuthResponse(NetPeer& peer, const PeerId& pi
 
 inline std::vector<PeerEvent> handleAuthAccepted(NetPeer& peer, const PeerId& pid, const Packet& packet, MonoTime now) {
     auto& pending = peer.pending.at(pid);
+    if (!pending.auth) return {};
     const auto& auth = *pending.auth;
     if (!auth.keys || elapsedMs(pending.createdAt, now) > peer.config.connectionRequestTimeoutMs) return {};
     const auto proof = decodeAuthReply(packet.payload, auth.requestId, auth.keys->serverProof.size());
     if (!proof || !detail::constTimeEq(proof->data(), auth.keys->serverProof.data(), proof->size())) return {};
     Connection conn = newConnection(peer.config, pending.clientSalt, now);
-    applyAuthKeys(conn, auth, false);
+    applyAuthKeys(conn, auth, *auth.keys, false);
     touchRecvTime(conn, now);
     markConnected(conn, now);
     auto event = pending.isReconnect ? evReconnected(pid) : evConnected(pid, ConnectionDirection::Outbound);
@@ -215,14 +220,15 @@ inline std::vector<PeerEvent> handleAuthAccepted(NetPeer& peer, const PeerId& pi
 }
 
 inline std::vector<PeerEvent> handleAuthDenied(NetPeer& peer, const PeerId& pid, const Packet& packet) {
-    const auto& auth = *peer.pending.at(pid).auth;
+    const auto& pending = peer.pending.at(pid);
+    if (!pending.auth) return {};
+    const auto& auth = *pending.auth;
     const auto proof = decodeAuthReply(packet.payload, auth.requestId, 33);
     if (!proof) return {};
     const auto expected = detail::hmacSha256(auth.denialKey, proof->first(1));
     if (!detail::constTimeEq(expected.data(), proof->data() + 1, expected.size())) return {};
     const auto reason = static_cast<DenyReason>((*proof)[0]);
-    if (reason == DenyReason::InvalidToken && peer.pending.at(pid).isReconnect
-        && peer.pending.at(pid).fallbackCredential) return {};
+    if (reason == DenyReason::InvalidToken && pending.isReconnect && pending.fallbackCredential) return {};
     removePending(peer, pid);
     return {evDisconnected(pid, denyToDisconnectReason(reason))};
 }

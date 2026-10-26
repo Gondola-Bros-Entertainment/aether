@@ -55,9 +55,53 @@ jobs:
             --enable=warning,performance,portability --std=c++20 \
             --error-exitcode=1 --quiet -I include src test bench examples
 
+  # The official LLVM build runs .clang-tidy over every translation unit outside test/, with warnings
+  # as errors. CMAKE_OSX_SYSROOT writes the SDK into the compile database, since a non-Apple
+  # clang-tidy cannot find the system headers without it. The analyzer follows paths only from
+  # functions in the main file unless it is told to analyze headers, and nearly all of the library
+  # is header code.
+  clang-tidy:
+    name: clang-tidy
+    timeout-minutes: 20
+    runs-on: macos-26
+    env:
+      LLVM_VERSION: 22.1.7
+      LLVM_SHA256: 4177245188b0a30a6539c96b361dea56f253485756bfd8927a6a59e7301e7806
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Cache LLVM
+        id: llvm-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/llvm
+          key: llvm-${{ env.LLVM_VERSION }}-macos26-${{ runner.arch }}-v1
+      - name: Download LLVM
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          archive="LLVM-$LLVM_VERSION-macOS-ARM64"
+          curl -fsSL -o "$RUNNER_TEMP/llvm.tar.xz" \
+            "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/$archive.tar.xz"
+          echo "$LLVM_SHA256  $RUNNER_TEMP/llvm.tar.xz" | shasum -a 256 -c
+          mkdir -p "$RUNNER_TEMP/llvm"
+          tar -xJf "$RUNNER_TEMP/llvm.tar.xz" -C "$RUNNER_TEMP/llvm" --strip-components 1 \
+            "$archive/bin/clang-tidy" "$archive/bin/run-clang-tidy" "$archive/lib/clang/${LLVM_VERSION%%.*}/include"
+          rm "$RUNNER_TEMP/llvm.tar.xz"
+      - name: Configure
+        run: cmake -B build -DCMAKE_OSX_SYSROOT=macosx
+      - name: Run clang-tidy
+        run: |
+          version="$("$RUNNER_TEMP/llvm/bin/clang-tidy" --version)"
+          echo "$version"
+          grep -Fqx "  LLVM version $LLVM_VERSION" <<< "$version"
+          "$RUNNER_TEMP/llvm/bin/run-clang-tidy" -clang-tidy-binary "$RUNNER_TEMP/llvm/bin/clang-tidy" \
+            -p build -quiet -warnings-as-errors='*' -source-filter "^(?!$PWD/test/)" \
+            -extra-arg=-Xclang -extra-arg=-analyzer-opt-analyze-headers
+
   sanitizers:
     name: asan + ubsan
-    needs: cppcheck
+    needs: [cppcheck, clang-tidy]
     timeout-minutes: 20
     runs-on: ubuntu-24.04
     steps:

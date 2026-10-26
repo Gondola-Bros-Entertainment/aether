@@ -302,6 +302,9 @@ inline std::optional<ConnectionRequestPayload> decodeConnectionRequest(const Byt
 
 enum class DenyReason : std::uint8_t { ServerFull = 1, InvalidChallenge = 2, InvalidToken = 3 };
 inline Bytes encodeDenyReason(DenyReason r) { return Bytes{ static_cast<std::uint8_t>(r) }; }
+// An empty denial carries no reason byte; its 0 maps through denyToDisconnectReason like any
+// unknown byte.
+// NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange)
 inline DenyReason decodeDenyReason(const Bytes& d) { return static_cast<DenyReason>(d.empty() ? 0 : d[0]); }
 inline DisconnectReason denyToDisconnectReason(DenyReason r) {
     switch (r) {

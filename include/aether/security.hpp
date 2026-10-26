@@ -253,6 +253,9 @@ inline ConnectCredential issueConnectCredential(const EncryptionKey& key, Connec
 }
 
 // A token whose seal + expiry checked out, plus the nonce that identifies it for replay defense.
+// ConnectToken's key-wiping destructor leaves it without a move constructor, so moving an
+// OpenedToken copies the token, and copying its userData can throw.
+// NOLINTNEXTLINE(bugprone-exception-escape)
 struct OpenedToken { ConnectToken token; TokenNonce nonce{}; };
 
 // Verify a sealed token: seal authentic AND not expired. nullopt = forged, corrupt, or expired.
@@ -278,7 +281,7 @@ inline std::optional<OpenedToken> openConnectToken(const EncryptionKey& key, con
     t.userData.assign(pt->begin() + connectTokenClaimsBytes, pt->end());
     detail::secureZero(pt->data(), pt->size());
     if (now.ns >= t.expiresAt.ns) return std::nullopt;   // expired
-    return OpenedToken{ std::move(t), nonce };
+    return OpenedToken{ t, nonce };
 }
 
 enum class TokenError { Invalid, Replayed, ReplayCapacity };
@@ -332,7 +335,7 @@ inline TokenResult validateConnectToken(const EncryptionKey& key, TokenValidator
     const auto opened = openConnectToken(key, sealed, now);
     if (!opened || expectedScope.protocolId == 0 || expectedScope.audience == 0
         || opened->token.scope != expectedScope) return { TokenError::Invalid, 0, {} };
-    if (const auto err = consumeTokenNonce(tv, opened->nonce, opened->token.expiresAt, now)) return { *err, 0, {} };
+    if (const auto err = consumeTokenNonce(tv, opened->nonce, opened->token.expiresAt, now)) return { err, 0, {} };
     return { std::nullopt, opened->token.playerId, opened->token.userData };
 }
 

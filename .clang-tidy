@@ -1,5 +1,10 @@
-# aether lint -- curated to signal, not style. clangd and `run-clang-tidy -p build` read this file;
-# CI does not run clang-tidy.
+# aether lint -- curated to signal, not style. clangd and run-clang-tidy read this file. The CI
+# clang-tidy job runs it with warnings as errors, and with the analyzer starting paths in header
+# functions too, over every translation unit outside test/ that its macOS build compiles. That
+# covers each public header alone, the examples, src and bench, but not the Windows socket source or
+# the opt-in comparison benchmark. A template is checked through the instantiations those units
+# make, so one that only test/ instantiates is outside the gate. HeaderFilterRegex names the header
+# directories rather than the checkout, whose path varies.
 #
 # The stock readability/modernize/misc checks fight the deliberate dense one-liners
 # (braces-around-statements), the lowercase literal suffixes, the C arrays and explicit types, none
@@ -21,4 +26,4 @@ Checks: >
   -performance-enum-size,
   -portability-avoid-pragma-once
 WarningsAsErrors: ''
-HeaderFilterRegex: 'aether/.*'
+HeaderFilterRegex: '/(include/aether|examples|src)/'

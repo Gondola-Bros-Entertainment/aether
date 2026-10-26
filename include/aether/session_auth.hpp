@@ -15,6 +15,8 @@ inline constexpr std::size_t authNoiseMessageBytes = 48; // ephemeral public key
 inline constexpr std::size_t authReplyPrefixBytes = 33;  // envelope tag + request hash
 
 struct AuthRequest {
+    // Zero matches no mode, so a request names one only once decodeAuthRequest sets it.
+    // NOLINTNEXTLINE(bugprone-invalid-enum-default-initialization)
     AuthRequestMode mode{};
     std::uint64_t token = 0;
     std::uint64_t attempt = 0;

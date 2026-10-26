@@ -136,8 +136,8 @@ inline std::vector<PeerEvent> hostTick(Host& h, const std::vector<std::pair<Chan
     }
 
     for (const auto& [ch, msg] : messages) {
-        for (auto& failure : peerBroadcast(h.peer, ch, msg, std::nullopt, now)) {
-            if (h.diagnostics.queueErrors.size() < maxHostDiagnostics) h.diagnostics.queueErrors.push_back(std::move(failure));
+        for (const auto& failure : peerBroadcast(h.peer, ch, msg, std::nullopt, now)) {
+            if (h.diagnostics.queueErrors.size() < maxHostDiagnostics) h.diagnostics.queueErrors.push_back(failure);
             else ++h.diagnostics.omittedQueueErrors;
         }
     }

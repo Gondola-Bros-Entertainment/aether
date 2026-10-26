@@ -4,6 +4,7 @@
 
 #include <csignal>
 #include <cstdio>
+#include <exception>
 #include <thread>
 
 namespace {
@@ -11,7 +12,7 @@ volatile std::sig_atomic_t stopping = 0;
 void requestStop(int) { stopping = 1; }
 } // namespace
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv) try {
     const auto port = aether_example::parsePort(argc > 2 ? argv[2] : "7777");
     const auto key = argc >= 2 ? aether_example::readServerKey(argv[1]) : std::nullopt;
     if (argc > 3 || !port || !key) {
@@ -54,4 +55,8 @@ int main(int argc, char** argv) {
     const bool ok = aether_example::reportDiagnostics(*host);
     aether::closeHost(*host);
     return ok ? 0 : 1;
+}
+ catch (const std::exception& error) {
+    std::fprintf(stderr, "aether_echo_server: %s\n", error.what());
+    return 1;
 }
