@@ -1,154 +1,132 @@
 # Behavior reference
 
-This describes the 0.2 implementation. [Authentication](authentication.md) specifies
-the session protocol and its application trust boundary.
+Limits, defaults, and application obligations behind the API in the [README](../README.md).
+`NetworkConfig` and `ChannelConfig` fields are named without their struct; times are in
+milliseconds. [Authentication](authentication.md) specifies the session protocol.
 
-## Handshake and resumption
+## Connections
 
-A new authenticated connection takes three round trips: request/retry cookie,
-cookied request/Noise reply, then client confirmation/server acceptance. The server
-checks credential scope and the first Noise authenticator before generating a cookie.
-A cookie precedes allocation of a pending slot and server X25519 work. Per-source
-rate limits apply to all requests and are keyed by host, not source port. Client
-challenge DH work is limited to three attempts per configured retry interval.
+Connection requests pass a per-source rate limit first: `rateLimitPerSecond` (default 10 per
+second), keyed by source host rather than port. A new connection takes three round trips.
+`maxPending` (default 256) caps handshakes in progress and `maxClients` (default 64) caps
+connections. A client retries its request up to `connectionRequestMaxRetries` (default 5) times
+within `connectionRequestTimeoutMs` (default 5000).
 
-The concrete Noise NNpsk0 handshake uses X25519, ChaCha20-Poly1305 and SHA-256/HKDF.
-The library matches independent Cacophony handshake, transcript and transport vectors,
-plus RFC 7748, 8439, 4231 and 5869 primitive vectors. Cookies prove return reachability;
-the credential PSK authenticates the transcript. The server only consumes a token after
-fresh client confirmation and a second expiry/capacity check. The client reports a
-connection only after authenticating the matching server acceptance. Secure pending
-sessions ignore plaintext acceptance, denial and disconnect packets.
+A connection that receives nothing for `connectionTimeoutMs` (default 10000) drops with
+`DisconnectReason::Timeout`, and a side that has sent nothing for `keepaliveIntervalMs` (default
+1000) sends a keepalive. A disconnect is repeated up to `disconnectRetries` (default 3) times,
+`disconnectRetryTimeoutMs` (default 500) apart, while the host keeps ticking. Until it finishes,
+the disconnecting peer still holds an admission slot, although connection queries such as
+`peerCount` and `peerIsConnected` count only connected peers.
 
-Timeout resumption uses the cached session secret as a new PSK, fresh ephemeral keys,
-a fresh server challenge and confirmation in both directions. The old cached generation
-is consumed only after proof; a captured request cannot win a replay race or recreate
-traffic keys. Identity and application claims survive. There is no 0-RTT application
-traffic. Unknown remote resume state falls back to a supplied fresh credential after
-the local attempt timeout; unauthenticated denial cannot force fallback.
+Timeouts arm a resume cache of `maxResumableSessions` entries (default 64; zero disables
+resumption). Entries expire after 30 seconds, and a session that times out while the cache is full
+needs a fresh credential.
 
-`maxResumableSessions` bounds the timeout cache (default 64; zero disables it). Cache
-entries expire after 30 seconds. Full cache capacity leaves additional dropped sessions
-requiring a fresh credential. Explicit disconnects are not resumable. A successful
-resume creates a new generation; original credential expiry gates initial admission,
-not the lifetime of the established session or its short resume window.
+Anonymous connections (`allowUnauthenticated`) encrypt traffic after an unauthenticated X25519
+exchange. They do not protect against an active man in the middle, and resuming one does not add
+authentication.
 
-Anonymous development/P2P connections use the unauthenticated X25519 exchange
-only when explicitly enabled. A token-gated host never admits an anonymous fallback.
-Anonymous initial exchange does not protect against an active intermediary; its later
-resume cannot retroactively establish identity. `hostJoinRoom` requires anonymous
-opt-in: its room/pairing service is not a credential issuer.
+## Address migration
 
-Address migration selects a connection by session routing ID, verifies its packet tag,
-and completes an encrypted path challenge before moving state. A forged routing ID or
-replayed packet does not authorize migration. Packet headers are associated data and
-a sliding window rejects replayed datagrams. Randomness comes from the operating system.
-
-Replay-validator state persists until actual token expiry; exhaustion fails admission.
-Applications preserve that state or rotate the sealing key after loss. Sharing an issuer
-key and audience across independent validators does not establish global single use.
+When a peer's packets arrive from a new address, the host finds the connection by the session
+routing ID in the packet header, authenticates the packet, and sends an encrypted path challenge to
+the new address. The connection moves only after that address answers. The host then reports
+`PeerEvent::Migrated` with `peer` set to the old ID and `other` to the new one; later events and
+sends use the new address. A forged routing ID or a replayed packet cannot move a connection, and a
+connection that has just moved cannot move again for 5 seconds. Set
+`enableConnectionMigration = false` to turn migration off.
 
 ## Delivery and backpressure
 
-Reliable ordered channels preserve order until delivery or explicit failure. `orderedBufferTimeout`
-defaults to zero, disabling a separate gap deadline. A positive deadline makes an unresolved gap
-fail the channel; it never skips the missing message. Retry exhaustion waits through the final
-attempt's acknowledgement deadline before failing. `NetPeer` reports a `DeliveryFailed` disconnect.
+A reliable ordered channel delivers in order or fails. `orderedBufferTimeout` (default 0) bounds
+how long a gap may stay open: zero waits for retransmission or a connection failure, and a positive
+value fails the channel rather than skipping the missing message. A reliable message still
+unacknowledged after `maxReliableRetries` (default 10) retransmissions fails the channel once its
+last acknowledgement deadline passes. A failed channel disconnects the peer with
+`DisconnectReason::DeliveryFailed`.
 
-Reliable unordered delivery tracks a contiguous receive frontier and a bounded window beyond it.
-Senders backpressure before an outstanding reliable message spans that sequence window. Initial
-sequence zero is valid in both sequenced modes; reset clears sequence initialization. Sequenced
-modes intentionally discard messages superseded by a newer received sequence.
+When a channel's send buffer is full, `hostSend` returns an error whose `channelError` is
+`ChannelError::BufferFull`. A reliable channel holds at most `messageBufferSize` (default 256)
+queued or unacknowledged messages and never drops one to make room; an unreliable channel drops its
+oldest queued message unless `blockOnFull` is set. Delivered messages wait in a buffer of
+`maxReceiveBufferSize` (default 8192) per channel until collected. `hostTick` and `peerProcess`
+collect them into events every tick; code that drives a `Connection` directly must call
+`receiveMessage` itself. A receiver with no room leaves a reliable message unacknowledged, and the
+sender retransmits it.
 
-Acknowledged reliable fragments reserve their complete assembly capacity. Another message cannot
-evict that reservation. A completed assembly facing channel backpressure is retained for retry.
-An unrecoverable partial-assembly timeout fails the connection. Lower-level best-effort assembly
-may evict or expire unreserved partial messages.
+A message larger than one datagram is split into at most 255 fragments.
+`maxFragmentableMessage(config)` returns the largest message the configured `mtu` allows, and
+`validateConfig` rejects a channel `maxMessageSize` above it or a `maxReassemblyBufferSize` too
+small to hold one such message. The receiver reserves a reliable message's whole assembly before
+acknowledging any of its fragments. A reliable assembly that receives no fragment for
+`fragmentTimeoutMs` (default 5000) fails the connection with `DeliveryFailed`; unreliable partial
+messages can be evicted or expire.
 
-`maxReceiveBufferSize` limits messages waiting for collection. `peerProcess` collects them into its
-returned events each tick; applications driving `Connection` directly must collect them themselves.
-`hostSend` reports local queue rejection, not remote processing. Application-level acknowledgements
-are still needed when a caller requires confirmation that a command was applied.
+## Sizing and socket intake
 
-Receive credit is advertised on connection, when capacity changes by a quarter of the buffer, or
-when the receiver becomes restricted. Unacknowledged updates repeat on a 250 ms persist timer.
+`mtu` (default 1200, valid from 576 to 65507) is the UDP payload size the transport is sized and
+validated against. Path-MTU probing can raise the usable datagram size up to `mtuProbeCeiling`
+(default 1500), and that extra room is used only to coalesce messages; fragments stay sized to
+`mtu`. `mtuProbeCeiling` must be at least `mtu`, so raise it as well when setting `mtu` above 1500.
+Setting it equal to `mtu`, or `enableMtuDiscovery` to false, turns probing off.
 
-## Resource bounds and sizing
+Each `hostTick` reads at most `receiveBudget.maxDatagrams` (default 256) datagrams and
+`receiveBudget.maxBytes` (default 256 KiB, minimum 64 KiB) from the socket, counting malformed and
+empty datagrams. A datagram that would cross the byte budget is discarded, and the rest stay queued
+for the next tick. The budget bounds socket intake, not total tick time.
 
-`receiveBudget.maxDatagrams` and `receiveBudget.maxBytes` default to 256 and 256 KiB per socket tick.
-Malformed and empty datagrams consume the datagram budget. A datagram crossing the remaining byte
-budget is discarded before CRC validation or allocation; later datagrams remain queued. This
-bounds socket intake, not total tick time. Connection count, queued work, and application scheduling
-also affect tick cost. Aether does not start a receive thread.
+## Rendezvous
 
-`config.mtu` defaults to 1200 bytes and is the sizing floor. The supported UDP payload
-ceiling is 65507 bytes for both IP families; normal internet paths need much smaller values. Path-MTU probes can raise the usable
-datagram size up to `mtuProbeCeiling` (default 1500), but this headroom is used for coalescing.
-Fragments remain sized to the floor so a drop in discovered MTU does not strand an assembly.
+A rendezvous server is a `RendezvousServer` driven by `rendezvousTick` on its own UDP socket. Two
+hosts that call `hostJoinRoom` with the same room ID are paired: one connects and the other sends
+hole-punch datagrams. Both hosts must set `allowUnauthenticated = true` and no `tokenKey`, since a
+rendezvous server pairs peers but issues no credentials; otherwise `hostJoinRoom` returns
+`ConnectError::AuthenticationRequired`. If they have not connected after `Host::punchTimeoutMs`
+(default 5000), both relay through the server. Relayed packets carry a 9-byte wrapper, so leave
+that headroom when choosing `mtu` for a relay path. The server accepts at most 10 datagrams per
+second from each source host, relayed traffic included, so a relayed connection carries at most 10
+packets per second in each direction; raise the server's `limiter.maxRequestsPerSecond` for
+real-time traffic. Waiting registrations and idle relay sessions expire after 5 minutes.
 
-`maxFragmentableMessage(config)` computes the message ceiling from the floor and 255-fragment wire
-limit. `validateConfig` rejects channel message sizes above that ceiling or assembly budgets too
-small to reserve a maximum-sized message. Large messages are paced across ticks; they do not need
-to fit in one send-rate bucket. Send-buffer and sequence-window caps make backpressure explicit.
+Room IDs act as bearer credentials: anyone registering the same ID learns its partner's public
+address. Generate unguessable room IDs and distribute them through your own authenticated service.
+Pairing does not authenticate a user's account.
 
-Rendezvous relay requests add a 9-byte wrapper. Leave that headroom when choosing MTU settings for
-a relay path. Room IDs act as bearer credentials: a matching registrant learns its partner's public
-address. Applications must generate unguessable room IDs and distribute them through their own
-authenticated service. Rendezvous pairing does not authenticate a user's account.
+## Decoding untrusted data
 
-## Decoding and replication
-
-`Reader::allocBudget` charges container element storage and string bytes, with an 8 MiB default.
-It is not an exact heap ceiling: allocator overhead and container capacity growth may add memory.
-Up-front vector reserves are separately limited.
-
-`Reader::workBudget` limits recursive value visits to 1,048,576 by default. Empty aggregates use
-zero wire bytes but still consume decode work. Tune both budgets for accepted message shapes.
-Varint values outside the destination integer type's range fail before narrowing.
-
-The aggregate codec supports up to 32 members. Nested aggregates and supported containers recurse;
-the field ladder binds members directly using structured bindings. Raw C-array fields are unsupported.
-The codec does not transmit a schema version or field names. Both endpoints must agree on types and
-member order. A changed field carries its complete value, including complete changed vectors.
-
-`DeltaTracker` only promotes a baseline after `deltaOnAck`. The application must send that
-acknowledgement after successful `deltaDecode` and storage at the receiver, and provide matching
-snapshot sequence IDs. Receiving an outer packet is insufficient if reconstruction failed.
-`maxBaselineAge` enables full-state fallback when acknowledgements stall; setting it to zero or
-less disables that recovery. `noBaseline` is a reserved sequence value, not a usable baseline ID.
+`Reader::allocBudget` (default 8 MiB) limits the container elements and string bytes one decode may
+allocate; allocator overhead and capacity growth are not counted. `Reader::workBudget` (default
+1,048,576) limits recursive value visits, which also bounds empty aggregates that occupy no wire
+bytes. Lower both to fit the messages you accept. A varint outside the destination integer's range
+fails the decode.
 
 ## Clock sync
 
-The offset estimate uses the midpoint of a local round trip and the remote reply timestamp.
-Unequal one-way delays bias that midpoint estimate by half their difference.
-
-`clockOffsetErrorMs` includes the distance between the smoothed estimate and latest measured
-offset, plus half that measurement's RTT. This accounts for smoothing lag after an offset change.
-The bound applies at the latest measurement, assuming nonnegative network delays and an offset
-constant during that round trip. It cannot bound future drift or a clock step within that trip.
-`ClockSync::lastSampleTimeMs` exposes sample age. Before any sample, the error bound is infinite.
+Connected peers exchange time-sync pings every second. `clockOffsetMs(connection)` estimates the
+remote clock minus the local clock from the midpoint of a round trip, so unequal one-way delays
+bias it by half their difference. `clockOffsetErrorMs(connection)` bounds that estimate's error as
+of the latest sample, assuming nonnegative network delays and an offset that held still during the
+round trip. It cannot bound later drift or a clock step, and it is infinite before the first sample.
+`ClockSync::lastSampleTimeMs` is the local `MonoTime`, in milliseconds, when the latest sample
+arrived; subtract it from the current time for the sample's age. For a host, the connection is
+`host.peer.connections.at(aether::PeerId{address})`.
 
 ## Metrics and socket errors
 
-Connection `packetsSent` counts framed datagrams placed in the outgoing queue, including control
-packets. `bytesSent` counts their bytes. These counters do not prove socket transmission or receipt.
-Socket counters separately record successful local I/O.
+`NetworkStats::packetsSent` and `bytesSent` count datagrams placed in the send queue, not socket
+transmissions or receipt. The `Socket` counters record actual socket I/O. `sendTo` and `recvFrom`
+return a byte count or -1 and set `lastSendError` or `lastReceiveError`: would block, message too
+large, invalid address, closed socket, or a native system error. An empty receive queue is not
+counted as an error.
 
-`sendTo` and `recvFrom` retain byte-count/`-1` results and set `lastSendError` or
-`lastReceiveError`: would-block, oversize, invalid address, closed socket or native
-system error. Socket send/receive error counters are distinct from successful I/O;
-a receive would-block is a normal empty queue. Reliable retries can recover transient
-send failures; a local success still does not prove remote receipt.
+`hostTakeDiagnostics` returns up to 32 socket failures and 32 per-peer broadcast rejections
+recorded since the last call, plus counts of any omitted. Records accumulate between calls,
+including from host calls made outside `hostTick`. `peerBroadcast` returns its rejections directly.
 
-`hostTakeDiagnostics` drains bounded records for socket failures and per-peer broadcast
-rejections (32 of each, plus omitted counts). They accumulate between calls, including
-calls outside the tick. `peerBroadcast` directly returns its per-peer rejections.
-`hostShutdown` uses the same direct/relay send path, and `closeHost` clears sessions.
-Connection queries count only the Connected state; disconnecting entries may still
-occupy admission slots while their shutdown completes.
+## Address resolution
 
-`resolveAddresses` performs blocking DNS/numeric resolution outside the tick. Results
-retain system preference order, preserve IPv6 scope IDs, and contain at most 16 unique
-endpoints. `addressToString` produces numeric IPv4 or bracketed IPv6 endpoints without
-reverse DNS. Applications choose and retry appropriate addresses; the library does
-not run background resolver threads or promise Happy Eyeballs connection racing.
+`resolveAddresses` blocks, so call it during setup or on a worker thread, never in the tick. It
+returns up to 16 unique addresses in system preference order and keeps IPv6 scope IDs. It does not
+race connection attempts across addresses; the application chooses an address and retries.
+`addressToString` formats a numeric `address:port`, bracketing IPv6, without reverse DNS.
