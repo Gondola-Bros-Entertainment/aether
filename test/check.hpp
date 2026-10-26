@@ -5,7 +5,8 @@
 #include <source_location>
 
 namespace aether::test {
-// Unlike assert(), this evaluates state-changing test operations in every build configuration.
+// Checks a test condition in every build configuration: unlike the assert macro, NDEBUG does not
+// remove it, so the condition and any call inside it always run.
 template<class Condition>
 void require(const Condition& condition, std::source_location where = std::source_location::current()) {
     if (static_cast<bool>(condition)) return;

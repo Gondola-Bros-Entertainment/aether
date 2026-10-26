@@ -1,6 +1,5 @@
 #include "check.hpp"
 #include "aether/peer.hpp"
-#include <cassert>
 #include <cstdio>
 #include <climits>
 int main() {

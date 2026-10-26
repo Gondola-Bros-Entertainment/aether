@@ -36,8 +36,7 @@ ctest --test-dir build -C Debug --output-on-failure
 
 CI uses cppcheck 2.21.0, ASan/UBSan, and compiler tests with GCC, Clang, and MSVC,
 including native Linux ARM64 transport tests. Installed-package consumers run on
-Linux, macOS, and Windows. Keep test builds in Debug: some tests use `assert`,
-which Release builds disable.
+Linux, macOS, and Windows.
 
 The [credential issuer](examples/echo_credentials.cpp), [echo server](examples/echo_server.cpp)
 and [echo client](examples/echo_client.cpp) exercise the authenticated public API.

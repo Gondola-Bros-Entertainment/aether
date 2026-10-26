@@ -6,10 +6,11 @@
 // who the rate limiter sheds when its table is full.
 #include <aether/aether.hpp>
 
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+
+using aether::test::require;
 
 int main() {
     // Full replay storage rejects new admissions and preserves every unexpired spent token.
@@ -20,23 +21,23 @@ int main() {
         const auto a = aether::sealConnectToken(key, token);
         const auto b = aether::sealConnectToken(key, token);
         const auto c = aether::sealConnectToken(key, {1, aether::UnixTime{2000}, {}, {17, 42}});
-        aether::test::require(aether::validateConnectToken(key, tv, a, {100}, {18, 42}).error == aether::TokenError::Invalid);
-        aether::test::require(aether::validateConnectToken(key, tv, a, {100}, {17, 43}).error == aether::TokenError::Invalid);
-        aether::test::require(tv.usedNonces.empty());
-        aether::test::require(!aether::validateConnectToken(key, tv, a, {100}, {17, 42}).error);
-        aether::test::require(!aether::validateConnectToken(key, tv, b, {200}, {17, 42}).error);
-        aether::test::require(aether::validateConnectToken(key, tv, c, {300}, {17, 42}).error == aether::TokenError::ReplayCapacity);
-        aether::test::require(aether::validateConnectToken(key, tv, a, {400}, {17, 42}).error == aether::TokenError::Replayed);
-        aether::test::require(aether::validateConnectToken(key, tv, b, {400}, {17, 42}).error == aether::TokenError::Replayed);
-        assert(tv.usedNonces.size() == 2);
+        require(aether::validateConnectToken(key, tv, a, {100}, {18, 42}).error == aether::TokenError::Invalid);
+        require(aether::validateConnectToken(key, tv, a, {100}, {17, 43}).error == aether::TokenError::Invalid);
+        require(tv.usedNonces.empty());
+        require(!aether::validateConnectToken(key, tv, a, {100}, {17, 42}).error);
+        require(!aether::validateConnectToken(key, tv, b, {200}, {17, 42}).error);
+        require(aether::validateConnectToken(key, tv, c, {300}, {17, 42}).error == aether::TokenError::ReplayCapacity);
+        require(aether::validateConnectToken(key, tv, a, {400}, {17, 42}).error == aether::TokenError::Replayed);
+        require(aether::validateConnectToken(key, tv, b, {400}, {17, 42}).error == aether::TokenError::Replayed);
+        require(tv.usedNonces.size() == 2);
         // Actual expiry frees capacity; a wall-clock rollback cannot revive the forgotten token.
-        aether::test::require(!aether::validateConnectToken(key, tv, c, {1000}, {17, 42}).error);
-        assert(tv.usedNonces.size() == 1);
-        aether::test::require(aether::validateConnectToken(key, tv, a, {500}, {17, 42}).error == aether::TokenError::Invalid);
-        aether::test::require(aether::validateConnectToken(key, tv, c, {1100}, {17, 42}).error == aether::TokenError::Replayed);
+        require(!aether::validateConnectToken(key, tv, c, {1000}, {17, 42}).error);
+        require(tv.usedNonces.size() == 1);
+        require(aether::validateConnectToken(key, tv, a, {500}, {17, 42}).error == aether::TokenError::Invalid);
+        require(aether::validateConnectToken(key, tv, c, {1100}, {17, 42}).error == aether::TokenError::Replayed);
         auto disabled = aether::newTokenValidator(0);
-        aether::test::require(aether::validateConnectToken(key, disabled, c, {1000}, {17, 42}).error == aether::TokenError::ReplayCapacity);
-        assert(disabled.usedNonces.empty());
+        require(aether::validateConnectToken(key, disabled, c, {1000}, {17, 42}).error == aether::TokenError::ReplayCapacity);
+        require(disabled.usedNonces.empty());
     }
 
     // token expiry is inclusive: rejected at exactly expiresAt (now.ns >= expiresAt.ns).
@@ -47,8 +48,8 @@ int main() {
         const aether::Bytes sealed = aether::sealConnectToken(K, aether::ConnectToken{ 7, aether::UnixTime{ exp }, {}, {17, 42} });
         const auto before = aether::openConnectToken(K, sealed, aether::UnixTime{ exp - 1 });
         const auto atExp  = aether::openConnectToken(K, sealed, aether::UnixTime{ exp });
-        assert(before.has_value());     // one ns before -> valid
-        assert(!atExp.has_value());     // exactly at expiry -> rejected
+        require(before.has_value());    // one ns before -> valid
+        require(!atExp.has_value());    // exactly at expiry -> rejected
         std::printf("aether token-expiry OK: valid at expiresAt-1, rejected at expiresAt (inclusive)\n");
     }
 
@@ -64,12 +65,12 @@ int main() {
         const aether::PeerId  idS{ addrS };
         aether::NetPeer C = aether::newPeerState(addrC, cfg, aether::MonoTime{ 0 });
         aether::peerConnect(C, idS, aether::MonoTime{ 0 });   // Outbound pending: no sessionShared, no resumable
-        assert(C.pending.count(idS) == 1);
+        require(C.pending.count(idS) == 1);
 
         const auto events = aether::handleConnectionAccepted(C, idS, aether::Packet{}, aether::MonoTime{ 1000000 });
-        assert(events.empty());                  // nothing to report yet: the attempt has not failed
-        assert(C.connections.count(idS) == 0);   // never came up unkeyed
-        assert(C.pending.count(idS) == 1);       // ...and the handshake in flight is untouched
+        require(events.empty());                  // nothing to report yet: the attempt has not failed
+        require(C.connections.count(idS) == 0);   // never came up unkeyed
+        require(C.pending.count(idS) == 1);       // ...and the handshake in flight is untouched
 
         // and if nothing ever keys it, the caller still hears the outcome
         const std::uint64_t past = static_cast<std::uint64_t>(cfg.connectionRequestTimeoutMs) * 2000000ull;
@@ -77,7 +78,7 @@ int main() {
         bool timedOut = false;
         for (const auto& e : expired.events)
             if (e.kind == aether::PeerEvent::Disconnected && e.reason == aether::DisconnectReason::Timeout) timedOut = true;
-        assert(timedOut);
+        require(timedOut);
         std::printf("aether fail-closed-accept OK: an unkeyed Accepted keys nothing and cancels nothing\n");
     }
 
@@ -91,7 +92,7 @@ int main() {
         constexpr std::uint64_t floodBase = 1000, freshBase = 900000;
         for (int i = 0; i < aether::rateLimiterMaxSources; ++i)
             (void) aether::rateLimiterAllow(rl, floodBase + static_cast<std::uint64_t>(i), aether::MonoTime{ 0 });
-        assert(static_cast<int>(rl.requests.size()) == aether::rateLimiterMaxSources);
+        require(static_cast<int>(rl.requests.size()) == aether::rateLimiterMaxSources);
 
         int admitted = 0;
         for (int round = 1; round <= 3; ++round) {
@@ -101,8 +102,8 @@ int main() {
             for (int i = 0; i < 512; ++i) (void) aether::rateLimiterAllow(rl, floodBase + static_cast<std::uint64_t>(i), now);
             if (aether::rateLimiterAllow(rl, freshBase + static_cast<std::uint64_t>(round), now)) admitted += 1;
         }
-        assert(admitted == 3);                                                             // every new source got in
-        assert(static_cast<int>(rl.requests.size()) <= aether::rateLimiterMaxSources);     // ...and the cap still holds
+        require(admitted == 3);                                                            // every new source got in
+        require(static_cast<int>(rl.requests.size()) <= aether::rateLimiterMaxSources);    // ...and the cap still holds
         std::printf("aether rate-limit capacity OK: %d new sources admitted with the table pinned full (%zu tracked)\n",
                     admitted, rl.requests.size());
     }
@@ -114,14 +115,14 @@ int main() {
         const aether::MonoTime now{ 1000000 };
         for (int i = 0; i < aether::rateLimiterMaxSources; ++i)
             (void) aether::rateLimiterAllow(S.rateLimiter, static_cast<std::uint64_t>(i) + 1, now);
-        assert(static_cast<int>(S.rateLimiter.requests.size()) == aether::rateLimiterMaxSources);
+        require(static_cast<int>(S.rateLimiter.requests.size()) == aether::rateLimiterMaxSources);
 
         const aether::PeerId client{ aether::addrV4(0x0A000001u, 5000) };
         const aether::Packet req{ aether::PacketHeader{ aether::PacketType::ConnectionRequest,
                                                         aether::SequenceNum{ 0 }, aether::SequenceNum{ 0 }, 0 },
                                   aether::encodeConnectionRequest({}, {}) };
         (void) aether::handleConnectionRequest(S, client, req, now);
-        assert(S.sendQueue.size() == 1);   // answered, not shed
+        require(S.sendQueue.size() == 1);   // answered, not shed
         std::printf("aether rate-limit capacity OK: a new client is still answered under a full table\n");
     }
 
@@ -144,10 +145,10 @@ int main() {
         for (int i = 0; i < floods; ++i) (void) aether::handleConnectionRequest(S, attacker, req, now);   // all at one instant
 
         const std::size_t replies = S.sendQueue.size();   // each queued reply is one datagram back to the (spoofable) source
-        assert(replies >= 1);        // the gate still lets legit requests through up to the rate
-        assert(replies < 20);        // ...but bounds the flood -- not one reply per request (~100)
-        assert(S.rateLimitDrops >= 60);
-        assert(S.pending.empty());   // and a flood without a valid cookie allocates nothing at all
+        require(replies >= 1);       // the gate still lets legit requests through up to the rate
+        require(replies < 20);       // ...but bounds the flood -- not one reply per request (~100)
+        require(S.rateLimitDrops >= 60);
+        require(S.pending.empty());   // and a flood without a valid cookie allocates nothing at all
         std::printf("aether connect-reflection OK: %zu retries from %d spoofed requests (rate-gated, 0 pending)\n", replies, floods);
     }
 

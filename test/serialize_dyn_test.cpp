@@ -1,3 +1,4 @@
+#include "check.hpp"
 // aether - pins these serializer and reassembly behaviors:
 //   1. nested-dynamic round-trip (the bounded-amplification path): vector<string> /
 //      vector<vector<uint8_t>> with empty inner elements pack+unpack exactly.
@@ -9,18 +10,19 @@
 //   6. the optional flag and bool accept 0 and 1 and nothing else.
 //   7. an out-of-range fragment index buffers nothing and evicts nothing.
 //   8. a container length is written through its 4-byte prefix exactly.
-// Standalone, no framework: assert() is the check (so build WITHOUT -DNDEBUG).
+// Standalone, no framework.
 #include "aether/bitserialize.hpp"
 #include "aether/delta.hpp"
 #include "aether/fragment.hpp"
 
-#include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <optional>
 #include <string>
 #include <vector>
+
+using aether::test::require;
 
 int main() {
     // ---- 1. nested-dynamic round-trip ----
@@ -34,12 +36,12 @@ int main() {
         std::uint8_t buf[128];
         aether::Writer w{ buf, sizeof buf, 0, true };
         aether::pack(w, orig);
-        assert(w.ok);
+        require(w.ok);
 
         aether::Reader r{ buf, w.pos, 0 };
         const auto back = aether::unpack<WithStrs>(r);
-        assert(back && back->items.size() == orig.items.size());
-        for (std::size_t k = 0; k < orig.items.size(); ++k) assert(back->items[k] == orig.items[k]);
+        require(back && back->items.size() == orig.items.size());
+        for (std::size_t k = 0; k < orig.items.size(); ++k) require(back->items[k] == orig.items[k]);
     }
 
     // vector<vector<uint8_t>> with several EMPTY inner vectors: same nested-dynamic shape one level
@@ -52,12 +54,12 @@ int main() {
         std::uint8_t buf[128];
         aether::Writer w{ buf, sizeof buf, 0, true };
         aether::pack(w, orig);
-        assert(w.ok);
+        require(w.ok);
 
         aether::Reader r{ buf, w.pos, 0 };
         const auto back = aether::unpack<WithVecs>(r);
-        assert(back && back->items.size() == orig.items.size());
-        for (std::size_t k = 0; k < orig.items.size(); ++k) assert(back->items[k] == orig.items[k]);
+        require(back && back->items.size() == orig.items.size());
+        for (std::size_t k = 0; k < orig.items.size(); ++k) require(back->items[k] == orig.items[k]);
     }
 
     // ---- 2. non-canonical delta changemask rejection ----
@@ -72,18 +74,18 @@ int main() {
         std::uint8_t buf[32];
         aether::Writer w{ buf, sizeof buf, 0, true };
         aether::deltaPack(w, prev, curr);
-        assert(w.ok && w.pos >= 1);
+        require(w.ok && w.pos >= 1);
 
         // canonical (uncorrupted) delta still round-trips.
         aether::Reader r{ buf, w.pos, 0 };
         const auto ok = aether::deltaUnpack(r, prev);
-        assert(ok && ok->a == 7 && ok->b == 2);
+        require(ok && ok->a == 7 && ok->b == 2);
 
         // corrupt the first (only) mask byte: set a high bit beyond the 2-field count.
         buf[0] |= 0x80;
         aether::Reader rbad{ buf, w.pos, 0 };
         const auto bad = aether::deltaUnpack(rbad, prev);
-        assert(!bad);                                 // non-canonical mask -> rejected
+        require(!bad);                                // non-canonical mask -> rejected
     }
 
     // ---- 3. the memcpy fast path admits only byte-identical fields ----
@@ -112,22 +114,22 @@ int main() {
         aether::Writer ws{ slow, sizeof slow, 0, true };
         aether::serialize(wf, none);
         aether::writeAny(ws, none);
-        assert(wf.ok && ws.ok);
-        assert(wf.pos == 1 && ws.pos == 1);                       // one flag byte, not sizeof(optional<int>)
-        assert(std::memcmp(fast, slow, wf.pos) == 0);
+        require(wf.ok && ws.ok);
+        require(wf.pos == 1 && ws.pos == 1);                      // one flag byte, not sizeof(optional<int>)
+        require(std::memcmp(fast, slow, wf.pos) == 0);
 
         aether::Writer wsome{ fast, sizeof fast, 0, true };
         aether::serialize(wsome, some);
-        assert(wsome.ok && wsome.pos == 5);                       // flag + 4-byte value
+        require(wsome.ok && wsome.pos == 5);                      // flag + 4-byte value
         aether::Reader rsome{ fast, wsome.pos, 0 };
         const auto backSome = aether::deserialize<WithOpt>(rsome);
-        assert(backSome && backSome->o && *backSome->o == 0x1234);
+        require(backSome && backSome->o && *backSome->o == 0x1234);
 
         // the raw memory image of a disengaged optional is not a valid encoding of anything
         const std::uint8_t residue[] = { 0xAA, 0xBB, 0xCC, 0xDD, 0x02, 0x00, 0x00, 0x00 };
         aether::Reader rres{ residue, sizeof residue, 0 };
         const auto fromResidue = aether::deserialize<WithOpt>(rres);
-        assert(!fromResidue);
+        require(!fromResidue);
     }
 
     // ---- 4. a zero-field reflection is believable only for an empty struct ----
@@ -147,10 +149,10 @@ int main() {
         std::uint8_t buf[32];
         aether::Writer w{ buf, sizeof buf, 0, true };
         aether::serialize(w, Plain{ 7, 8, 9 });
-        assert(w.ok && w.pos == 12);                              // 3 * 4 bytes, not 0
+        require(w.ok && w.pos == 12);                             // 3 * 4 bytes, not 0
         aether::Writer we{ buf, sizeof buf, 0, true };
         aether::serialize(we, Empty{});
-        assert(we.ok && we.pos == 0);
+        require(we.ok && we.pos == 0);
     }
 
     // ---- 5. an enum decodes over the whole range its underlying type can hold ----
@@ -164,7 +166,7 @@ int main() {
             const std::uint8_t bytes[2] = { static_cast<std::uint8_t>(raw), 1 };
             aether::Reader r{ bytes, sizeof bytes, 0 };
             const auto got = aether::deserialize<Msg>(r);
-            assert(got && aether::toInt(got->ch) == raw && got->flag);
+            require(got && aether::toInt(got->ch) == raw && got->flag);
         }
         // the bit path packs the enum at its underlying width and must accept the same full range
         for (const int raw : { 0, 1, 200, 255 }) {
@@ -172,10 +174,10 @@ int main() {
             std::uint8_t bits[4];
             aether::BitWriter bw{ bits, sizeof bits };
             const std::size_t n = aether::packBits(bw, in);
-            assert(bw.ok);
+            require(bw.ok);
             aether::BitReader br{ bits, n };
             const auto got = aether::unpackBits<Msg>(br);
-            assert(got && aether::toInt(got->ch) == raw && !got->flag);
+            require(got && aether::toInt(got->ch) == raw && !got->flag);
         }
     }
 
@@ -192,16 +194,16 @@ int main() {
 
         aether::Reader r1{ engaged, sizeof engaged, 0 };
         const auto v1 = aether::deserialize<S>(r1);
-        assert(v1 && v1->o && *v1->o == 0x1234 && v1->b);
+        require(v1 && v1->o && *v1->o == 0x1234 && v1->b);
         aether::Reader r2{ disengaged, sizeof disengaged, 0 };
         const auto v2 = aether::deserialize<S>(r2);
-        assert(v2 && !v2->o && !v2->b);
+        require(v2 && !v2->o && !v2->b);
         aether::Reader r3{ badFlag, sizeof badFlag, 0 };
         const auto v3 = aether::deserialize<S>(r3);
-        assert(!v3);                                              // flag byte 2 is not a canonical "engaged"
+        require(!v3);                                             // flag byte 2 is not a canonical "engaged"
         aether::Reader r4{ badBool, sizeof badBool, 0 };
         const auto v4 = aether::deserialize<S>(r4);
-        assert(!v4);                                              // nor is bool byte 2 a canonical "true"
+        require(!v4);                                             // nor is bool byte 2 a canonical "true"
     }
 
     // ---- 7. an out-of-range fragment index buffers nothing and evicts nothing ----
@@ -215,24 +217,24 @@ int main() {
         aether::writeFragmentHeader(first, aether::FragmentHeader{ aether::MessageId{ 7 }, 0, 2 });
         first[6] = 0xAA;
         const auto partial = aether::processFragment(a, first, sizeof first, aether::MonoTime{ 0 });
-        assert(!partial && a.buffers.size() == 1);
+        require(!partial && a.buffers.size() == 1);
         const std::size_t chargedAfterFirst = a.currentSize;
 
         std::uint8_t bogus[7];
         aether::writeFragmentHeader(bogus, aether::FragmentHeader{ aether::MessageId{ 9 }, 5, 2 });   // index 5 of 2
         bogus[6] = 0xBB;
         const auto rejected = aether::processFragment(a, bogus, sizeof bogus, aether::MonoTime{ 0 });
-        assert(!rejected);
-        assert(a.buffers.size() == 1);                            // no entry created for message 9
-        assert(a.buffers.count(aether::MessageId{ 9 }) == 0);
-        assert(a.currentSize == chargedAfterFirst);               // nothing charged, nothing evicted
+        require(!rejected);
+        require(a.buffers.size() == 1);                           // no entry created for message 9
+        require(a.buffers.count(aether::MessageId{ 9 }) == 0);
+        require(a.currentSize == chargedAfterFirst);              // nothing charged, nothing evicted
 
         std::uint8_t second[7];
         aether::writeFragmentHeader(second, aether::FragmentHeader{ aether::MessageId{ 7 }, 1, 2 });
         second[6] = 0xCC;
         const auto done = aether::processFragment(a, second, sizeof second, aether::MonoTime{ 0 });
-        assert(done && done->size() == 2 && (*done)[0] == 0xAA && (*done)[1] == 0xCC);
-        assert(a.buffers.empty() && a.currentSize == 0);
+        require(done && done->size() == 2 && (*done)[0] == 0xAA && (*done)[1] == 0xCC);
+        require(a.buffers.empty() && a.currentSize == 0);
     }
 
     // ---- 8. a container length is written through its 4-byte prefix exactly ----
@@ -246,12 +248,12 @@ int main() {
         std::uint8_t buf[32];
         aether::Writer w{ buf, sizeof buf, 0, true };
         aether::serialize(w, in);
-        assert(w.ok && w.pos == 4 + 3 + 4 + 4);                   // len + "abc" + len + 2 * uint16
-        assert(buf[0] == 3 && buf[1] == 0 && buf[2] == 0 && buf[3] == 0);
-        assert(buf[7] == 2 && buf[8] == 0 && buf[9] == 0 && buf[10] == 0);
+        require(w.ok && w.pos == 4 + 3 + 4 + 4);                  // len + "abc" + len + 2 * uint16
+        require(buf[0] == 3 && buf[1] == 0 && buf[2] == 0 && buf[3] == 0);
+        require(buf[7] == 2 && buf[8] == 0 && buf[9] == 0 && buf[10] == 0);
         aether::Reader r{ buf, w.pos, 0 };
         const auto back = aether::deserialize<S>(r);
-        assert(back && back->s == "abc" && back->v.size() == 2 && back->v[0] == 1 && back->v[1] == 2);
+        require(back && back->s == "abc" && back->v.size() == 2 && back->v[0] == 1 && back->v[1] == 2);
     }
 
     std::printf("aether serialize-dyn OK: nested-dynamic (empty string/vector) round-trips; non-canonical delta "

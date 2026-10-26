@@ -1,12 +1,13 @@
+#include "check.hpp"
 // Rendezvous pairing: a Register from a NEW address pairs, a Register from the address already
-// waiting is a retry and must not. assert() is the check, so build WITHOUT NDEBUG.
+// waiting is a retry and must not.
 #include "aether/rendezvous.hpp"
 
-#include <cassert>
 #include <cstdio>
 #include <vector>
 
 using namespace aether;
+using aether::test::require;
 
 namespace {
 std::vector<std::pair<Address, Bytes>> registerFrom(RendezvousServer& rv, const Address& src,
@@ -23,15 +24,15 @@ int main() {
         aether::RendezvousServer rv;
         const auto a = aether::addrLocalhost(17001), b = aether::addrLocalhost(17002);
         const auto request = aether::encodeRegister(42);
-        assert(aether::rendezvousProcess(rv, {{a, request}}, aether::MonoTime{1}).empty());
+        require(aether::rendezvousProcess(rv, {{a, request}}, aether::MonoTime{1}).empty());
         const auto pair = aether::rendezvousProcess(rv, {{b, request}}, aether::MonoTime{2});
-        assert(pair.size() == 2);
+        require(pair.size() == 2);
         for (std::uint64_t second = 1; second <= 10; ++second) {
             const auto retry = aether::rendezvousProcess(rv, {{a, request}}, aether::MonoTime{second * 1000000000});
-            assert(retry.size() == 1 && aether::addrEqual(retry[0].first, a));
+            require(retry.size() == 1 && aether::addrEqual(retry[0].first, a));
             const auto paired = aether::decodePaired(retry[0].second);
-            assert(paired && paired->first == aether::PunchRole::Accept && aether::addrEqual(paired->second, b));
-            assert(rv.waiting.empty() && rv.sessions.size() == 1);
+            require(paired && paired->first == aether::PunchRole::Accept && aether::addrEqual(paired->second, b));
+            require(rv.waiting.empty() && rv.sessions.size() == 1);
         }
     }
     const Address a = addrV4(0xC0A80005, 5555);
@@ -45,33 +46,33 @@ int main() {
     // one peer arriving more than a second before the other.
     {
         RendezvousServer rv;
-        assert(registerFrom(rv, a, 77, atSec(0.0)).empty());   // first peer waits, no reply
-        assert(rv.waiting.count(77) == 1);
+        require(registerFrom(rv, a, 77, atSec(0.0)).empty());   // first peer waits, no reply
+        require(rv.waiting.count(77) == 1);
 
         for (double t = 1.0; t <= 5.0; t += 1.0) {             // the retries hostTick would send
             const auto out = registerFrom(rv, a, 77, atSec(t));
-            assert(out.empty());                               // a retry pairs with nothing
+            require(out.empty());                              // a retry pairs with nothing
         }
-        assert(rv.waiting.count(77) == 1);                     // still waiting, not consumed
-        assert(rv.sessions.empty());                           // and no bogus self-session
-        assert(addrEqual(rv.waiting[77].first, a));
+        require(rv.waiting.count(77) == 1);                    // still waiting, not consumed
+        require(rv.sessions.empty());                          // and no bogus self-session
+        require(addrEqual(rv.waiting[77].first, a));
         // the retry refreshed the waiter's TTL clock rather than being ignored outright
-        assert(rv.waiting[77].second.ns == atSec(5.0).ns);
+        require(rv.waiting[77].second.ns == atSec(5.0).ns);
 
         // the real partner then pairs normally, and each side is told about the OTHER one
         const auto paired = registerFrom(rv, b, 77, atSec(6.0));
-        assert(paired.size() == 2);
-        assert(rv.waiting.empty());                            // room consumed by a real pairing
-        assert(rv.sessions.count(77) == 1);
+        require(paired.size() == 2);
+        require(rv.waiting.empty());                           // room consumed by a real pairing
+        require(rv.sessions.count(77) == 1);
         for (const auto& [to, data] : paired) {
             const auto pr = decodePaired(data);
-            assert(pr);
-            assert(!addrEqual(to, pr->second));                // never your own address
-            if (addrEqual(to, a)) { assert(pr->first == PunchRole::Accept);  assert(addrEqual(pr->second, b)); }
-            else                  { assert(pr->first == PunchRole::Connect); assert(addrEqual(pr->second, a)); }
+            require(pr);
+            require(!addrEqual(to, pr->second));               // never your own address
+            if (addrEqual(to, a)) { require(pr->first == PunchRole::Accept);  require(addrEqual(pr->second, b)); }
+            else                  { require(pr->first == PunchRole::Connect); require(addrEqual(pr->second, a)); }
         }
         // the relay session records the two DISTINCT peers, so the relay fallback has a real target
-        assert(!addrEqual(rv.sessions[77].a, rv.sessions[77].b));
+        require(!addrEqual(rv.sessions[77].a, rv.sessions[77].b));
     }
 
     // The waiter's TTL refresh is real: without it a peer whose partner is slow would be swept at
@@ -80,8 +81,8 @@ int main() {
         RendezvousServer rv;
         registerFrom(rv, a, 88, atSec(0.0));
         for (double t = 100.0; t <= 400.0; t += 100.0) registerFrom(rv, a, 88, atSec(t));   // past the 300s TTL
-        assert(rv.waiting.count(88) == 1);                     // kept alive by its own retries
-        assert(registerFrom(rv, b, 88, atSec(450.0)).size() == 2);
+        require(rv.waiting.count(88) == 1);                    // kept alive by its own retries
+        require(registerFrom(rv, b, 88, atSec(450.0)).size() == 2);
     }
 
     // Two different rooms stay independent, and a peer registering for a second room does not
@@ -90,10 +91,10 @@ int main() {
         RendezvousServer rv;
         registerFrom(rv, a, 1, atSec(0.0));
         registerFrom(rv, a, 2, atSec(0.0));
-        assert(rv.waiting.size() == 2);
-        assert(registerFrom(rv, b, 1, atSec(1.0)).size() == 2);
-        assert(rv.waiting.count(2) == 1);                      // room 2 untouched
-        assert(rv.sessions.count(1) == 1);
+        require(rv.waiting.size() == 2);
+        require(registerFrom(rv, b, 1, atSec(1.0)).size() == 2);
+        require(rv.waiting.count(2) == 1);                     // room 2 untouched
+        require(rv.sessions.count(1) == 1);
     }
 
     // A third party presenting a known room id must not be able to terminate a LIVE relay session.
@@ -103,23 +104,23 @@ int main() {
     {
         RendezvousServer rv;
         const Address    evil = addrV4(0xC0A800FF, 9999);
-        assert(registerFrom(rv, a, 42, atSec(0)).empty());               // a waits
-        assert(registerFrom(rv, b, 42, atSec(0.1)).size() == 2);         // b pairs with it
-        assert(rv.sessions.count(42) == 1);
+        require(registerFrom(rv, a, 42, atSec(0)).empty());              // a waits
+        require(registerFrom(rv, b, 42, atSec(0.1)).size() == 2);        // b pairs with it
+        require(rv.sessions.count(42) == 1);
         const RendezvousSession before = rv.sessions.at(42);
 
-        assert(registerFrom(rv, evil, 42, atSec(0.2)).empty());          // stranger: ignored outright
-        assert(rv.waiting.count(42) == 0);                               // ...and it did not become a waiter
-        assert(registerFrom(rv, evil, 42, atSec(0.3)).empty());
-        assert(rv.sessions.count(42) == 1);
-        assert(addrEqual(rv.sessions.at(42).a, before.a));               // the live pair is intact
-        assert(addrEqual(rv.sessions.at(42).b, before.b));
+        require(registerFrom(rv, evil, 42, atSec(0.2)).empty());         // stranger: ignored outright
+        require(rv.waiting.count(42) == 0);                              // ...and it did not become a waiter
+        require(registerFrom(rv, evil, 42, atSec(0.3)).empty());
+        require(rv.sessions.count(42) == 1);
+        require(addrEqual(rv.sessions.at(42).a, before.a));              // the live pair is intact
+        require(addrEqual(rv.sessions.at(42).b, before.b));
 
         // A relay from a real member still works, so the session was not merely frozen.
         const Bytes inner{ 1, 2, 3 };
         const std::vector<std::pair<Address, Bytes>> relay = { { a, encodeRelay(42, inner.data(), inner.size()) } };
         const auto fwd = rendezvousProcess(rv, relay, atSec(0.4));
-        assert(fwd.size() == 1 && addrEqual(fwd[0].first, before.b));
+        require(fwd.size() == 1 && addrEqual(fwd[0].first, before.b));
     }
 
     // The rendezvous is a public host, so every frame it accepts is attacker-reachable. Unlimited, two
@@ -132,8 +133,8 @@ int main() {
             registerFrom(rv, flood, 1000 + k, atSec(0.001 * static_cast<double>(k)));
             accepted = static_cast<int>(rv.waiting.size());
         }
-        assert(rv.rateLimitDrops > 0);                                   // the limiter actually engaged
-        assert(accepted <= rendezvousMaxRequestsPerSecond);              // ...and bounded what one host could claim
+        require(rv.rateLimitDrops > 0);                                  // the limiter actually engaged
+        require(accepted <= rendezvousMaxRequestsPerSecond);             // ...and bounded what one host could claim
     }
 
     std::printf("rendezvous_test: all assertions passed\n");

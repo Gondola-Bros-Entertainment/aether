@@ -1,3 +1,4 @@
+#include "check.hpp"
 // aether - published crypto vectors + anti-replay window boundaries (crypto.hpp, x25519.hpp).
 //
 // Two jobs. The VECTORS come first: ChaCha20, Poly1305, the AEAD in both directions, and X25519,
@@ -9,14 +10,13 @@
 // out, a duplicate of the high-water mark, and an in-window skip-then-fill -- the cases roundtrip.cpp's
 // basic reorder/replay path does not reach.
 //
-// Standalone: assert() IS the check, so build WITHOUT -DNDEBUG. No framework.
+// Standalone, no framework.
 
 #include "aether/crypto.hpp"
 #include "aether/peer.hpp"     // x25519Shared: the fail-closed gate on a degenerate peer public key
 #include "aether/x25519.hpp"
 
 #include <array>
-#include <cassert>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -24,6 +24,8 @@
 #include <optional>
 #include <string>
 #include <vector>
+
+using aether::test::require;
 
 namespace {
 
@@ -41,13 +43,13 @@ std::vector<std::uint8_t> hexBytes(const char* h) {
         if (hi < 0) hi = v;
         else { out.push_back(static_cast<std::uint8_t>((hi << 4) | v)); hi = -1; }
     }
-    assert(hi < 0);   // an odd digit count means the pasted vector is truncated
+    require(hi < 0);   // an odd digit count means the pasted vector is truncated
     return out;
 }
 
 aether::X25519Key hexKey(const char* h) {
     const auto b = hexBytes(h);
-    assert(b.size() == 32);
+    require(b.size() == 32);
     aether::X25519Key k{};
     for (std::size_t i = 0; i < k.size(); ++i) k[i] = b[i];
     return k;
@@ -72,10 +74,10 @@ void testChacha20Block() {
                                 "c7d1f4c733c068030422aa9ac3d46c4e"
                                 "d2826446079faa0914c2d705d98b02a2"
                                 "b5129cd1de164eb9cbd083e8a2503c4e");
-    assert(key.size() == 32 && nonce.size() == 12 && want.size() == 64);
+    require(key.size() == 32 && nonce.size() == 12 && want.size() == 64);
     std::uint8_t got[64];
     aether::detail::chacha20Block(key.data(), 1, nonce.data(), got);
-    assert(sameBytes(got, want.data(), want.size()));
+    require(sameBytes(got, want.data(), want.size()));
     std::printf("  chacha20 block          RFC 8439 2.3.2 OK\n");
 }
 
@@ -100,21 +102,21 @@ void testChacha20Stream() {
                                 "52bc514d16ccf806818ce91ab7793736"
                                 "5af90bbf74a35be6b40b8eedf2785e42"
                                 "874d");
-    assert(pt.size() == 114 && want.size() == 114);
+    require(pt.size() == 114 && want.size() == 114);
     std::vector<std::uint8_t> ct(pt.size());
     aether::detail::chacha20Xor(key.data(), 1, nonce.data(), pt.data(), ct.data(), pt.size());
-    assert(sameBytes(ct.data(), want.data(), want.size()));
+    require(sameBytes(ct.data(), want.data(), want.size()));
 
     // The counter must ADVANCE across the boundary: bytes 64.. are block 2's keystream, not a repeat
     // of block 1's. A stalled counter still round-trips locally, so only this catches it.
     std::uint8_t block2[64];
     aether::detail::chacha20Block(key.data(), 2, nonce.data(), block2);
     for (std::size_t i = 64; i < pt.size(); ++i)
-        assert(ct[i] == static_cast<std::uint8_t>(pt[i] ^ block2[i - 64]));
+        require(ct[i] == static_cast<std::uint8_t>(pt[i] ^ block2[i - 64]));
 
     std::vector<std::uint8_t> back(pt.size());
     aether::detail::chacha20Xor(key.data(), 1, nonce.data(), ct.data(), back.data(), ct.size());
-    assert(sameBytes(back.data(), pt.data(), pt.size()));   // the stream is its own inverse
+    require(sameBytes(back.data(), pt.data(), pt.size()));   // the stream is its own inverse
     std::printf("  chacha20 stream         RFC 8439 2.4.2 OK (counter crosses a block)\n");
 }
 
@@ -125,10 +127,10 @@ void checkPoly1305(const char* keyHex, const char* msgHex, const char* tagHex) {
     const auto key  = hexBytes(keyHex);
     const auto msg  = hexBytes(msgHex);
     const auto want = hexBytes(tagHex);
-    assert(key.size() == 32 && want.size() == 16);
+    require(key.size() == 32 && want.size() == 16);
     std::uint8_t tag[16];
     aether::detail::poly1305(key.data(), msg.data(), msg.size(), tag);
-    assert(sameBytes(tag, want.data(), want.size()));
+    require(sameBytes(tag, want.data(), want.size()));
 }
 
 // A.3 prints r and s as separate 16-byte halves; the key is their concatenation.
@@ -216,7 +218,7 @@ void testPoly1305Vectors() {
     const auto emptyKey = hexBytes("85d6be7857556d337f4452fe42d506a8" "0103808afb0db2fd4abff6af4149f51b");
     std::uint8_t emptyTag[16];
     aether::detail::poly1305(emptyKey.data(), nullptr, 0, emptyTag);
-    assert(sameBytes(emptyTag, emptyKey.data() + 16, 16));
+    require(sameBytes(emptyTag, emptyKey.data() + 16, 16));
     std::printf("  poly1305 vectors        RFC 8439 2.5.2 + A.3 #1-#11 + empty message OK\n");
 }
 
@@ -242,7 +244,7 @@ void testPoly1305Incremental() {
             aether::detail::poly1305Update(st, msg.data() + j, n - j);
             std::uint8_t got[16];
             aether::detail::poly1305Finish(st, got);
-            assert(sameBytes(got, want, 16));
+            require(sameBytes(got, want, 16));
         }
     }
     std::printf("  poly1305 incremental    every 1- and 2-cut split of 83 bytes matches one-shot\n");
@@ -275,13 +277,13 @@ void testAeadDecryptVector() {
                                 "65666572656e6365206d617465726961" "6c206f7220746f206369746520746865"
                                 "6d206f74686572207468616e20617320" "2fe2809c776f726b20696e2070726f67"
                                 "726573732e2fe2809d");
-    assert(ct.size() == 265 && want.size() == 265 && aad.size() == 12);
+    require(ct.size() == 265 && want.size() == 265 && aad.size() == 12);
 
     std::vector<std::uint8_t> out(ct.size(), 0xAA);
     const bool ok = aether::aeadOpenInto(key.data(), nonce.data(), aad.data(), aad.size(),
                                          ct.data(), ct.size(), tag.data(), out.data());
-    assert(ok);
-    assert(sameBytes(out.data(), want.data(), want.size()));
+    require(ok);
+    require(sameBytes(out.data(), want.data(), want.size()));
 
     // Each of a flipped tag, ciphertext and aad byte must be rejected, and rejection must leave `out`
     // untouched -- the tag is checked before a single plaintext byte is written.
@@ -301,7 +303,7 @@ void testAeadDecryptVector() {
     const bool badTag = rejects(aad, ct, flipped(tag, 0));
     const bool badCt  = rejects(aad, flipped(ct, ct.size() - 1), tag);
     const bool badAad = rejects(flipped(aad, 0), ct, tag);
-    assert(badTag && badCt && badAad);
+    require(badTag && badCt && badAad);
     std::printf("  aead decrypt            RFC 8439 A.5 OK (tampered tag/ct/aad all rejected)\n");
 }
 
@@ -323,13 +325,13 @@ void testAeadEmptyShapes() {
     const std::uint8_t lengths[16] = {};
     std::uint8_t       want[16];
     aether::detail::poly1305(polyKey, lengths, sizeof lengths, want);
-    assert(sameBytes(tag, want, 16));
+    require(sameBytes(tag, want, 16));
 
     const bool ok = aether::aeadOpenInto(key.data(), nonce, nullptr, 0, nullptr, 0, tag, nullptr);
-    assert(ok);
+    require(ok);
     const auto badTag = hexBytes("00000000000000000000000000000000");
     const bool bad    = aether::aeadOpenInto(key.data(), nonce, nullptr, 0, nullptr, 0, badTag.data(), nullptr);
-    assert(!bad);
+    require(!bad);
 
     // makeRetryCookie's real shape: aad present, plaintext empty. The aad must still be bound.
     const auto aad = hexBytes("0011223344556677" "8899aabbccddeeff");
@@ -337,12 +339,12 @@ void testAeadEmptyShapes() {
     aether::aeadSeal(key.data(), nonce, aad.data(), aad.size(), nullptr, 0, nullptr, cookieTag);
     const bool cookieOk = aether::aeadOpenInto(key.data(), nonce, aad.data(), aad.size(),
                                                nullptr, 0, cookieTag, nullptr);
-    assert(cookieOk);
+    require(cookieOk);
     auto otherAad = aad;
     otherAad[0]   = static_cast<std::uint8_t>(otherAad[0] ^ 0x01);
     const bool cookieBad = aether::aeadOpenInto(key.data(), nonce, otherAad.data(), otherAad.size(),
                                                 nullptr, 0, cookieTag, nullptr);
-    assert(!cookieBad);
+    require(!cookieBad);
     std::printf("  aead empty shapes       null pt/aad seal+open OK, aad still bound\n");
 }
 
@@ -376,17 +378,17 @@ void testAeadMacInputFraming() {
     const std::uint64_t ctLen64  = ct.size();
     for (int i = 0; i < 8; ++i) macInput.push_back(static_cast<std::uint8_t>(aadLen64 >> (8 * i)));
     for (int i = 0; i < 8; ++i) macInput.push_back(static_cast<std::uint8_t>(ctLen64  >> (8 * i)));
-    assert(macInput.size() % 16 == 0);
+    require(macInput.size() % 16 == 0);
 
     std::uint8_t polyKey[64];
     aether::detail::chacha20Block(key.data(), 0, nonce, polyKey);
     std::uint8_t want[16];
     aether::detail::poly1305(polyKey, macInput.data(), macInput.size(), want);
-    assert(sameBytes(tag, want, 16));
+    require(sameBytes(tag, want, 16));
 
     std::vector<std::uint8_t> wantCt(pt.size());
     aether::detail::chacha20Xor(key.data(), 1, nonce, pt.data(), wantCt.data(), pt.size());
-    assert(sameBytes(ct.data(), wantCt.data(), ct.size()));   // ciphertext starts at block 1, not 0
+    require(sameBytes(ct.data(), wantCt.data(), ct.size()));   // ciphertext starts at block 1, not 0
     std::printf("  aead mac framing        pad16 + le64 lengths + block 0/1 split match by hand\n");
 }
 
@@ -411,21 +413,21 @@ void testAeadLengthSweep() {
         std::vector<std::uint8_t> out(len, 0xAA);
         const bool ok = aether::aeadOpenInto(key.data(), nonce, aad.data(), aad.size(),
                                              ct.data(), len, tag, out.data());
-        assert(ok);
-        assert(len == 0 || sameBytes(out.data(), pt.data(), len));
+        require(ok);
+        require(len == 0 || sameBytes(out.data(), pt.data(), len));
 
         if (len > 0) {
             ct[len - 1] = static_cast<std::uint8_t>(ct[len - 1] ^ 0x01);
             const bool bad = aether::aeadOpenInto(key.data(), nonce, aad.data(), aad.size(),
                                                   ct.data(), len, tag, out.data());
-            assert(!bad);
+            require(!bad);
             ct[len - 1] = static_cast<std::uint8_t>(ct[len - 1] ^ 0x01);
         }
         if (!aad.empty()) {
             aad[0] = static_cast<std::uint8_t>(aad[0] ^ 0x01);
             const bool bad = aether::aeadOpenInto(key.data(), nonce, aad.data(), aad.size(),
                                                   ct.data(), len, tag, out.data());
-            assert(!bad);
+            require(!bad);
         }
     }
     std::printf("  aead length sweep       0..129 round-trip + tamper OK (both pad16 boundaries)\n");
@@ -448,7 +450,7 @@ void testX25519Vectors() {
     for (const MulVector& v : muls) {
         aether::X25519Key out{};
         aether::x25519(out, hexKey(v.scalar), hexKey(v.point));
-        assert(sameBytes(out.data(), hexKey(v.want).data(), out.size()));
+        require(sameBytes(out.data(), hexKey(v.want).data(), out.size()));
     }
 
     const aether::X25519Key alicePriv = hexKey("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
@@ -456,12 +458,12 @@ void testX25519Vectors() {
     aether::X25519Key alicePub{}, bobPub{}, sharedA{}, sharedB{};
     aether::x25519Base(alicePub, alicePriv);
     aether::x25519Base(bobPub, bobPriv);
-    assert(sameBytes(alicePub.data(), hexKey("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a").data(), 32));
-    assert(sameBytes(bobPub.data(),   hexKey("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f").data(), 32));
+    require(sameBytes(alicePub.data(), hexKey("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a").data(), 32));
+    require(sameBytes(bobPub.data(),   hexKey("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f").data(), 32));
     aether::x25519(sharedA, alicePriv, bobPub);
     aether::x25519(sharedB, bobPriv, alicePub);
-    assert(sameBytes(sharedA.data(), hexKey("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742").data(), 32));
-    assert(sameBytes(sharedB.data(), sharedA.data(), 32));
+    require(sameBytes(sharedA.data(), hexKey("4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742").data(), 32));
+    require(sameBytes(sharedB.data(), sharedA.data(), 32));
     std::printf("  x25519 vectors          RFC 7748 5.2 (x2) + 6.1 ECDH example OK\n");
 }
 
@@ -478,9 +480,9 @@ void testX25519Iterated() {
         u = k;
         k = next;
         if (i == 0)
-            assert(sameBytes(k.data(), hexKey("422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079").data(), 32));
+            require(sameBytes(k.data(), hexKey("422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079").data(), 32));
     }
-    assert(sameBytes(k.data(), hexKey("684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51").data(), 32));
+    require(sameBytes(k.data(), hexKey("684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51").data(), 32));
     std::printf("  x25519 iterated         RFC 7748 5.2 after 1 and after 1000 OK\n");
 }
 
@@ -504,15 +506,15 @@ void testX25519SmallOrder() {
         aether::x25519(raw, priv, point);
         std::uint8_t acc = 0;
         for (const std::uint8_t b : raw) acc = static_cast<std::uint8_t>(acc | b);
-        assert(acc == 0);                                        // the ladder really does collapse
+        require(acc == 0);                                       // the ladder really does collapse
         const auto gated = aether::x25519Shared(priv, point);
-        assert(!gated);                                          // and the gate really does reject
+        require(!gated);                                         // and the gate really does reject
     }
     // A real peer key still passes the gate, so the check is not rejecting everything.
     aether::X25519Key peerPub{};
     aether::x25519Base(peerPub, hexKey("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb"));
     const auto good = aether::x25519Shared(priv, peerPub);
-    assert(good);
+    require(good);
     std::printf("  x25519 small order      7 low-order points rejected, real key accepted\n");
 }
 
@@ -531,10 +533,10 @@ void testReplayWindow() {
     {
         ReplayWindow w;
         const std::uint64_t n = 1000;
-        const bool base = replayAccept(w, n);          assert(base);          // first seen -> high-water = n
-        const bool jump = replayAccept(w, n + replayWindowBits); assert(jump); // +64: window zeroed, max = n+64
-        const bool edge = replayAccept(w, n + 1);      assert(edge);          // age 63: oldest in-window -> accepted
-        const bool fell = replayAccept(w, n);          assert(!fell);         // age 64: fell out -> rejected (too-old)
+        const bool base = replayAccept(w, n);          require(base);         // first seen -> high-water = n
+        const bool jump = replayAccept(w, n + replayWindowBits); require(jump); // +64: window zeroed, max = n+64
+        const bool edge = replayAccept(w, n + 1);      require(edge);         // age 63: oldest in-window -> accepted
+        const bool fell = replayAccept(w, n);          require(!fell);        // age 64: fell out -> rejected (too-old)
     }
 
     // Fresh window: accept a high counter, then a counter exactly at the far edge (age 63) is in-window
@@ -542,26 +544,26 @@ void testReplayWindow() {
     {
         ReplayWindow w;
         const std::uint64_t n = 1000;
-        const bool base  = replayAccept(w, n);                       assert(base);    // high-water = n
-        const bool inWin = replayAccept(w, n - (replayWindowBits - 1)); assert(inWin);  // age 63 -> accepted
-        const bool stale = replayAccept(w, n - replayWindowBits);    assert(!stale);  // age 64 -> rejected
+        const bool base  = replayAccept(w, n);                       require(base);   // high-water = n
+        const bool inWin = replayAccept(w, n - (replayWindowBits - 1)); require(inWin);  // age 63 -> accepted
+        const bool stale = replayAccept(w, n - replayWindowBits);    require(!stale);  // age 64 -> rejected
     }
 
     // A counter equal to the current high-water mark is a duplicate of the max -> rejected as replay.
     {
         ReplayWindow w;
-        const bool first = replayAccept(w, 500); assert(first);   // max = 500
-        const bool dup   = replayAccept(w, 500); assert(!dup);    // same as max -> replay
+        const bool first = replayAccept(w, 500); require(first);   // max = 500
+        const bool dup   = replayAccept(w, 500); require(!dup);    // same as max -> replay
     }
 
     // In-window reorder: skip a counter (advancing the window), then fill the gap -> accepted; the
     // window records it, so re-delivering that same counter -> rejected as replay.
     {
         ReplayWindow w;
-        const bool a    = replayAccept(w, 10); assert(a);    // max = 10
-        const bool b    = replayAccept(w, 12); assert(b);    // skip 11, max = 12 (bit for 11 still clear)
-        const bool fill = replayAccept(w, 11); assert(fill); // in-window, not yet seen -> accepted
-        const bool re   = replayAccept(w, 11); assert(!re);  // now seen -> replay
+        const bool a    = replayAccept(w, 10); require(a);    // max = 10
+        const bool b    = replayAccept(w, 12); require(b);    // skip 11, max = 12 (bit for 11 still clear)
+        const bool fill = replayAccept(w, 11); require(fill); // in-window, not yet seen -> accepted
+        const bool re   = replayAccept(w, 11); require(!re);  // now seen -> replay
     }
 
     std::printf("  replay window           full-width jump zeroes window, age-63 in / age-64 out,"

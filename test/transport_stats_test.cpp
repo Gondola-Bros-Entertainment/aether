@@ -1,16 +1,15 @@
 #include "check.hpp"
 // Cross-layer transport tests: the RTT/loss signal must not depend on a connection carrying
 // RELIABLE traffic, and the congestion window must bound what a single tick emits.
-// assert() is the check, so build WITHOUT NDEBUG.
 #include "aether/connection.hpp"
 #include "aether/peer.hpp"
 #include "aether/testnet.hpp"
 
-#include <cassert>
 #include <cstdio>
 #include <cstdint>
 
 using namespace aether;
+using aether::test::require;
 
 namespace {
 
@@ -34,7 +33,7 @@ MonoTime connectPair(Pair& p, const NetworkConfig& cfg, MonoTime now) {
     p.link   = newTestLink(p.server, p.sp, p.client, p.cp);
     peerConnect(p.client, p.sp, now);
     now = testLinkConnect(p.link, now, tickNs, 400);
-    assert(peerIsConnected(p.client, p.sp));
+    require(peerIsConnected(p.client, p.sp));
     return now;
 }
 
@@ -70,19 +69,19 @@ int main() {
         }
 
         const Connection& c = p.client.connections.at(p.sp);
-        assert(c.reliability.lossWindowCount > 0);          // the loss window is actually fed
-        assert(packetLossFraction(c.reliability) > 0.1);    // and reports real loss, not a flat 0
-        assert(c.reliability.hasRttSample);                 // RTT is sampled off the same acks
-        assert(c.reliability.srtt > 0.0);
-        assert(c.stats.rtt > 0.0);                          // ...and reaches the app-facing stats
-        assert(c.stats.packetLoss > 0.1);
-        assert(c.stats.connectionQuality != ConnectionQuality::Excellent);   // not graded perfect
+        require(c.reliability.lossWindowCount > 0);         // the loss window is actually fed
+        require(packetLossFraction(c.reliability) > 0.1);   // and reports real loss, not a flat 0
+        require(c.reliability.hasRttSample);                // RTT is sampled off the same acks
+        require(c.reliability.srtt > 0.0);
+        require(c.stats.rtt > 0.0);                         // ...and reaches the app-facing stats
+        require(c.stats.packetLoss > 0.1);
+        require(c.stats.connectionQuality != ConnectionQuality::Excellent);   // not graded perfect
         // the rate controller reacts instead of ramping up into the loss
-        assert(c.congestion.currentSendRate <= c.congestion.baseSendRate);
+        require(c.congestion.currentSendRate <= c.congestion.baseSendRate);
 
         // the unreliable traffic must NOT have been charged to the congestion window (size 0),
         // otherwise nothing would ever ack those bytes back out and the window would wedge shut
-        assert(c.reliability.bytesAcked == 0);
+        require(c.reliability.bytesAcked == 0);
     }
 
     // A clean link must still read as clean: the widened signal reports real conditions, it does
@@ -105,10 +104,10 @@ int main() {
             testLinkStep(p.link, now);
         }
         const Connection& c = p.client.connections.at(p.sp);
-        assert(c.reliability.lossWindowCount > 0);
-        assert(packetLossFraction(c.reliability) == 0.0);   // a clean link reads clean
-        assert(c.stats.rtt > 0.0);
-        assert(c.congestion.mode == CongestionMode::Good);
+        require(c.reliability.lossWindowCount > 0);
+        require(packetLossFraction(c.reliability) == 0.0);   // a clean link reads clean
+        require(c.stats.rtt > 0.0);
+        require(c.congestion.mode == CongestionMode::Good);
     }
 
     // ---- the congestion window bounds a single tick ----
@@ -143,26 +142,26 @@ int main() {
         now = MonoTime{ now.ns + tickNs };
         updateConnectedPure(c, now);
 
-        assert(c.cwnd->bytesInFlight <= static_cast<std::uint64_t>(c.cwnd->cwnd));   // the window HOLDS
-        assert(c.cwnd->bytesInFlight > 0);                                           // ...without stalling the sender
-        assert(c.cwnd->pendingBytes == 0);   // every reservation was realized at flush; none leaked
+        require(c.cwnd->bytesInFlight <= static_cast<std::uint64_t>(c.cwnd->cwnd));   // the window HOLDS
+        require(c.cwnd->bytesInFlight > 0);                                           // ...without stalling the sender
+        require(c.cwnd->pendingBytes == 0);   // every reservation was realized at flush; none leaked
 
         // Pacing spreads a window over an RTT, so filling one can take more than a single tick. What
         // must hold on EVERY tick is that nothing is admitted past the window.
         for (int t = 0; t < 4 && c.cwnd->bytesInFlight + wireBytes <= static_cast<std::uint64_t>(c.cwnd->cwnd); ++t) {
             now = MonoTime{ now.ns + tickNs };
             updateConnectedPure(c, now);
-            assert(c.cwnd->bytesInFlight <= static_cast<std::uint64_t>(c.cwnd->cwnd));
-            assert(c.cwnd->pendingBytes == 0);
+            require(c.cwnd->bytesInFlight <= static_cast<std::uint64_t>(c.cwnd->cwnd));
+            require(c.cwnd->pendingBytes == 0);
         }
 
         // and a full window blocks the next tick rather than admitting more
         const std::uint64_t inFlight = c.cwnd->bytesInFlight;
-        assert(inFlight + wireBytes > static_cast<std::uint64_t>(c.cwnd->cwnd));   // it really is full
+        require(inFlight + wireBytes > static_cast<std::uint64_t>(c.cwnd->cwnd));   // it really is full
         now = MonoTime{ now.ns + tickNs };
         updateConnectedPure(c, now);
-        assert(c.cwnd->bytesInFlight == inFlight);
-        assert(c.cwnd->pendingBytes == 0);
+        require(c.cwnd->bytesInFlight == inFlight);
+        require(c.cwnd->pendingBytes == 0);
     }
 
     // ---- the congestion WINDOW must react to loss of unreliable-only packets ----
@@ -183,7 +182,7 @@ int main() {
         MonoTime now = connectPair(p, cfg, MonoTime{ 0 });
 
         const double cwnd0 = p.client.connections.at(p.sp).cwnd->cwnd;
-        assert(cwnd0 > 0.0);
+        require(cwnd0 > 0.0);
 
         TestLinkConfig bad;
         bad.lossRate  = 0.40;
@@ -198,13 +197,13 @@ int main() {
         }
 
         const Connection& c = p.client.connections.at(p.sp);
-        assert(c.reliability.totalLost > 0);                 // packets really were declared lost
-        assert(c.cwnd->cwnd < cwnd0);                        // ...and the WINDOW responded to them
-        assert(c.cwnd->phase != CongestionPhase::SlowStart);  // it left slow start on the loss episode
+        require(c.reliability.totalLost > 0);                // packets really were declared lost
+        require(c.cwnd->cwnd < cwnd0);                       // ...and the WINDOW responded to them
+        require(c.cwnd->phase != CongestionPhase::SlowStart);  // it left slow start on the loss episode
         // window accounting is still untouched by unreliable traffic: nothing acks it, so charging
         // it would leak the window shut.
-        assert(c.cwnd->bytesInFlight == 0);
-        assert(c.cwnd->pendingBytes == 0);
+        require(c.cwnd->bytesInFlight == 0);
+        require(c.cwnd->pendingBytes == 0);
     }
 
     // ---- ONE window reduction per loss episode, through the real header path ----
@@ -245,16 +244,16 @@ int main() {
         deliver(4);
         const double cwndAtLoss = c.cwnd->cwnd;
         deliver(5);                                          // seq 2 crosses the threshold: ONE reduction
-        assert(c.cwnd->phase == CongestionPhase::Recovery);
+        require(c.cwnd->phase == CongestionPhase::Recovery);
         const double afterFirst = c.cwnd->ssthresh;
-        assert(afterFirst == cwndAtLoss / 2.0);
+        require(afterFirst == cwndAtLoss / 2.0);
 
         deliver(7);                                          // acks with no loss: fast recovery ends here
-        assert(c.cwnd->phase == CongestionPhase::Avoidance);
+        require(c.cwnd->phase == CongestionPhase::Avoidance);
         deliver(8);
         deliver(9);                                          // seq 6, same flight -> no second reduction
-        assert(c.reliability.totalLost == 2);
-        assert(c.cwnd->ssthresh == afterFirst);
+        require(c.reliability.totalLost == 2);
+        require(c.cwnd->ssthresh == afterFirst);
     }
 
     // ---- a path that goes totally DARK must degrade the signal, not freeze it ----
@@ -278,10 +277,10 @@ int main() {
             testLinkStep(p.link, now);
         }
         const Connection& c = p.client.connections.at(p.sp);
-        assert(c.stats.connectionQuality == ConnectionQuality::Excellent);
-        assert(c.stats.packetLoss == 0.0);
+        require(c.stats.connectionQuality == ConnectionQuality::Excellent);
+        require(c.stats.packetLoss == 0.0);
         const double rateBefore = c.congestion.currentSendRate;
-        assert(rateBefore > minSendRate);
+        require(rateBefore > minSendRate);
 
         TestLinkConfig dark;
         dark.lossRate = 1.0;   // nothing gets through, in either direction
@@ -292,12 +291,12 @@ int main() {
             peerSend(p.client, p.sp, ChannelId{ 0 }, payload, now);
             testLinkStep(p.link, now);
         }
-        assert(peerIsConnected(p.client, p.sp));                          // still Connected, as before...
-        assert(c.stats.packetLoss > 0.9);                                 // ...but the loss signal MOVED
-        assert(c.stats.connectionQuality == ConnectionQuality::Bad);      // ...and so did the grade
-        assert(c.congestion.mode == CongestionMode::Bad);
-        assert(c.congestion.currentSendRate < rateBefore);                // the controller backed OFF
-        assert(c.reliability.totalLost > 0);
+        require(peerIsConnected(p.client, p.sp));                         // still Connected, as before...
+        require(c.stats.packetLoss > 0.9);                                // ...but the loss signal MOVED
+        require(c.stats.connectionQuality == ConnectionQuality::Bad);     // ...and so did the grade
+        require(c.congestion.mode == CongestionMode::Bad);
+        require(c.congestion.currentSendRate < rateBefore);               // the controller backed OFF
+        require(c.reliability.totalLost > 0);
     }
 
     // ---- a fragmented retransmit is priced PER FRAGMENT, exactly as its first send is ----
@@ -314,15 +313,15 @@ int main() {
         cfg.channelConfigs[0].maxMessageSize     = 16384;
         cfg.channelConfigs[0].maxReliableRetries = 3;   // a short budget, so delivery failure is reachable in sim time
         cfg.maxChannels    = 1;
-        assert(!validateConfig(cfg));
+        require(!validateConfig(cfg));
 
         MonoTime   now{ 0 };
         Connection c = newConnection(cfg, 1, now);
         markConnected(c, now);
         c.peerCredit[0] = 64;   // the receiver is not the constraint under test here
 
-        aether::test::require(!sendMessage(c, ChannelId{ 0 }, Bytes(4000, 0x7E), now));   // ~4 fragments: over one bucket
-        aether::test::require(!sendMessage(c, ChannelId{ 0 }, Bytes(40, 0x11), now));     // a small one queued BEHIND it
+        require(!sendMessage(c, ChannelId{ 0 }, Bytes(4000, 0x7E), now));                 // ~4 fragments: over one bucket
+        require(!sendMessage(c, ChannelId{ 0 }, Bytes(40, 0x11), now));                   // a small one queued BEHIND it
 
         // Nothing is ever acked, so both keep qualifying for retransmit until their budgets run out.
         const std::uint64_t tick = 16000000;
@@ -333,12 +332,12 @@ int main() {
             drainSendQueue(c);   // the wire goes nowhere: only the send-side accounting is under test
         }
         const Channel& ch = c.channels[0];
-        assert(ticks < 12000);                    // it terminated rather than spinning forever
-        assert(ch.totalRetransmits > 0);          // the over-budget message DOES retransmit...
-        assert(ch.failure == ChannelFailure::RetryLimitExceeded);
-        assert(!ch.sendBuffer.empty());           // retained for failure reporting; never silently discarded
-        assert(ch.totalReliableDropped >= 1);
-        assert(c.stats.reliableDropped == ch.totalReliableDropped);
+        require(ticks < 12000);                   // it terminated rather than spinning forever
+        require(ch.totalRetransmits > 0);         // the over-budget message DOES retransmit...
+        require(ch.failure == ChannelFailure::RetryLimitExceeded);
+        require(!ch.sendBuffer.empty());          // retained for failure reporting; never silently discarded
+        require(ch.totalReliableDropped >= 1);
+        require(c.stats.reliableDropped == ch.totalReliableDropped);
     }
 
     // ---- an idle connection must not trade an ack-only every tick ----
@@ -364,10 +363,10 @@ int main() {
 
         // 5s of keepalives + time-sync pings + their pongs is ~15 packets, plus a short MTU search.
         // The bound that matters is that this is a function of the CADENCES, not of the tick rate.
-        assert(sent > 0);                                    // the link stays alive
-        assert(sent < static_cast<std::uint64_t>(ticks) / 4);   // and nowhere near one per tick
-        assert(peerIsConnected(p.client, p.sp));             // no timeout from the quieter link
-        assert(peerIsConnected(p.server, p.cp));
+        require(sent > 0);                                   // the link stays alive
+        require(sent < static_cast<std::uint64_t>(ticks) / 4);   // and nowhere near one per tick
+        require(peerIsConnected(p.client, p.sp));            // no timeout from the quieter link
+        require(peerIsConnected(p.server, p.cp));
 
         // a reliable message must still be acked PROMPTLY, not held until the next keepalive
         const Bytes msg(64, 0x11);
@@ -375,20 +374,20 @@ int main() {
         peerSend(p.client, p.sp, ChannelId{ 0 }, msg, now);
         for (int t = 0; t < 8; ++t) { now = MonoTime{ now.ns + tickNs }; testLinkStep(p.link, now); }
         const Connection& c = p.client.connections.at(p.sp);
-        assert(c.reliability.totalAcked > 0);                // the ack came back inside a few ticks
-        assert(c.channels[0].sendBuffer.empty());            // ...and retired the message
+        require(c.reliability.totalAcked > 0);               // the ack came back inside a few ticks
+        require(c.channels[0].sendBuffer.empty());           // ...and retired the message
     }
 
     // A reservation must never wrap the counter, and must survive a connection reset.
     {
         CongestionWindow cw = newCongestionWindow(1200);
         cwOnAdmit(cw, 500);
-        assert(cw.pendingBytes == 500);
+        require(cw.pendingBytes == 500);
         cwOnSend(cw, 500, MonoTime{ 1 });
-        assert(cw.pendingBytes == 0 && cw.bytesInFlight == 500);
+        require(cw.pendingBytes == 0 && cw.bytesInFlight == 500);
         cwOnSend(cw, 900, MonoTime{ 2 });            // flushed more than was reserved
-        assert(cw.pendingBytes == 0);                // saturates at 0 rather than wrapping
-        assert(cw.bytesInFlight == 1400);
+        require(cw.pendingBytes == 0);               // saturates at 0 rather than wrapping
+        require(cw.bytesInFlight == 1400);
     }
 
     // ---- a peer that has received nothing must not acknowledge anything ----
@@ -405,16 +404,16 @@ int main() {
 
         Connection c = newConnection(cfg, 1234, now);
         markConnected(c, now);
-        assert(c.localSeq != SequenceNum{ 0 });   // ...both on a fresh connection and on connect
+        require(c.localSeq != SequenceNum{ 0 });   // ...both on a fresh connection and on connect
         resetConnection(c);
-        assert(c.localSeq != SequenceNum{ 0 });   // ...and on a recycled one
+        require(c.localSeq != SequenceNum{ 0 });   // ...and on a recycled one
 
         // Register a reliable packet at the first sequence we would actually send.
         markConnected(c, now);
         const SequenceNum first = c.localSeq;
-        assert(first == firstSequence);
+        require(first == firstSequence);
         onPacketSent(c.reliability, first, now, ChannelId{ 0 }, SequenceNum{ 0 }, 200);
-        assert(isInFlight(c.reliability, first));
+        require(isInFlight(c.reliability, first));
 
         // Now the peer's very first header, sent before it had received anything: ack = 0, bits = 0.
         PacketHeader virgin{};
@@ -422,7 +421,7 @@ int main() {
         virgin.ack     = SequenceNum{ 0 };
         virgin.ackBits = 0;
         processIncomingAcks(c, virgin, now);
-        assert(isInFlight(c.reliability, first));   // still in flight: nothing was falsely confirmed
+        require(isInFlight(c.reliability, first));   // still in flight: nothing was falsely confirmed
     }
 
     std::printf("transport_stats_test: all assertions passed\n");

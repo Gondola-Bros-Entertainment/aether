@@ -4,8 +4,9 @@
 // reliable mode has to recognize that. Data-first: plain Channel struct + free functions.
 #include "aether/channel.hpp"
 
-#include <cassert>
 #include <cstdio>
+
+using aether::test::require;
 
 int main() {
     // Sequence zero is a real first message; reset restores the no-message-received state.
@@ -13,10 +14,10 @@ int main() {
         aether::ChannelConfig cfg; cfg.deliveryMode = mode;
         auto ch = aether::newChannel(aether::ChannelId{0}, cfg);
         for (int reset = 0; reset < 2; ++reset) {
-            aether::test::require(aether::onMessageReceived(ch, aether::SequenceNum{0}, aether::Bytes{42}, {}));
-            assert(aether::channelReceive(ch) == std::vector<aether::Bytes>{{42}});
+            require(aether::onMessageReceived(ch, aether::SequenceNum{0}, aether::Bytes{42}, {}));
+            require(aether::channelReceive(ch) == std::vector<aether::Bytes>{{42}});
             aether::onMessageReceived(ch, aether::SequenceNum{0}, aether::Bytes{42}, {});
-            assert(aether::channelReceive(ch).empty());
+            require(aether::channelReceive(ch).empty());
             aether::resetChannel(ch);
         }
     }
@@ -26,12 +27,12 @@ int main() {
         auto ch = aether::newChannel(aether::ChannelId{0}, cfg);
         for (unsigned i = 0; i < 66000; ++i) {
             const aether::SequenceNum seq{static_cast<std::uint16_t>(i)};
-            aether::test::require(aether::onMessageReceived(ch, seq, aether::Bytes{42}, {}));
-            assert(aether::channelReceive(ch).size() == 1);
+            require(aether::onMessageReceived(ch, seq, aether::Bytes{42}, {}));
+            require(aether::channelReceive(ch).size() == 1);
             if (i >= 256) {
                 const aether::SequenceNum old{static_cast<std::uint16_t>(i - 256)};
-                aether::test::require(aether::onMessageReceived(ch, old, aether::Bytes{42}, {}));
-                assert(aether::channelReceive(ch).empty());
+                require(aether::onMessageReceived(ch, old, aether::Bytes{42}, {}));
+                require(aether::channelReceive(ch).empty());
             }
         }
     }
@@ -41,32 +42,32 @@ int main() {
         auto tx = aether::newChannel(aether::ChannelId{0}, cfg);
         tx.localSeq = aether::SequenceNum{start};
         auto first = aether::channelSend(tx, {42}, {});
-        assert(first.error == aether::ChannelError::None);
+        require(first.error == aether::ChannelError::None);
         for (int i = 1; i < aether::maxMessageBufferSize; ++i) {
             const auto sent = aether::channelSend(tx, {42}, {});
-            assert(sent.error == aether::ChannelError::None);
+            require(sent.error == aether::ChannelError::None);
             aether::acknowledgeMessage(tx, sent.seq);
         }
-        aether::test::require(aether::channelSend(tx, {42}, {}).error == aether::ChannelError::BufferFull);
+        require(aether::channelSend(tx, {42}, {}).error == aether::ChannelError::BufferFull);
         aether::acknowledgeMessage(tx, first.seq);
-        aether::test::require(aether::channelSend(tx, {42}, {}).error == aether::ChannelError::None);
+        require(aether::channelSend(tx, {42}, {}).error == aether::ChannelError::None);
     }
     // Out-of-order evidence never evicts a hole: refuse the next window, then advance when zero arrives.
     {
         aether::ChannelConfig cfg; cfg.deliveryMode = aether::DeliveryMode::ReliableUnordered;
         auto ch = aether::newChannel(aether::ChannelId{0}, cfg);
         for (unsigned i = 1; i < aether::maxMessageBufferSize; ++i) {
-            aether::test::require(aether::onMessageReceived(ch, aether::SequenceNum{static_cast<std::uint16_t>(i)}, {42}, {}));
+            require(aether::onMessageReceived(ch, aether::SequenceNum{static_cast<std::uint16_t>(i)}, {42}, {}));
             aether::channelReceive(ch);
         }
-        aether::test::require(!aether::onMessageReceived(ch, aether::SequenceNum{aether::maxMessageBufferSize}, {42}, {}));
-        aether::test::require(aether::onMessageReceived(ch, aether::SequenceNum{1}, {42}, {}));
-        assert(aether::channelReceive(ch).empty());
-        aether::test::require(aether::onMessageReceived(ch, aether::SequenceNum{0}, {42}, {}));
-        assert(ch.unorderedExpected.value == aether::maxMessageBufferSize);
-        assert(aether::channelReceive(ch).size() == 1);
-        aether::test::require(aether::onMessageReceived(ch, aether::SequenceNum{aether::maxMessageBufferSize}, {42}, {}));
-        assert(aether::channelReceive(ch).size() == 1);
+        require(!aether::onMessageReceived(ch, aether::SequenceNum{aether::maxMessageBufferSize}, {42}, {}));
+        require(aether::onMessageReceived(ch, aether::SequenceNum{1}, {42}, {}));
+        require(aether::channelReceive(ch).empty());
+        require(aether::onMessageReceived(ch, aether::SequenceNum{0}, {42}, {}));
+        require(ch.unorderedExpected.value == aether::maxMessageBufferSize);
+        require(aether::channelReceive(ch).size() == 1);
+        require(aether::onMessageReceived(ch, aether::SequenceNum{aether::maxMessageBufferSize}, {42}, {}));
+        require(aether::channelReceive(ch).size() == 1);
     }
 
     // A duplicate of an already-DELIVERED sequence on an ordered channel must be dropped, not buffered.
@@ -77,22 +78,22 @@ int main() {
         aether::Channel ch = aether::newChannel(aether::ChannelId{ 0 }, aether::reliableOrderedChannel());
         for (std::uint16_t s = 0; s < 3; ++s)
             aether::onMessageReceived(ch, aether::SequenceNum{ s }, aether::Bytes{ static_cast<std::uint8_t>(s) }, aether::MonoTime{ 0 });
-        assert(aether::channelReceive(ch).size() == 3);
-        assert(ch.orderedExpected == aether::SequenceNum{ 3 });
+        require(aether::channelReceive(ch).size() == 3);
+        require(ch.orderedExpected == aether::SequenceNum{ 3 });
 
         const bool acked = aether::onMessageReceived(ch, aether::SequenceNum{ 0 }, aether::Bytes{ 0 }, aether::MonoTime{ 1000000 });
-        assert(ch.orderedBuffer.empty());                     // recognized as a duplicate, never buffered
-        assert(ch.totalDuplicate == 1 && ch.totalDropped == 0 && ch.totalRefused == 0);
-        assert(acked);   // and it must still be ACKED: the peer resent it precisely because it saw no ack
+        require(ch.orderedBuffer.empty());                    // recognized as a duplicate, never buffered
+        require(ch.totalDuplicate == 1 && ch.totalDropped == 0 && ch.totalRefused == 0);
+        require(acked);   // and it must still be ACKED: the peer resent it precisely because it saw no ack
 
         aether::channelUpdate(ch, aether::MonoTime{ 6000000000ull });   // 6s: past the 5s ordered timeout
-        assert(aether::channelReceive(ch).empty());           // nothing to redeliver
-        assert(ch.orderedExpected == aether::SequenceNum{ 3 });         // window did NOT rewind
+        require(aether::channelReceive(ch).empty());          // nothing to redeliver
+        require(ch.orderedExpected == aether::SequenceNum{ 3 });        // window did NOT rewind
 
         // ...so the next real messages still deliver immediately.
         aether::onMessageReceived(ch, aether::SequenceNum{ 3 }, aether::Bytes{ 3 }, aether::MonoTime{ 6100000000ull });
         aether::onMessageReceived(ch, aether::SequenceNum{ 4 }, aether::Bytes{ 4 }, aether::MonoTime{ 6100000000ull });
-        assert(aether::channelReceive(ch).size() == 2);
+        require(aether::channelReceive(ch).size() == 2);
     }
 
     // An explicit gap deadline terminates strict ordering; it must never publish later commands.
@@ -107,12 +108,12 @@ int main() {
         aether::channelUpdate(ch, aether::MonoTime{ 200000000ull });   // 200ms: seq 2 timed out, seq 3 has not
 
         const auto got = aether::channelReceive(ch);
-        assert(got.empty());
-        assert(ch.failure == aether::ChannelFailure::OrderedGapTimeout);
-        assert(ch.orderedExpected == aether::SequenceNum{ 0 });
-        assert(ch.orderedBuffer.size() == 2); // Retained until explicit connection termination/reset.
-        aether::test::require(!aether::onMessageReceived(ch, aether::SequenceNum{0}, {0}, {}));
-        aether::test::require(aether::channelSend(ch, {0}, {}).error == aether::ChannelError::DeliveryFailed);
+        require(got.empty());
+        require(ch.failure == aether::ChannelFailure::OrderedGapTimeout);
+        require(ch.orderedExpected == aether::SequenceNum{ 0 });
+        require(ch.orderedBuffer.size() == 2); // Retained until explicit connection termination/reset.
+        require(!aether::onMessageReceived(ch, aether::SequenceNum{0}, {0}, {}));
+        require(aether::channelSend(ch, {0}, {}).error == aether::ChannelError::DeliveryFailed);
     }
 
     // ReliableUnordered has no ordering state to infer duplicates from, so it dedups explicitly: a
@@ -124,15 +125,15 @@ int main() {
 
         aether::onMessageReceived(ch, aether::SequenceNum{ 7 }, aether::Bytes{ 0xAA }, aether::MonoTime{ 0 });
         aether::onMessageReceived(ch, aether::SequenceNum{ 7 }, aether::Bytes{ 0xAA }, aether::MonoTime{ 1000000 });   // retransmit
-        assert(aether::channelReceive(ch).size() == 1);
-        assert(ch.totalDuplicate == 1 && ch.totalReceived == 1 && ch.totalDropped == 0);
+        require(aether::channelReceive(ch).size() == 1);
+        require(ch.totalDuplicate == 1 && ch.totalReceived == 1 && ch.totalDropped == 0);
 
         // Out-of-order first arrivals are still both delivered -- this mode promises delivery, not order.
         aether::onMessageReceived(ch, aether::SequenceNum{ 9 }, aether::Bytes{ 0x09 }, aether::MonoTime{ 2000000 });
         aether::onMessageReceived(ch, aether::SequenceNum{ 8 }, aether::Bytes{ 0x08 }, aether::MonoTime{ 3000000 });
-        assert(aether::channelReceive(ch).size() == 2);
+        require(aether::channelReceive(ch).size() == 2);
         aether::onMessageReceived(ch, aether::SequenceNum{ 8 }, aether::Bytes{ 0x08 }, aether::MonoTime{ 4000000 });   // dup of the late one
-        assert(aether::channelReceive(ch).empty());
+        require(aether::channelReceive(ch).empty());
     }
 
     // A reliable message split into N>1 fragments acks only when the LAST fragment lands. Acking a
@@ -142,7 +143,7 @@ int main() {
         constexpr std::uint8_t N = 5;
         aether::Channel ch = aether::newChannel(aether::ChannelId{ 0 }, aether::reliableOrderedChannel());
         const auto sr = aether::channelSend(ch, aether::Bytes{ 1, 2, 3 }, aether::MonoTime{ 0 });
-        assert(sr.error == aether::ChannelError::None);
+        require(sr.error == aether::ChannelError::None);
         aether::commitOutgoingMessage(ch, sr.seq, aether::MonoTime{ 0 });   // in flight (reliable, retryCount 1)
         ch.sendBuffer.at(sr.seq).fragmentCount = N;                          // recorded as 5 fragments
 
@@ -151,10 +152,10 @@ int main() {
         aether::acknowledgeMessage(ch, sr.seq, 0);
         aether::acknowledgeMessage(ch, sr.seq, 4);
         aether::acknowledgeMessage(ch, sr.seq, 1);
-        assert(!ch.sendBuffer.at(sr.seq).acked);              // 4/5 -> incomplete
+        require(!ch.sendBuffer.at(sr.seq).acked);             // 4/5 -> incomplete
 
         aether::acknowledgeMessage(ch, sr.seq, 2);            // the 5th and last fragment
-        assert(ch.sendBuffer.at(sr.seq).acked);              // all fragments in -> acked
+        require(ch.sendBuffer.at(sr.seq).acked);             // all fragments in -> acked
     }
 
     // A duplicate fragment ack (same index twice) is idempotent: it does not double-count, so it
@@ -163,7 +164,7 @@ int main() {
         constexpr std::uint8_t N = 5;
         aether::Channel ch = aether::newChannel(aether::ChannelId{ 0 }, aether::reliableOrderedChannel());
         const auto sr = aether::channelSend(ch, aether::Bytes{ 7 }, aether::MonoTime{ 0 });
-        assert(sr.error == aether::ChannelError::None);
+        require(sr.error == aether::ChannelError::None);
         aether::commitOutgoingMessage(ch, sr.seq, aether::MonoTime{ 0 });
         ch.sendBuffer.at(sr.seq).fragmentCount = N;
 
@@ -173,20 +174,20 @@ int main() {
         aether::acknowledgeMessage(ch, sr.seq, 1);
         aether::acknowledgeMessage(ch, sr.seq, 2);
         aether::acknowledgeMessage(ch, sr.seq, 3);
-        assert(!ch.sendBuffer.at(sr.seq).acked);              // 4 distinct (0..3), dups didn't count -> not acked
+        require(!ch.sendBuffer.at(sr.seq).acked);             // 4 distinct (0..3), dups didn't count -> not acked
         aether::acknowledgeMessage(ch, sr.seq, 4);            // the actual last distinct fragment
-        assert(ch.sendBuffer.at(sr.seq).acked);
+        require(ch.sendBuffer.at(sr.seq).acked);
     }
 
     // fragmentCount <= 1 (an unfragmented message) acks immediately on the first acknowledge.
     {
         aether::Channel ch = aether::newChannel(aether::ChannelId{ 0 }, aether::reliableOrderedChannel());
         const auto sr = aether::channelSend(ch, aether::Bytes{ 9 }, aether::MonoTime{ 0 });
-        assert(sr.error == aether::ChannelError::None);
+        require(sr.error == aether::ChannelError::None);
         aether::commitOutgoingMessage(ch, sr.seq, aether::MonoTime{ 0 });   // fragmentCount stays 0 (sent in one packet)
-        assert(!ch.sendBuffer.at(sr.seq).acked);
+        require(!ch.sendBuffer.at(sr.seq).acked);
         aether::acknowledgeMessage(ch, sr.seq);              // single ack flips it
-        assert(ch.sendBuffer.at(sr.seq).acked);
+        require(ch.sendBuffer.at(sr.seq).acked);
     }
 
     // A duplicate of a sequence already WAITING in the reorder buffer is acked, not re-buffered or
@@ -200,16 +201,16 @@ int main() {
 
         aether::onMessageReceived(ch, aether::SequenceNum{ 1 }, aether::Bytes{ 1 }, aether::MonoTime{ 0 });   // waits on 0
         aether::onMessageReceived(ch, aether::SequenceNum{ 2 }, aether::Bytes{ 2 }, aether::MonoTime{ 0 });   // buffer now full
-        assert(ch.orderedBuffer.size() == 2);
+        require(ch.orderedBuffer.size() == 2);
 
         const bool acked = aether::onMessageReceived(ch, aether::SequenceNum{ 1 }, aether::Bytes{ 1 }, aether::MonoTime{ 500000000ull });
-        assert(acked);                                            // already held -> ack it, retransmit helps nothing
-        assert(ch.totalDuplicate == 1 && ch.totalRefused == 0);
-        assert(ch.orderedBuffer.size() == 2);
-        assert(ch.orderedBuffer.at(aether::SequenceNum{ 1 }).second.ns == 0);   // original clock kept
+        require(acked);                                           // already held -> ack it, retransmit helps nothing
+        require(ch.totalDuplicate == 1 && ch.totalRefused == 0);
+        require(ch.orderedBuffer.size() == 2);
+        require(ch.orderedBuffer.at(aether::SequenceNum{ 1 }).second.ns == 0);   // original clock kept
 
         aether::onMessageReceived(ch, aether::SequenceNum{ 0 }, aether::Bytes{ 0 }, aether::MonoTime{ 1000000 });   // gap fills
-        assert(aether::channelReceive(ch).size() == 3);           // 0,1,2 delivered; the dup delivered once
+        require(aether::channelReceive(ch).size() == 3);          // 0,1,2 delivered; the dup delivered once
     }
 
     // A reliable message whose retry budget runs out is DROPPED, and every attempt has to wait out its
@@ -222,7 +223,7 @@ int main() {
         cfg.maxReliableRetries    = 3;
         aether::Channel ch = aether::newChannel(aether::ChannelId{ 0 }, cfg);
         const auto sr = aether::channelSend(ch, aether::Bytes{ 1 }, aether::MonoTime{ 0 });
-        assert(sr.error == aether::ChannelError::None);
+        require(sr.error == aether::ChannelError::None);
         aether::commitOutgoingMessage(ch, sr.seq, aether::MonoTime{ 0 });   // in flight, retryCount 1
 
         // Nothing ever acks it. Poll every 10ms; each attempt has to wait out ITS backoff (50, 100, 200).
@@ -234,12 +235,12 @@ int main() {
             ++attempts;
             aether::commitRetransmit(ch, sr.seq, aether::MonoTime{ nowMs * 1000000 });   // hoisted: it mutates send state
         }
-        assert(ch.failure == aether::ChannelFailure::RetryLimitExceeded);
-        assert(ch.sendBuffer.size() == 1); // Failed state retains the message until reset.
-        assert(attempts == cfg.maxReliableRetries);           // ...after exactly that many attempts
-        assert(nowMs >= 50 + 100 + 200 + 400); // Includes the final transmission's ACK deadline.
-        assert(ch.totalDropped == 1);
-        assert(ch.totalReliableDropped == 1);                 // the guarantee failed, and it is visible
+        require(ch.failure == aether::ChannelFailure::RetryLimitExceeded);
+        require(ch.sendBuffer.size() == 1); // Failed state retains the message until reset.
+        require(attempts == cfg.maxReliableRetries);          // ...after exactly that many attempts
+        require(nowMs >= 50 + 100 + 200 + 400); // Includes the final transmission's ACK deadline.
+        require(ch.totalDropped == 1);
+        require(ch.totalReliableDropped == 1);                // the guarantee failed, and it is visible
     }
 
     // The advertised credit has to reflect the REORDER buffer's occupancy. While a gap is open every
@@ -251,24 +252,24 @@ int main() {
         cfg.maxOrderedBufferSize  = 4;
         cfg.maxReceiveBufferSize  = 8192;
         aether::Channel ch = aether::newChannel(aether::ChannelId{ 0 }, cfg);
-        assert(aether::channelFreeReceiveSlots(ch) == 8192);   // no gap: the receive buffer is the only limit
+        require(aether::channelFreeReceiveSlots(ch) == 8192);   // no gap: the receive buffer is the only limit
 
         for (std::uint16_t s = 1; s <= 4; ++s)                 // seq 0 never arrives; 1..4 pile up behind it
             aether::onMessageReceived(ch, aether::SequenceNum{ s }, aether::Bytes{ static_cast<std::uint8_t>(s) },
                                       aether::MonoTime{ 0 });
-        assert(ch.orderedBuffer.size() == 4);
-        assert(aether::channelFreeReceiveSlots(ch) == 1);      // the credit SEES the reorder buffer now
+        require(ch.orderedBuffer.size() == 4);
+        require(aether::channelFreeReceiveSlots(ch) == 1);     // the credit SEES the reorder buffer now
 
         const bool accepted = aether::onMessageReceived(ch, aether::SequenceNum{ 5 }, aether::Bytes{ 5 }, aether::MonoTime{ 0 });
-        assert(!accepted && ch.totalRefused == 1);             // ...and the refusal it was predicting happens
+        require(!accepted && ch.totalRefused == 1);            // ...and the refusal it was predicting happens
 
         // The one-slot floor is what makes this backpressure and not deadlock: the message that FILLS
         // the gap is delivered straight through, so the window must never close on it.
         const bool filled = aether::onMessageReceived(ch, aether::SequenceNum{ 0 }, aether::Bytes{ 0 }, aether::MonoTime{ 0 });
-        assert(filled);
-        assert(ch.orderedBuffer.empty());                      // 0 unblocked 1..4
-        assert(aether::channelReceive(ch).size() == 5);
-        assert(aether::channelFreeReceiveSlots(ch) == 8192);
+        require(filled);
+        require(ch.orderedBuffer.empty());                     // 0 unblocked 1..4
+        require(aether::channelReceive(ch).size() == 5);
+        require(aether::channelFreeReceiveSlots(ch) == 8192);
     }
 
     // The send buffer is a std::map keyed on the RAW 16-bit sequence, so at the wrap its own order is
@@ -279,24 +280,24 @@ int main() {
         ch.localSeq = aether::SequenceNum{ 65533 };
         for (int i = 0; i < 6; ++i) {
             const auto r = aether::channelSend(ch, aether::Bytes{ static_cast<std::uint8_t>(i) }, aether::MonoTime{ 0 });
-            assert(r.error == aether::ChannelError::None);
+            require(r.error == aether::ChannelError::None);
         }
-        assert(ch.sendBuffer.begin()->first == aether::SequenceNum{ 0 });   // the map's first key is the NEWEST run
+        require(ch.sendBuffer.begin()->first == aether::SequenceNum{ 0 });   // the map's first key is the NEWEST run
 
         const std::uint16_t order[] = { 65533, 65534, 65535, 0, 1, 2 };
         for (const std::uint16_t want : order) {
             const aether::ChannelMessage* m = aether::peekOutgoingMessage(ch);
-            assert(m && m->sequence == aether::SequenceNum{ want });        // oldest first, across the wrap
+            require(m && m->sequence == aether::SequenceNum{ want });       // oldest first, across the wrap
             aether::commitOutgoingMessage(ch, m->sequence, aether::MonoTime{ 0 });
         }
-        assert(!aether::peekOutgoingMessage(ch));
+        require(!aether::peekOutgoingMessage(ch));
 
         // ...and the retransmit candidates come back in that same order, which is what the receiver's
         // credit budget in processRetransmissions spends its slots on.
         const auto cands = aether::getRetransmitMessages(ch, aether::MonoTime{ 200ull * 1000000 }, 100.0);
-        assert(cands.size() == 6);
+        require(cands.size() == 6);
         for (std::size_t i = 0; i < cands.size(); ++i)
-            assert(cands[i]->sequence == aether::SequenceNum{ order[i] });
+            require(cands[i]->sequence == aether::SequenceNum{ order[i] });
     }
 
     // ...and an unreliable overflow evicts the OLDEST message, which at the wrap is not begin().
@@ -307,13 +308,13 @@ int main() {
         ch.localSeq = aether::SequenceNum{ 65534 };
         for (int i = 0; i < 4; ++i)                                          // holds 65534, 65535, 0, 1
             aether::channelSend(ch, aether::Bytes{ static_cast<std::uint8_t>(i) }, aether::MonoTime{ 0 });
-        assert(ch.sendBuffer.size() == 4);
+        require(ch.sendBuffer.size() == 4);
 
         aether::channelSend(ch, aether::Bytes{ 4 }, aether::MonoTime{ 0 });   // full: one has to go
-        assert(ch.sendBuffer.size() == 4);
-        assert(ch.sendBuffer.find(aether::SequenceNum{ 65534 }) == ch.sendBuffer.end());   // the oldest went...
-        assert(ch.sendBuffer.find(aether::SequenceNum{ 0 }) != ch.sendBuffer.end());       // ...not the newest
-        assert(ch.sendBuffer.find(aether::SequenceNum{ 2 }) != ch.sendBuffer.end());
+        require(ch.sendBuffer.size() == 4);
+        require(ch.sendBuffer.find(aether::SequenceNum{ 65534 }) == ch.sendBuffer.end());   // the oldest went...
+        require(ch.sendBuffer.find(aether::SequenceNum{ 0 }) != ch.sendBuffer.end());       // ...not the newest
+        require(ch.sendBuffer.find(aether::SequenceNum{ 2 }) != ch.sendBuffer.end());
     }
 
     std::printf("aether channel OK: duplicate receives dropped (ordered window never rewinds, unordered dedups); "

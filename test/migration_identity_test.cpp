@@ -1,8 +1,6 @@
 #include "check.hpp"
 #include "aether/peer.hpp"
 
-#include <cassert>
-
 int main() {
     using namespace aether;
     const NetworkConfig config = aether::test::anonymousConfig<NetworkConfig>();
